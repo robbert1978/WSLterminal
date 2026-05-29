@@ -90,6 +90,26 @@ Requires: WSL2 with a C toolchain (`gcc`/`cc`, `pty.h`, `libutil`) and the
 package (`Vortice.Direct2D1`, for color-emoji rasterization), so it needs network
 access once.
 
+### Standalone single-file build
+
+```powershell
+dotnet publish src\WslTerminal\WslTerminal.csproj -c Release -r win-x64 --self-contained
+```
+
+This emits a single, self-contained **`WslTerminal.exe`** (.NET runtime + WPF +
+all dependency DLLs bundled and compressed inside the exe — no .NET install
+needed to run it) under `…\net9.0-windows\win-x64\publish\`. Drop the two Linux
+helpers next to it so the app can stage them into the distro:
+
+```
+publish\WslTerminal.exe
+publish\artifacts\wslpty
+publish\artifacts\wslptyd
+```
+
+(WPF can't be trimmed, so the exe is ~130 MB on disk; that's the runtime, not the
+app.) The helpers come from `artifacts\` after `build.ps1` / `native/build.sh`.
+
 ## Run
 
 ```powershell
