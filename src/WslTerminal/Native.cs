@@ -100,6 +100,23 @@ internal static partial class Native
     public static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode,
         IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
 
+    // --- DWM composition: cheap window translucency without AllowsTransparency --
+    // A transparent WPF render surface composited by DWM (honoring per-pixel
+    // alpha across the extended frame), instead of WPF's expensive layered
+    // window. The acrylic system backdrop is Windows 11 22621+.
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MARGINS { public int cxLeftWidth, cxRightWidth, cyTopHeight, cyBottomHeight; }
+
+    public const int DWMWA_SYSTEMBACKDROP_TYPE = 38;
+    public const int DWMSBT_TRANSIENTWINDOW = 3;   // acrylic
+
+    [LibraryImport("dwmapi.dll")]
+    public static partial int DwmExtendFrameIntoClientArea(IntPtr hwnd, in MARGINS margins);
+
+    [LibraryImport("dwmapi.dll")]
+    public static partial int DwmSetWindowAttribute(IntPtr hwnd, int attribute, in int value, int size);
+
     // --- wslapi.dll ---------------------------------------------------------
 
     // BOOL WslIsDistributionRegistered(PCWSTR distributionName);

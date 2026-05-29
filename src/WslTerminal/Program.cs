@@ -330,8 +330,8 @@ internal static class Program
     }
 
     // Verify the background renders translucent: at 90% opacity the empty
-    // background pixels must have alpha ~= 229 (not 255). With AllowsTransparency
-    // that alpha is what composites the desktop through the window.
+    // background pixels must have alpha ~= 229 (not 255). DWM composites that
+    // alpha through the window (no AllowsTransparency layered window needed).
     private static int OpacityTest()
     {
         const int W = 320, H = 160;
@@ -351,7 +351,7 @@ internal static class Program
         Console.WriteLine($"[opacitytest] background pixel alpha = {a}/255 (expect ~229 for 90%)");
         bool ok = a is > 215 and < 245;
         Console.WriteLine(ok
-            ? "[opacitytest] PASS — background is translucent (desktop shows through with AllowsTransparency)"
+            ? "[opacitytest] PASS — background is translucent (desktop shows through via DWM composition)"
             : "[opacitytest] FAIL — background not translucent");
         return ok ? 0 : 1;
     }

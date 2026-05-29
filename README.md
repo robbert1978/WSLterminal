@@ -216,10 +216,14 @@ Settings keys (the JSON is also editable directly):
 | `Opacity` | window opacity %, 10–100 (100 = opaque) |
 
 `Opacity` < 100 makes the window translucent (the desktop shows through the
-background). WPF transparency requires a borderless window, so in that mode the
-app draws a small custom title bar (drag + minimize/maximize/close) with resize
-borders; at `100` it uses the normal native frame. (WT's `useAcrylic`/blur and
-`backgroundImage` aren't supported — this is plain opacity.)
+background). The translucency is composited by **DWM**, not WPF's
+`AllowsTransparency` (which is a slow per-pixel-alpha *layered* window): the app
+gives the window a transparent composition surface + `DwmExtendFrameIntoClientArea`,
+and on Windows 11 requests the **acrylic system backdrop** (`DWMSBT_TRANSIENTWINDOW`)
+— GPU-cheap, the same mechanism Windows Terminal uses. Translucency needs a
+borderless window, so in that mode the app draws a small custom title bar (drag +
+minimize/maximize/close) with resize borders; at `100` it uses the normal native
+frame. (WT's `backgroundImage` isn't supported.)
 
 **New window in the same directory** (Ctrl+Shift+N) works because the shell
 reports its working directory via OSC 7; the new window is launched with
