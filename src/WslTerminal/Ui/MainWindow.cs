@@ -453,10 +453,10 @@ public sealed class MainWindow : Window
         return b;
     }
 
-    // Cheap translucency without AllowsTransparency: make WPF's composition
-    // surface transparent (per-pixel alpha, no layered window) and have DWM honor
-    // that alpha across the whole client area. On Windows 11 also request the
-    // acrylic system backdrop — GPU-cheap translucency, like Windows Terminal.
+    // Cheap PLAIN translucency without AllowsTransparency (no layered window): a
+    // transparent WPF composition surface, with DWM honoring the per-pixel alpha
+    // across the whole client area via an extended frame — so the terminal's
+    // alpha background reveals the real desktop behind it (not an acrylic blur).
     private void EnableDwmTranslucency()
     {
         if (PresentationSource.FromVisual(this) is not HwndSource src) return;
@@ -464,14 +464,10 @@ public sealed class MainWindow : Window
         if (src.CompositionTarget is not null)
             src.CompositionTarget.BackgroundColor = Colors.Transparent;
 
+        // Sheet-of-glass: extend the (now-empty) frame over the whole client area
+        // so DWM composites the window's alpha against what's behind it.
         var margins = new Native.MARGINS { cxLeftWidth = -1, cxRightWidth = -1, cyTopHeight = -1, cyBottomHeight = -1 };
         Native.DwmExtendFrameIntoClientArea(src.Handle, margins);
-
-        if (Environment.OSVersion.Version.Build >= 22621)   // Win11 acrylic backdrop
-        {
-            int backdrop = Native.DWMSBT_TRANSIENTWINDOW;
-            Native.DwmSetWindowAttribute(src.Handle, Native.DWMWA_SYSTEMBACKDROP_TYPE, backdrop, sizeof(int));
-        }
 
         src.AddHook(MinMaxHook);   // keep the borderless maximize-size fix
     }

@@ -215,15 +215,16 @@ Settings keys (the JSON is also editable directly):
 | `Ansi` | the 16 ANSI colors (`black…white`, then `bright*`) |
 | `Opacity` | window opacity %, 10–100 (100 = opaque) |
 
-`Opacity` < 100 makes the window translucent (the desktop shows through the
-background). The translucency is composited by **DWM**, not WPF's
-`AllowsTransparency` (which is a slow per-pixel-alpha *layered* window): the app
-gives the window a transparent composition surface + `DwmExtendFrameIntoClientArea`,
-and on Windows 11 requests the **acrylic system backdrop** (`DWMSBT_TRANSIENTWINDOW`)
-— GPU-cheap, the same mechanism Windows Terminal uses. Translucency needs a
-borderless window, so in that mode the app draws a small custom title bar (drag +
-minimize/maximize/close) with resize borders; at `100` it uses the normal native
-frame. (WT's `backgroundImage` isn't supported.)
+`Opacity` < 100 makes the window translucent — the real desktop shows through the
+background (plain see-through, no blur). The translucency is composited by **DWM**,
+not WPF's `AllowsTransparency` (which is a slow per-pixel-alpha *layered* window):
+the app gives the window a transparent composition surface and extends the frame
+across the client area (`DwmExtendFrameIntoClientArea`), so DWM composites the
+terminal's alpha background against whatever is behind the window — GPU-cheap, with
+no layered window. Translucency needs a borderless window, so in that mode the app
+draws a small custom title bar (drag + minimize/maximize/close) with resize
+borders; at `100` it uses the normal native frame. (WT's acrylic/blur and
+`backgroundImage` aren't supported — this is plain opacity.)
 
 **New window in the same directory** (Ctrl+Shift+N) works because the shell
 reports its working directory via OSC 7; the new window is launched with
