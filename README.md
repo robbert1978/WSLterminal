@@ -10,26 +10,31 @@ Windows (C# / .NET 9, WPF, one process)            WSL2 distro (Linux)
 │ Window 1  TerminalView+VT ──┐│                    │ wslptyd  (one server)        │
 │ Window 2  TerminalView+VT ──┤│  multiplexed       │   session 1: forkpty→/dev/pts │
 │ Window N  TerminalView+VT ──┘│  frames over ONE   │   session 2: forkpty→/dev/pts │
-│ WslMux ─ CreateProcess ──────┼─ wsl.exe pipe ───► │   …each a login shell on a pty│
-│   wsl.exe CREATE_NO_WINDOW   │                    └──────────────────────────────┘
+│ WslMux ─ CreateProcess ──────┼─ wslg.exe pipe ──► │   …each a login shell on a pty│
+│   wslg.exe (GUI subsystem)   │                    └──────────────────────────────┘
 └─────────────────────────────┘
-   N windows = 1 wsl.exe + 1 server (+ N shells); GUI-subsystem → no console window
+   N windows = 1 wslg.exe + 1 server (+ N shells); GUI subsystem → no console window
 ```
 
 ## Why this design
 
-* **Headless `wsl.exe` (`CREATE_NO_WINDOW`).** Talking to a WSL2 distro goes
-  through `wsl.exe` either way — even `wslapi.dll`'s `WslLaunch` just shells out
-  to `C:\Windows\System32\wsl.exe` (verified by inspecting the child's command
-  line), and it does so *without* `CREATE_NO_WINDOW`, so on Win11 (where Windows
-  Terminal is the default terminal) it pops a WT window. We instead launch
-  `wsl.exe` ourselves with `CREATE_NO_WINDOW` and redirected pipe handles, so no
-  console/terminal window ever appears. The app itself is a **GUI-subsystem**
-  binary, so launching it doesn't allocate a console either.
+* **Headless `wslg.exe` (GUI subsystem).** Talking to a WSL2 distro goes through
+  the `wsl.exe` machinery either way — even `wslapi.dll`'s `WslLaunch` just shells
+  out to `wsl.exe` (verified by inspecting the child's command line), and it does
+  so *without* `CREATE_NO_WINDOW`, so on Win11 (where Windows Terminal is the
+  default terminal) it pops a WT window. We instead launch
+  **`C:\Program Files\WSL\wslg.exe`** — the GUI-subsystem launcher Microsoft ships
+  next to `wsl.exe` — with redirected pipe handles. Because it's a GUI-subsystem
+  binary, Windows never allocates a console for it, so no console/terminal window
+  ever appears (a console-subsystem `wsl.exe` flashes one even with
+  `CREATE_NO_WINDOW`). It takes the same arguments and relays stdio identically;
+  we fall back to `System32\wsl.exe` (with `CREATE_NO_WINDOW`) if `wslg.exe` is
+  absent, and `$WSL_LAUNCHER` overrides the choice. The app itself is also a
+  **GUI-subsystem** binary, so launching it doesn't allocate a console either.
 * **One PTY server, many sessions.** `native/wslptyd.c` runs once per distro and
-  multiplexes every terminal over a single `wsl.exe` + pipe connection. Opening N
-  windows costs 1 `wsl.exe` + 1 server (+ the N shells), instead of
-  N×(wsl.exe + helper). Each `OPEN` does a real `forkpty()` → its own `/dev/pts/N`
+  multiplexes every terminal over a single `wslg.exe` + pipe connection. Opening N
+  windows costs 1 `wslg.exe` + 1 server (+ the N shells), instead of
+  N×(launcher + helper). Each `OPEN` does a real `forkpty()` → its own `/dev/pts/N`
   login shell, so every session is a genuine TTY (job control, line discipline,
   `SIGWINCH`, echo). A plain piped `wsl.exe <cmd>` reports `tty: not a tty`; through
   this path the shell reports `/dev/pts/N`. (A single-session helper, `wslpty.c`,

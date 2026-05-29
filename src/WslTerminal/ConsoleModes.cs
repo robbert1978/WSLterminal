@@ -29,6 +29,7 @@ internal static class ConsoleModes
     {
         string helper = WslBootstrap.ResolveHelper();
         string cmd = WslBootstrap.BuildLaunchCommand(helper);
+        Console.WriteLine($"[selftest] launcher = {WslProcess.LauncherPath}");
         Console.WriteLine($"[selftest] helper = {helper}");
         Console.WriteLine($"[selftest] launch = {cmd}");
 
@@ -61,7 +62,7 @@ internal static class ConsoleModes
         bool ok = captured.Contains("/dev/pts/");
         Console.WriteLine($"[selftest] shell exit={code}");
         Console.WriteLine(ok
-            ? "[selftest] PASS — real WSL PTY (/dev/pts/N) via headless wsl.exe (CREATE_NO_WINDOW) + forkpty; no terminal window"
+            ? $"[selftest] PASS — real WSL PTY (/dev/pts/N) via headless {Path.GetFileName(WslProcess.LauncherPath)} (GUI subsystem, no console) + forkpty; no terminal window"
             : "[selftest] FAIL — did not observe /dev/pts/N");
         return ok ? 0 : 1;
     }

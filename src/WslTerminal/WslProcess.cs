@@ -6,8 +6,9 @@ using Microsoft.Win32.SafeHandles;
 namespace WslTerminal;
 
 /// <summary>
-/// Launches wsl.exe headlessly (CREATE_NO_WINDOW) with redirected pipes and
-/// exposes the raw stdio streams + process handle. No conhost/Windows Terminal
+/// Launches WSL headlessly with redirected pipes and exposes the raw stdio
+/// streams + process handle. Prefers <c>wslg.exe</c> (the GUI-subsystem
+/// launcher) so Windows never allocates a console — no conhost/Windows Terminal
 /// window appears. Used by both the single-session <see cref="WslSession"/> and
 /// the multiplexed <see cref="WslMux"/>.
 /// </summary>
@@ -23,6 +24,30 @@ public sealed class WslProcess : IDisposable
         StdIn = stdin;
         StdOut = stdout;
         _process = process;
+    }
+
+    // Prefer wslg.exe over wsl.exe. wsl.exe is a console-subsystem binary, so
+    // launching it makes Windows allocate a console (a brief flash) even with
+    // CREATE_NO_WINDOW; wslg.exe is the GUI-subsystem launcher Microsoft ships
+    // for exactly this, so no console is ever created. It takes the same
+    // arguments and relays redirected stdio identically. Resolve order:
+    // $WSL_LAUNCHER override, then %ProgramFiles%\WSL\wslg.exe, then wsl.exe.
+    private static readonly string Launcher = ResolveLauncher();
+
+    /// <summary>The WSL launcher chosen at startup (wslg.exe when present).</summary>
+    public static string LauncherPath => Launcher;
+
+    private static string ResolveLauncher()
+    {
+        string? overridePath = Environment.GetEnvironmentVariable("WSL_LAUNCHER");
+        if (!string.IsNullOrWhiteSpace(overridePath) && File.Exists(overridePath))
+            return overridePath;
+
+        string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        string wslg = Path.Combine(programFiles, "WSL", "wslg.exe");
+        if (File.Exists(wslg)) return wslg;
+
+        return Path.Combine(Environment.SystemDirectory, "wsl.exe");
     }
 
     public static WslProcess Launch(string distribution, string command)
@@ -42,12 +67,11 @@ public sealed class WslProcess : IDisposable
         Native.SetHandleInformation(inWrite, Native.HANDLE_FLAG_INHERIT, 0);
         Native.SetHandleInformation(outRead, Native.HANDLE_FLAG_INHERIT, 0);
 
-        // wsl.exe parses its command line raw, so the distro name must NOT be
-        // quoted (it would keep the quotes -> WSL_E_DISTRO_NOT_FOUND). `~` starts
-        // in the Linux home dir. CREATE_NO_WINDOW => no console/terminal window.
-        string wslExe = Path.Combine(Environment.SystemDirectory, "wsl.exe");
+        // The launcher parses its command line raw, so the distro name must NOT
+        // be quoted (it would keep the quotes -> WSL_E_DISTRO_NOT_FOUND). `~`
+        // starts in the Linux home dir.
         var cmd = new StringBuilder();
-        cmd.Append('"').Append(wslExe).Append('"')
+        cmd.Append('"').Append(Launcher).Append('"')
            .Append(" ~ --distribution ").Append(distribution)
            .Append(' ').Append(command);
 
@@ -60,6 +84,8 @@ public sealed class WslProcess : IDisposable
             hStdError = outWrite.DangerousGetHandle(),
         };
 
+        // CREATE_NO_WINDOW is a no-op for wslg.exe (GUI subsystem) but keeps the
+        // wsl.exe fallback windowless too.
         bool ok = Native.CreateProcess(null, cmd, IntPtr.Zero, IntPtr.Zero,
             bInheritHandles: true, Native.CREATE_NO_WINDOW, IntPtr.Zero, null,
             ref si, out Native.PROCESS_INFORMATION pi);
@@ -71,7 +97,7 @@ public sealed class WslProcess : IDisposable
             int err = Marshal.GetLastWin32Error();
             inRead.Dispose(); inWrite.Dispose(); outRead.Dispose(); outWrite.Dispose();
             throw new System.ComponentModel.Win32Exception(err,
-                $"CreateProcess(wsl.exe) failed for distribution '{distribution}'.");
+                $"CreateProcess({Path.GetFileName(Launcher)}) failed for distribution '{distribution}'.");
         }
         Native.CloseHandle(pi.hThread);
 

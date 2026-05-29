@@ -1,3 +1,4 @@
+using System.IO;
 using System.Text;
 using System.Windows;
 using WslTerminal;
@@ -105,7 +106,7 @@ internal static class Program
         Console.WriteLine($"[muxtest] session1 -> {m1.Value}   session2 -> {m2.Value}");
         bool ok = m1.Success && m2.Success && m1.Value != m2.Value;
         Console.WriteLine(ok
-            ? "[muxtest] PASS — two real PTYs over one wsl.exe + one wslptyd server, distinct /dev/pts"
+            ? $"[muxtest] PASS — two real PTYs over one {Path.GetFileName(WslProcess.LauncherPath)} + one wslptyd server, distinct /dev/pts"
             : "[muxtest] FAIL — expected two distinct /dev/pts/N");
         mux.Dispose();
         return ok ? 0 : 1;

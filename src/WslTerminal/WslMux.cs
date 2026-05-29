@@ -8,9 +8,9 @@ using System.Threading;
 namespace WslTerminal;
 
 /// <summary>
-/// Multiplexes many PTY sessions over one wsl.exe + one wslptyd server process.
-/// Opening N terminal windows therefore costs 1 wsl.exe + 1 server (+ N shells),
-/// instead of N×(wsl.exe + helper). One reader thread demuxes server output and
+/// Multiplexes many PTY sessions over one wslg.exe + one wslptyd server process.
+/// Opening N terminal windows therefore costs 1 wslg.exe + 1 server (+ N shells),
+/// instead of N×(launcher + helper). One reader thread demuxes server output and
 /// dispatches per-session; writes are framed under a lock.
 /// </summary>
 public sealed class WslMux : IDisposable
