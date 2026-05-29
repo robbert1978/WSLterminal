@@ -1,0 +1,12 @@
+# Normalize line endings. Keep LF for anything that runs inside WSL/Linux
+# (a CRLF in build.sh breaks bash); let Windows-only files use CRLF.
+* text=auto
+
+*.sh   text eol=lf
+*.c    text eol=lf
+*.h    text eol=lf
+
+*.ps1  text eol=crlf
+
+# Treat the icon and any prebuilt artifacts as binary.
+*.ico  binary

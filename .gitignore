@@ -1,0 +1,11 @@
+# .NET build output
+bin/
+obj/
+*.user
+
+# Compiled native helpers (built by native/build.sh inside WSL)
+artifacts/wslpty
+artifacts/wslptyd
+
+# Release packaging
+*.zip
