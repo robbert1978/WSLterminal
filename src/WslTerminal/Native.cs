@@ -100,17 +100,6 @@ internal static partial class Native
     public static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode,
         IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
 
-    // --- DWM composition: cheap window translucency without AllowsTransparency --
-    // A transparent WPF render surface composited by DWM (honoring per-pixel
-    // alpha across the extended frame) against the real desktop, instead of WPF's
-    // expensive layered window.
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct MARGINS { public int cxLeftWidth, cxRightWidth, cyTopHeight, cyBottomHeight; }
-
-    [LibraryImport("dwmapi.dll")]
-    public static partial int DwmExtendFrameIntoClientArea(IntPtr hwnd, in MARGINS margins);
-
     // --- wslapi.dll ---------------------------------------------------------
 
     // BOOL WslIsDistributionRegistered(PCWSTR distributionName);

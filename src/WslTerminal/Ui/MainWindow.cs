@@ -49,10 +49,14 @@ public sealed class MainWindow : Window
         _translucent = Math.Clamp(_settings.Opacity, 10, 100) < 100;
         if (_translucent)
         {
-            // Borderless + translucent, but WITHOUT WPF's AllowsTransparency — that
-            // uses a per-pixel-alpha layered window (the expensive path). Instead
-            // DWM composites the window's alpha cheaply; see EnableDwmTranslucency.
+            // Plain see-through translucency via WPF's AllowsTransparency (a
+            // per-pixel-alpha layered window). It carries some GPU cost, but it is
+            // the only WPF path that reliably composites the window's alpha against
+            // the REAL desktop. The cheaper DWM routes (acrylic system backdrop /
+            // window-composition accent / extended frame) only produce a tinted or
+            // blurred backdrop on this platform, not true see-through.
             WindowStyle = WindowStyle.None;
+            AllowsTransparency = true;
             ResizeMode = ResizeMode.CanResize;
             Background = Brushes.Transparent;
             WindowChrome.SetWindowChrome(this, new WindowChrome
@@ -63,7 +67,8 @@ public sealed class MainWindow : Window
                 CornerRadius = new CornerRadius(0),
                 UseAeroCaptionButtons = false,
             });
-            SourceInitialized += (_, _) => EnableDwmTranslucency();
+            SourceInitialized += (_, _) =>
+                HwndSource.FromHwnd(new WindowInteropHelper(this).Handle)?.AddHook(MinMaxHook);
         }
         else
         {
@@ -451,25 +456,6 @@ public sealed class MainWindow : Window
         b.MouseLeave += (_, _) => b.Background = normal;
         b.MouseLeftButtonUp += (_, _) => onClick();
         return b;
-    }
-
-    // Cheap PLAIN translucency without AllowsTransparency (no layered window): a
-    // transparent WPF composition surface, with DWM honoring the per-pixel alpha
-    // across the whole client area via an extended frame — so the terminal's
-    // alpha background reveals the real desktop behind it (not an acrylic blur).
-    private void EnableDwmTranslucency()
-    {
-        if (PresentationSource.FromVisual(this) is not HwndSource src) return;
-
-        if (src.CompositionTarget is not null)
-            src.CompositionTarget.BackgroundColor = Colors.Transparent;
-
-        // Sheet-of-glass: extend the (now-empty) frame over the whole client area
-        // so DWM composites the window's alpha against what's behind it.
-        var margins = new Native.MARGINS { cxLeftWidth = -1, cxRightWidth = -1, cyTopHeight = -1, cyBottomHeight = -1 };
-        Native.DwmExtendFrameIntoClientArea(src.Handle, margins);
-
-        src.AddHook(MinMaxHook);   // keep the borderless maximize-size fix
     }
 
     private IntPtr MinMaxHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
