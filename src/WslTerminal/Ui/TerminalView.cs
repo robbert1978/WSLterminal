@@ -11,11 +11,22 @@ namespace WslTerminal.Ui;
 /// <summary>
 /// WPF surface that renders a <see cref="Terminal"/> grid via GlyphRuns and
 /// turns keyboard/mouse input into a byte stream for the PTY. Rendering is
-/// coalesced to ~60 Hz; resizing reports new cols/rows to the host.
+/// coalesced to ~30 fps and dirty-row cached; resizing reports new cols/rows.
 /// </summary>
 public sealed class TerminalView : FrameworkElement
 {
     private readonly Terminal _term;
+
+    // Dirty-row repaint: cache each row's vector drawing and rebuild only the
+    // rows whose content or selection changed; reuse the cached drawing for the
+    // rest. The cursor is a cheap live overlay (drawn below), so moving it never
+    // invalidates a row. With the ~30 fps cap this keeps partial updates (typing,
+    // a refreshing status line) from re-laying-out glyphs for the whole viewport.
+    private DrawingGroup?[] _rowCache = Array.Empty<DrawingGroup?>();
+    private Cell[][] _rendered = Array.Empty<Cell[]>();
+    private (bool on, int s, int e)[] _renderedSel = Array.Empty<(bool, int, int)>();
+    private bool _forceFullRender = true;
+    private double _lastPpd = -1;
 
     // font / metrics
     private GlyphTypeface _gtRegular = null!, _gtBold = null!, _gtItalic = null!, _gtBoldItalic = null!;
@@ -75,7 +86,10 @@ public sealed class TerminalView : FrameworkElement
 
         var timer = new DispatcherTimer(DispatcherPriority.Render)
         {
-            Interval = TimeSpan.FromMilliseconds(16),
+            // ~30 fps. A terminal rarely needs 60; halving the repaint rate
+            // roughly halves render-side GPU during heavy output, and the
+            // _dirty gate below means idle costs nothing either way.
+            Interval = TimeSpan.FromMilliseconds(33),
         };
         timer.Tick += (_, _) => { if (Interlocked.Exchange(ref _dirty, 0) != 0) InvalidateVisual(); };
         timer.Start();
@@ -201,6 +215,13 @@ public sealed class TerminalView : FrameworkElement
         _dest = new Cell[rows][];
         for (int r = 0; r < rows; r++) _dest[r] = new Cell[cols];
 
+        // per-row render cache, sized with the grid (see OnRender dirty-row reuse)
+        _rendered = new Cell[rows][];
+        for (int r = 0; r < rows; r++) _rendered[r] = new Cell[cols];
+        _rowCache = new DrawingGroup?[rows];
+        _renderedSel = new (bool, int, int)[rows];
+        _forceFullRender = true;
+
         _term.Resize(cols, rows);
         Resized?.Invoke(cols, rows);
         _dirty = 1;
@@ -216,20 +237,69 @@ public sealed class TerminalView : FrameworkElement
         // didn't fire (e.g. a manually arranged, unconnected visual).
         if (RenderSize.Width > 0 && RenderSize.Height > 0) RecomputeGrid(RenderSize);
 
+        // full-surface background (carries window opacity); cheap, drawn every frame
         dc.DrawRectangle(BackgroundBrush(), null, new Rect(0, 0, RenderSize.Width, RenderSize.Height));
         if (_dest.Length == 0) return;
 
         ViewportInfo vp = _term.CaptureViewport(_scrollOffset, _dest);
 
-        for (int r = 0; r < _rows; r++)
-            RenderRow(dc, r, _dest[r]);
+        // A DPI change invalidates every cached glyph run.
+        if (_ppd != _lastPpd) { _forceFullRender = true; _lastPpd = _ppd; }
 
-        // cursor (only when viewing the live bottom)
+        // Rows: reuse each row's cached drawing unless its content or selection
+        // changed. RenderRow (glyph layout) only runs for rows that actually changed.
+        for (int r = 0; r < _rows && r < _dest.Length; r++)
+        {
+            bool selOn = SelSpan(r, out int ss, out int se);
+            if (_forceFullRender || _rowCache[r] is null || RowChanged(r, selOn, ss, se))
+            {
+                var dg = new DrawingGroup();
+                using (DrawingContext rdc = dg.Open())
+                    RenderRow(rdc, r, _dest[r]);
+                dg.Freeze();
+                _rowCache[r] = dg;
+                SnapshotRow(r, selOn, ss, se);
+            }
+            dc.DrawDrawing(_rowCache[r]);
+        }
+        _forceFullRender = false;
+
+        // cursor: live overlay, redrawn every frame over the cached rows (only
+        // when viewing the live bottom). Keeping it here means cursor movement and
+        // focus changes never dirty a row's cache.
         if (_scrollOffset == 0 && vp.CursorVisible &&
             vp.CursorX >= 0 && vp.CursorX < _cols && vp.CursorY >= 0 && vp.CursorY < _rows)
         {
             DrawCursor(dc, vp.CursorX, vp.CursorY, _dest[vp.CursorY][vp.CursorX]);
         }
+    }
+
+    // True if row r's rendered appearance (cell content or selection span) differs
+    // from what its cached drawing was built for.
+    private bool RowChanged(int r, bool selOn, int ss, int se)
+    {
+        var prev = _renderedSel[r];
+        if (prev.on != selOn || prev.s != ss || prev.e != se) return true;
+        Cell[] cur = _dest[r], old = _rendered[r];
+        if (cur.Length != old.Length) return true;
+        for (int i = 0; i < cur.Length; i++)
+        {
+            Cell a = cur[i], b = old[i];
+            if (a.Rune != b.Rune || a.Fg != b.Fg || a.Bg != b.Bg ||
+                a.Flags != b.Flags || a.Width != b.Width ||
+                !string.Equals(a.Combo, b.Combo, StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
+
+    // Record what row r's cache was just built from, so RowChanged can detect the
+    // next change. _rendered uses its own arrays (CaptureViewport mutates _dest in
+    // place), so this copy must not alias _dest.
+    private void SnapshotRow(int r, bool selOn, int ss, int se)
+    {
+        Array.Copy(_dest[r], _rendered[r], _dest[r].Length);
+        _renderedSel[r] = (selOn, ss, se);
     }
 
     private void RenderRow(DrawingContext dc, int row, Cell[] cells)
