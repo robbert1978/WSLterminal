@@ -5,15 +5,16 @@ A Windows terminal app that runs a WSL shell on a **genuine Linux PTY**, launche
 cooked stdio you get from a plain piped `wsl.exe`.
 
 ```
-Windows (C# / .NET 9, WPF, one process)            WSL2 distro (Linux)
-┌─────────────────────────────┐                    ┌──────────────────────────────┐
-│ Window 1  TerminalView+VT ──┐│                    │ wslptyd  (one server)        │
-│ Window 2  TerminalView+VT ──┤│  multiplexed       │   session 1: forkpty→/dev/pts │
-│ Window N  TerminalView+VT ──┘│  frames over ONE   │   session 2: forkpty→/dev/pts │
-│ WslMux ─ CreateProcess ──────┼─ wslg.exe pipe ──► │   …each a login shell on a pty│
-│   wslg.exe (GUI subsystem)   │                    └──────────────────────────────┘
-└─────────────────────────────┘
-   N windows = 1 wslg.exe + 1 server (+ N shells); GUI subsystem → no console window
+Windows (C# / .NET 9, WPF, one GUI process)           WSL2 distro (Linux)
++--------------------------------+                    +------------------------------+
+| Window 1   TerminalView + VT   |                    | wslptyd   (one server)       |
+| Window 2   TerminalView + VT   | multiplexed        |   session 1: forkpty /dev/pts|
+| Window N   TerminalView + VT   | frames over ONE    |   session 2: forkpty /dev/pts|
+| WslMux -> CreateProcess        | wslg.exe pipe ==>  |   ...login shell on each pty |
+| wslg.exe   (GUI subsystem)     |                    +------------------------------+
++--------------------------------+
+
+   N windows/tabs/panes = 1 wslg.exe + 1 server (+ N shells);  GUI subsystem => no console window
 ```
 
 ## Why this design
