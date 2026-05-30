@@ -11,7 +11,7 @@ namespace WslTerminal.Ui;
 /// <summary>
 /// WPF surface that renders a <see cref="Terminal"/> grid via GlyphRuns and
 /// turns keyboard/mouse input into a byte stream for the PTY. Rendering is
-/// coalesced to ~30 fps and dirty-row cached; resizing reports new cols/rows.
+/// paced at the monitor refresh rate and dirty-row cached; resizing reports new cols/rows.
 /// </summary>
 public sealed class TerminalView : FrameworkElement
 {
@@ -84,17 +84,39 @@ public sealed class TerminalView : FrameworkElement
 
         LoadFonts();
 
+        // Pace repaints at the monitor's refresh rate (e.g. 60/120/144 Hz) so the
+        // terminal feels as smooth as the display allows. The _dirty gate means a
+        // tick only repaints when something changed, so idle still costs nothing;
+        // the dirty-row cache keeps each repaint cheap. (Reads the primary display
+        // at startup; doesn't re-read if the window moves to a different monitor.)
+        int hz = Math.Clamp(DisplayRefreshHz(), 30, 360);
         var timer = new DispatcherTimer(DispatcherPriority.Render)
         {
-            // ~30 fps. A terminal rarely needs 60; halving the repaint rate
-            // roughly halves render-side GPU during heavy output, and the
-            // _dirty gate below means idle costs nothing either way.
-            Interval = TimeSpan.FromMilliseconds(33),
+            Interval = TimeSpan.FromMilliseconds(1000.0 / hz),
         };
         timer.Tick += (_, _) => { if (Interlocked.Exchange(ref _dirty, 0) != 0) InvalidateVisual(); };
         timer.Start();
 
         Loaded += (_, _) => Focus();
+    }
+
+    // Primary display's vertical refresh in Hz (GetDeviceCaps VREFRESH). Returns
+    // 0/1 for "default/unknown" on some virtual displays; caller clamps. Falls
+    // back to 60 on any failure.
+    private static int DisplayRefreshHz()
+    {
+        try
+        {
+            IntPtr dc = Native.GetDC(IntPtr.Zero);
+            if (dc != IntPtr.Zero)
+            {
+                int hz = Native.GetDeviceCaps(dc, Native.VREFRESH);
+                Native.ReleaseDC(IntPtr.Zero, dc);
+                if (hz > 1) return hz;
+            }
+        }
+        catch { /* fall through */ }
+        return 60;
     }
 
     public double FontEmSize => _emSize;

@@ -172,14 +172,15 @@ block on a GUI exe, capture them with
 ## Performance
 
 Input draining (VT parse + grid update) runs on the reader thread, decoupled
-from rendering (a ~30 fps `DispatcherTimer` renders the latest grid only when it
-changed), so render speed never gates throughput. Rendering is also **dirty-row
-cached**: each row's vector drawing is retained and rebuilt only when that row's
-content or selection changes (the cursor is a cheap live overlay), so a partial
-update — typing, a refreshing status line — re-lays-out one row, not the whole
-viewport. The ~30 fps cap and the row cache together cut per-frame render cost,
-which helps because translucent windows are composited the more expensive way
-(see Appearance). The scrollback is a ring buffer (O(1) push, with
+from rendering (a `DispatcherTimer` paced at the **monitor's refresh rate** —
+60/120/144 Hz, via `GetDeviceCaps(VREFRESH)` — renders the latest grid only when
+it changed), so render speed never gates throughput and idle costs nothing.
+Rendering is also **dirty-row cached**: each row's vector drawing is retained and
+rebuilt only when that row's content or selection changes (the cursor is a cheap
+live overlay), so a partial update — typing, a refreshing status line — re-lays-out
+one row, not the whole viewport. The dirty gate plus the row cache keep each
+repaint cheap, so matching a high refresh rate stays light even with translucency
+(which is composited the more expensive way — see Appearance). The scrollback is a ring buffer (O(1) push, with
 row-array recycling) and the parser bulk-processes printable runs. On
 termbench-style workloads the parse+grid stage matches or beats Windows
 Terminal; the end-to-end rate (~0.036 GB/s on ManyLine) is on par with WT and

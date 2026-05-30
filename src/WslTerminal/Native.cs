@@ -100,6 +100,19 @@ internal static partial class Native
     public static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode,
         IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
 
+    // --- display refresh rate (to pace rendering at the monitor's Hz) --------
+
+    public const int VREFRESH = 116;   // GetDeviceCaps index: vertical refresh in Hz
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetDC(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+
+    [DllImport("gdi32.dll")]
+    public static extern int GetDeviceCaps(IntPtr hdc, int nIndex);
+
     // --- wslapi.dll ---------------------------------------------------------
 
     // BOOL WslIsDistributionRegistered(PCWSTR distributionName);
