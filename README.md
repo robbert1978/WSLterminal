@@ -216,15 +216,16 @@ Settings keys (the JSON is also editable directly):
 | `Opacity` | window opacity %, 10–100 (100 = opaque) |
 
 `Opacity` < 100 makes the window translucent — the real desktop shows through the
-background (plain see-through, no blur). The translucency is composited by **DWM**,
-not WPF's `AllowsTransparency` (which is a slow per-pixel-alpha *layered* window):
-the app gives the window a transparent composition surface and extends the frame
-across the client area (`DwmExtendFrameIntoClientArea`), so DWM composites the
-terminal's alpha background against whatever is behind the window — GPU-cheap, with
-no layered window. Translucency needs a borderless window, so in that mode the app
-draws a small custom title bar (drag + minimize/maximize/close) with resize
-borders; at `100` it uses the normal native frame. (WT's acrylic/blur and
-`backgroundImage` aren't supported — this is plain opacity.)
+background (plain see-through, no blur), via WPF's `AllowsTransparency` (a
+per-pixel-alpha layered window). That is the only WPF mechanism that reliably
+composites the window's alpha against the *actual desktop*; the cheaper DWM routes
+(acrylic system backdrop, the window-composition accent, or an extended frame)
+only yield a tint or a blur on this platform, not true see-through, so they aren't
+used. The layered window carries some extra GPU cost — the price of real per-pixel
+transparency in WPF. Translucency needs a borderless window, so in that mode the
+app draws a small custom title bar (drag + minimize/maximize/close) with resize
+borders; at `100` it uses the normal native frame (and no layered-window cost).
+(WT's acrylic/blur and `backgroundImage` aren't supported — this is plain opacity.)
 
 **New window in the same directory** (Ctrl+Shift+N) works because the shell
 reports its working directory via OSC 7; the new window is launched with
