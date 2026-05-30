@@ -2,7 +2,7 @@
 bin/
 obj/
 *.user
-*./exe
+*.exe
 
 
 # Compiled native helpers (built by native/build.sh inside WSL)

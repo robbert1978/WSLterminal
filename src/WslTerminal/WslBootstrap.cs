@@ -64,10 +64,15 @@ public static class WslBootstrap
     }
 
     /// <summary>Stage the multiplexed PTY server into /tmp and exec it. Per-session
-    /// directories are sent in each OPEN frame, so no cwd is baked in here.</summary>
+    /// directories are sent in each OPEN frame, so no cwd is baked in here. The
+    /// server is a per-distro singleton, so it gets a fixed name (/tmp/wslptyd,
+    /// not /tmp/wslptyd.$$) — cleaner in `ps`. `rm -f` before `cp` avoids ETXTBSY
+    /// if a stale daemon is still holding that file: unlink drops the directory
+    /// entry (the old process keeps its now-anonymous inode) and cp writes a fresh
+    /// file.</summary>
     public static string BuildServerCommand(string serverWinPath)
     {
         string src = WindowsToWslPath(serverWinPath);
-        return $"d=/tmp/wslptyd.$$; cp '{src}' \"$d\" 2>/dev/null; chmod +x \"$d\"; exec \"$d\"";
+        return $"d=/tmp/wslptyd; rm -f \"$d\" 2>/dev/null; cp '{src}' \"$d\" 2>/dev/null; chmod +x \"$d\"; exec \"$d\"";
     }
 }
