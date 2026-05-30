@@ -40,4 +40,16 @@
     <PackageReference Include="Vortice.Direct2D1" Version="3.6.2" />
   </ItemGroup>
 
+  <!-- Code/file viewer with syntax highlighting (file-preview tabs). -->
+  <ItemGroup>
+    <PackageReference Include="AvalonEdit" Version="6.3.1.120" />
+  </ItemGroup>
+
+
+  <!-- Extra highlighting definitions AvalonEdit doesn't ship, loaded at startup in
+       FilePreview. Embedded so they live inside the single-file exe. -->
+  <ItemGroup>
+    <EmbeddedResource Include="Highlighting\*.xshd" />
+  </ItemGroup>
+
 </Project>

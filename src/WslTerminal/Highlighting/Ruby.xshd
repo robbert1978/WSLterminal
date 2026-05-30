@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<SyntaxDefinition name="Ruby" extensions=".rb;.gemspec;.rake"
+                  xmlns="http://icsharpcode.net/sharpdevelop/syntaxdefinition/2008">
+  <Color name="Comment" foreground="#6A9955" />
+  <Color name="String"  foreground="#CE9178" />
+  <Color name="Keyword" foreground="#569CD6" fontWeight="bold" />
+  <Color name="Symbol"  foreground="#4EC9B0" />
+  <Color name="Number"  foreground="#B5CEA8" />
+  <RuleSet ignoreCase="false">
+    <Span color="Comment"><Begin>\#</Begin></Span>
+    <Span color="String" multiline="true"><Begin>"</Begin><End>"</End><RuleSet><Span begin="\\" end="." /></RuleSet></Span>
+    <Span color="String"><Begin>'</Begin><End>'</End></Span>
+    <Keywords color="Keyword">
+      <Word>def</Word><Word>end</Word><Word>if</Word><Word>elsif</Word><Word>else</Word>
+      <Word>unless</Word><Word>case</Word><Word>when</Word><Word>while</Word><Word>until</Word>
+      <Word>for</Word><Word>do</Word><Word>begin</Word><Word>rescue</Word><Word>ensure</Word>
+      <Word>raise</Word><Word>return</Word><Word>yield</Word><Word>class</Word><Word>module</Word>
+      <Word>self</Word><Word>nil</Word><Word>true</Word><Word>false</Word><Word>and</Word>
+      <Word>or</Word><Word>not</Word><Word>then</Word><Word>require</Word><Word>require_relative</Word>
+      <Word>attr_accessor</Word><Word>attr_reader</Word><Word>attr_writer</Word><Word>puts</Word><Word>lambda</Word>
+    </Keywords>
+    <Rule color="Symbol">:[A-Za-z_][A-Za-z0-9_]*</Rule>
+    <Rule color="Number">\b[0-9][0-9_]*(\.[0-9]+)?\b</Rule>
+  </RuleSet>
+</SyntaxDefinition>

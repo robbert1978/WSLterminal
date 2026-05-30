@@ -11,3 +11,6 @@ artifacts/wslptyd
 
 # Release packaging
 *.zip
+
+# Local Claude Code agent data (not part of the project)
+.claude/

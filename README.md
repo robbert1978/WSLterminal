@@ -75,9 +75,14 @@ src/WslTerminal/
   Ui/TerminalView.cs   WPF GlyphRun renderer + keyboard/mouse/selection/resize/zoom
   Ui/EmojiRenderer.cs  Direct2D/DirectWrite color-emoji rasterizer (cached bitmaps)
   Ui/InputEncoder.cs   keys -> xterm/VT byte sequences
-  Ui/MainWindow.cs     window: tab strip + chrome; manages tabs, panes, settings
-  Ui/TerminalTab.cs    one tab = a pane tree (Root/Active) + its strip chip
+  Ui/MainWindow.cs     window: tab strip + chrome; manages tabs, panes, sidebar, settings
+  Ui/TerminalTab.cs    one tab = a pane tree (Root/Active), or a file-viewer document
   Ui/Pane.cs           pane tree: Pane (Terminal+TerminalView+MuxSession) | SplitNode
+  Ui/FileSidebar.cs    left file browser (follows the shell cwd via OSC 7)
+  Ui/FilePreview.cs    builds a viewer/editor control (syntax highlight / image)
+  Ui/FileDocument.cs   open document: editable text, dirty tracking, save to WSL
+  Ui/WslFiles.cs       list/read/write WSL files from Windows (\\wsl.localhost)
+  Highlighting/*.xshd  extra syntax definitions (shell, yaml, rust, go, ts, ...)
   Ui/SettingsWindow.cs appearance dialog (font / size / scheme / colors)
   Settings.cs          persisted appearance (JSON in %APPDATA%\WslTerminal)
   Schemes.cs           built-in color schemes
@@ -136,6 +141,8 @@ block on a GUI exe, capture them with
 --settingstest # verify the appearance dialog opens
 --tabtest      # open a window, add/close tabs, assert the tab count tracks
 --splittest    # split the active pane right/down, close one; assert pane count
+--sidebartest  # file sidebar: list, open a file tab, toggle hidden + font size
+--hltest       # assert file-type -> syntax-highlighting mappings (incl. shell)
 --muxtest      # open two PTY sessions over one server; assert distinct /dev/pts
 --emojitest    # render emoji/kaomoji/CJK and assert fallback + combining work
 --benchtest    # headless VT parse+grid throughput (termbench-style workloads)
@@ -150,6 +157,19 @@ block on a GUI exe, capture them with
   session on the shared server. Plus one PTY **server** per distro
   multiplexing all windows over a single wsl.exe; the app is single-instance, so
   relaunching it reuses the same host + server.
+* **File sidebar** (Ctrl+Shift+E) — a left panel that **follows the active shell's
+  working directory** (OSC 7). Double-click a folder to enter it, a file to open
+  it in a **viewer/editor tab**; right-click for Open / "Insert path at prompt"
+  (files) or "Open in new window" (folders). Hidden dot-files are off by default
+  (Ctrl+Shift+H toggles). The panel font defaults to the terminal's size and is
+  adjustable (Ctrl +/−/0 when focused). The panel is opaque even when the window
+  is translucent.
+* **File viewer/editor** — opened files become tabs with **syntax highlighting**
+  (~35 languages: the AvalonEdit built-ins plus bundled shell/YAML/Rust/Go/
+  TypeScript/TOML/INI/Dockerfile/Ruby/Lua definitions; unknown text → plain), or
+  a rendered image. Text is **editable** — **Ctrl+S** saves back to the WSL file;
+  a ● marks unsaved changes and closing prompts to save. Images, binaries, and
+  over-cap (>2 MB) files are read-only.
 * Real `/dev/pts/N` shell via `forkpty` (full job control, resize, echo).
 * Mouse text **selection** (drag, double-click word, triple-click line) with
   copy (Ctrl+Shift+C or right-click) and paste.
@@ -202,6 +222,10 @@ bounded by the shared WSL relay transport, not the terminal. Measure with
 | Ctrl+Shift+C, or right-click (with selection) | copy selection |
 | Ctrl+Shift+V / Shift+Insert / right-click (no selection) | paste |
 | Ctrl+Shift+N | new window in the shell's current directory |
+| Ctrl+Shift+E / the 🗀 button | toggle the file sidebar |
+| Ctrl+Shift+H | toggle hidden (dot) files in the sidebar |
+| double-click file / folder (sidebar) | open file in a tab / enter folder |
+| Ctrl+S (in a file tab) | save edits back to the WSL file |
 | Ctrl+, | open the appearance settings dialog |
 | Ctrl+= / Ctrl+- / Ctrl+0 | increase / decrease / reset font size |
 | Ctrl+mouse wheel | zoom font size |

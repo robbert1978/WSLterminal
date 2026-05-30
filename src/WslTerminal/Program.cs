@@ -26,11 +26,13 @@ internal static class Program
                 case "--shottest":
                 case "--tabtest":
                 case "--splittest":
+                case "--sidebartest":
                 case "--settingstest":
                 case "--muxtest":
                 case "--emojitest":
                 case "--opacitytest":
                 case "--benchtest":
+                case "--hltest":
                 case "--pipetest":
                     mode = args[i];
                     break;
@@ -51,6 +53,7 @@ internal static class Program
         if (mode == "--emojitest") return EmojiTest();        // no WSL needed
         if (mode == "--opacitytest") return OpacityTest();    // no WSL needed
         if (mode == "--benchtest") return BenchTest();        // no WSL needed
+        if (mode == "--hltest") return HlTest();              // no WSL needed
 
         try { Console.OutputEncoding = Encoding.UTF8; } catch { }
 
@@ -66,6 +69,7 @@ internal static class Program
             "--shottest" => ShotTest(distro),
             "--tabtest" => TabTest(distro),
             "--splittest" => SplitTest(distro),
+            "--sidebartest" => SidebarTest(distro),
             "--muxtest" => MuxTest(distro),
             "--pipetest" => PipeTest(distro),
             "--probe" => ConsoleModes.Probe(distro),
@@ -225,6 +229,71 @@ internal static class Program
         return result;
     }
 
+    // Exercise the file sidebar: point it at a WSL dir, assert it lists entries,
+    // render the window (sidebar + a file preview), preview a known text file, and
+    // toggle the sidebar off.
+    private static int SidebarTest(string distro)
+    {
+        string server = WslBootstrap.ResolveServer();
+        var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+        var win = new MainWindow(distro, server, Settings.Load());
+        int step = 0, result = 1;
+        const string previewPath = "/etc/hostname";   // small text file present in every distro
+        win.Show();
+        var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(1.3) };
+        timer.Tick += (_, _) =>
+        {
+            step++;
+            if (step == 1)
+            {
+                win.TestSidebarSetDir("/etc");           // exists + has many files
+            }
+            else if (step == 2)
+            {
+                win.TestOpenFileTab(previewPath);        // double-click a file -> opens a viewer tab
+            }
+            else
+            {
+                int n = win.TestSidebarItemCount;
+                bool doc = win.TestActiveIsDocument;      // the viewer tab is now active
+                string png = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "wslterminal_sidebar.png");
+                win.CaptureWindow(png);
+                Console.WriteLine($"[sidebartest] header='{win.TestSidebarHeader}' items={n} openedDocTab={doc}; saved {png}");
+                bool visBefore = win.TestSidebarVisible;
+                win.TestToggleSidebar();
+                bool visAfter = win.TestSidebarVisible;
+                Console.WriteLine($"[sidebartest] visible {visBefore} -> {visAfter} after toggle");
+
+                // hidden-files toggle: /etc has dotfiles, so showing them adds entries
+                win.TestToggleSidebar();                  // re-show the sidebar
+                bool hidDefault = win.TestShowHidden;     // expect false (hidden by default)
+                int hiddenOff = win.TestSidebarItemCount;
+                win.TestToggleHidden();                   // show hidden
+                int hiddenOn = win.TestSidebarItemCount;
+                bool hidWorks = !hidDefault && win.TestShowHidden && hiddenOn >= hiddenOff;
+                Console.WriteLine($"[sidebartest] hidden default={hidDefault} items {hiddenOff}->{hiddenOn} on show");
+
+                // panel font size: defaults to terminal size, bump changes it
+                double f0 = win.TestSidebarFontSize;
+                win.TestSidebarBumpFont(+3);
+                double f1 = win.TestSidebarFontSize;
+                bool fontWorks = f1 == f0 + 3;
+                Console.WriteLine($"[sidebartest] font {f0} -> {f1} after +3");
+
+                result = (n > 1 && doc && visBefore && !visAfter && hidWorks && fontWorks) ? 0 : 1;
+                Console.WriteLine(result == 0
+                    ? "[sidebartest] PASS — lists files, opens tab, toggles, hidden-files toggle + font size work"
+                    : "[sidebartest] FAIL");
+                timer.Stop();
+                app.Shutdown();
+            }
+        };
+        timer.Start();
+        app.Run();
+        WslMuxManager.DisposeAll();
+        return result;
+    }
+
     // Verify the appearance dialog constructs + lays out without throwing, and
     // render it to a PNG for inspection.
     private static int SettingsTest()
@@ -327,6 +396,62 @@ internal static class Program
             ? "[emojitest] PASS — color emoji (Direct2D) + kaomoji/CJK (font fallback) render"
             : "[emojitest] FAIL");
         return ok ? 0 : 1;
+    }
+
+    // Verify the file-preview highlighting resolver: each filename maps to the
+    // expected highlighting definition (or null = plain text). Confirms the bundled
+    // shell/YAML .xshd actually load and that built-ins resolve. No WSL needed.
+    private static int HlTest()
+    {
+        var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+        int result = 1;
+        app.Dispatcher.Invoke(() =>
+        {
+            (string file, string? text, string? expect)[] cases =
+            {
+                ("deploy.sh",  null, "Shell"),
+                ("run.bash",   null, "Shell"),
+                ("conf.yaml",  null, "YAML"),
+                ("conf.yml",   null, "YAML"),
+                ("app.py",     null, "Python"),
+                ("main.cs",    null, "C#"),
+                ("a.cpp",      null, "C++"),
+                ("page.json",  null, "Json"),
+                ("notes.md",   null, "MarkDown*"),   // built-in may be "MarkDown" or "MarkDownWithFontSize"
+                ("lib.rs",     null, "Rust"),
+                ("main.go",    null, "Go"),
+                ("app.ts",     null, "TypeScript"),
+                ("Cargo.toml", null, "TOML"),
+                ("my.conf",    null, "INI"),
+                ("server.rb",  null, "Ruby"),
+                ("init.lua",   null, "Lua"),
+                ("Main.java",  null, "Java"),
+                ("q.sql",      null, "TSQL"),
+                ("Dockerfile", null, "Dockerfile"),
+                (".bashrc",    null, "Shell"),
+                (".gitconfig", null, "INI"),
+                ("script",     "#!/usr/bin/env bash\necho hi", "Shell"),  // shebang sniff
+                ("tool",       "#!/usr/bin/python3\nprint(1)", "Python"),
+                ("LICENSE",    "Copyright ...", null),                    // plain text
+            };
+            int pass = 0;
+            foreach (var (file, text, expect) in cases)
+            {
+                var def = WslTerminal.Ui.FilePreview.HighlightingFor(file, text);
+                string got = def?.Name ?? "(plain)";
+                string want = expect ?? "(plain)";
+                bool ok = want.EndsWith("*")
+                    ? got.StartsWith(want[..^1], StringComparison.OrdinalIgnoreCase)
+                    : string.Equals(got, want, StringComparison.OrdinalIgnoreCase);
+                if (ok) pass++;
+                Console.WriteLine($"[hltest] {file,-12} -> {got,-10} expect {expect ?? "(plain)",-10} {(ok ? "ok" : "MISMATCH")}");
+            }
+            result = pass == cases.Length ? 0 : 1;
+            Console.WriteLine(result == 0
+                ? $"[hltest] PASS - {pass}/{cases.Length} mappings (shell + yaml .xshd loaded)"
+                : $"[hltest] FAIL - {pass}/{cases.Length} correct");
+        });
+        return result;
     }
 
     // Verify the background renders translucent: at 90% opacity the empty

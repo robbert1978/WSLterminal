@@ -12,6 +12,8 @@ public sealed class Terminal
     /// <summary>Bytes the emulator must send back to the PTY (DSR/DA replies).</summary>
     public event Action<byte[]>? Respond;
     public event Action<string>? TitleChanged;
+    /// <summary>Fires when the shell reports a new working directory (OSC 7).</summary>
+    public event Action<string>? DirectoryChanged;
 
     private string? _cwd;
     /// <summary>Latest working directory reported by the shell via OSC 7 (or null).</summary>
@@ -23,7 +25,12 @@ public sealed class Terminal
         _parser = new VtParser(_screen,
             bytes => Respond?.Invoke(bytes),
             title => TitleChanged?.Invoke(title),
-            cwd => { lock (Sync) _cwd = cwd; });
+            cwd =>
+            {
+                bool changed;
+                lock (Sync) { changed = _cwd != cwd; _cwd = cwd; }
+                if (changed) DirectoryChanged?.Invoke(cwd);
+            });
     }
 
     public int Cols { get { lock (Sync) return _screen.Cols; } }

@@ -72,6 +72,8 @@ public sealed class TerminalView : FrameworkElement
     public event Action<int>? SwitchTabRequested;   // +1 next, -1 previous
     public event Action<bool>? SplitRequested;      // true = split right (columns), false = split down (rows)
     public event Action? Focused;
+    public event Action? ToggleSidebarRequested;    // Ctrl+Shift+E toggles the file sidebar
+    public event Action? ToggleHiddenRequested;     // Ctrl+Shift+H toggles hidden files in the sidebar
 
     public TerminalView(Terminal term)
     {
@@ -663,6 +665,8 @@ public sealed class TerminalView : FrameworkElement
         if (ctrl && shift && key == Key.N) { NewWindowRequested?.Invoke(); e.Handled = true; return; }
         if (ctrl && shift && key == Key.T) { NewTabRequested?.Invoke(); e.Handled = true; return; }
         if (ctrl && shift && key == Key.W) { ClosePaneRequested?.Invoke(); e.Handled = true; return; }
+        if (ctrl && shift && key == Key.E) { ToggleSidebarRequested?.Invoke(); e.Handled = true; return; }
+        if (ctrl && shift && key == Key.H) { ToggleHiddenRequested?.Invoke(); e.Handled = true; return; }
         if (ctrl && key == Key.Tab) { SwitchTabRequested?.Invoke(shift ? -1 : 1); e.Handled = true; return; }
         if (ctrl && key == Key.OemComma) { OpenSettingsRequested?.Invoke(); e.Handled = true; return; }
         if (ctrl && key is Key.OemPlus or Key.Add) { ZoomFont(+1); e.Handled = true; return; }

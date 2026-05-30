@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<SyntaxDefinition name="Go" extensions=".go"
+                  xmlns="http://icsharpcode.net/sharpdevelop/syntaxdefinition/2008">
+  <Color name="Comment" foreground="#6A9955" />
+  <Color name="String"  foreground="#CE9178" />
+  <Color name="Keyword" foreground="#569CD6" fontWeight="bold" />
+  <Color name="Type"    foreground="#4EC9B0" />
+  <Color name="Number"  foreground="#B5CEA8" />
+  <RuleSet ignoreCase="false">
+    <Span color="Comment" multiline="true"><Begin>/\*</Begin><End>\*/</End></Span>
+    <Span color="Comment"><Begin>//</Begin></Span>
+    <Span color="String" multiline="true"><Begin>"</Begin><End>"</End><RuleSet><Span begin="\\" end="." /></RuleSet></Span>
+    <Span color="String" multiline="true"><Begin>`</Begin><End>`</End></Span>
+    <Span color="String"><Begin>'</Begin><End>'</End></Span>
+    <Keywords color="Keyword">
+      <Word>break</Word><Word>case</Word><Word>chan</Word><Word>const</Word><Word>continue</Word>
+      <Word>default</Word><Word>defer</Word><Word>else</Word><Word>fallthrough</Word><Word>for</Word>
+      <Word>func</Word><Word>go</Word><Word>goto</Word><Word>if</Word><Word>import</Word>
+      <Word>interface</Word><Word>map</Word><Word>package</Word><Word>range</Word><Word>return</Word>
+      <Word>select</Word><Word>struct</Word><Word>switch</Word><Word>type</Word><Word>var</Word>
+    </Keywords>
+    <Keywords color="Type">
+      <Word>bool</Word><Word>string</Word><Word>error</Word><Word>byte</Word><Word>rune</Word>
+      <Word>int</Word><Word>int8</Word><Word>int16</Word><Word>int32</Word><Word>int64</Word>
+      <Word>uint</Word><Word>uint8</Word><Word>uint16</Word><Word>uint32</Word><Word>uint64</Word>
+      <Word>uintptr</Word><Word>float32</Word><Word>float64</Word><Word>complex64</Word><Word>complex128</Word>
+      <Word>true</Word><Word>false</Word><Word>nil</Word><Word>iota</Word>
+    </Keywords>
+    <Rule color="Number">\b0[xX][0-9a-fA-F]+|\b[0-9]+(\.[0-9]+)?\b</Rule>
+  </RuleSet>
+</SyntaxDefinition>

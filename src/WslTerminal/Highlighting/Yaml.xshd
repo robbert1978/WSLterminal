@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<!-- YAML highlighting for AvalonEdit (replaces the wrong XML borrow). -->
+<SyntaxDefinition name="YAML" extensions=".yml;.yaml"
+                  xmlns="http://icsharpcode.net/sharpdevelop/syntaxdefinition/2008">
+
+  <Color name="Comment" foreground="#6A9955" />
+  <Color name="Key"     foreground="#9CDCFE" />
+  <Color name="String"  foreground="#CE9178" />
+  <Color name="Value"   foreground="#569CD6" fontWeight="bold" />
+  <Color name="Number"  foreground="#B5CEA8" />
+  <Color name="Anchor"  foreground="#DCDCAA" />
+
+  <RuleSet ignoreCase="false">
+
+    <!-- comment to end of line -->
+    <Span color="Comment" begin="\#" />
+
+    <!-- mapping key:  leading "key:" -->
+    <Rule color="Key">(?&lt;=^\s*)[\w.\-/]+(?=\s*:)</Rule>
+
+    <!-- list/dash marker handled implicitly; document markers -->
+    <Keywords color="Value">
+      <Word>true</Word>  <Word>false</Word> <Word>null</Word>
+      <Word>yes</Word>   <Word>no</Word>    <Word>on</Word>   <Word>off</Word>
+      <Word>True</Word>  <Word>False</Word> <Word>Null</Word> <Word>~</Word>
+    </Keywords>
+
+    <!-- anchors and references: &name, *name -->
+    <Rule color="Anchor">[&amp;\*][A-Za-z0-9_\-]+</Rule>
+
+    <!-- quoted strings -->
+    <Span color="String" multiline="false"><Begin>"</Begin><End>"</End></Span>
+    <Span color="String" multiline="false"><Begin>'</Begin><End>'</End></Span>
+
+    <!-- numbers -->
+    <Rule color="Number">\b[0-9]+(\.[0-9]+)?\b</Rule>
+
+  </RuleSet>
+</SyntaxDefinition>

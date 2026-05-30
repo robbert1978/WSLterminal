@@ -34,6 +34,19 @@ public sealed class MainWindow : Window
     private Border _plus = null!;
     private const double TitleBarHeight = 32;
 
+    // left file sidebar (follows the active pane's cwd)
+    private FileSidebar _sidebar = null!;
+    private ColumnDefinition _sidebarCol = null!;
+    private GridSplitter _sidebarSplitter = null!;
+    private bool _sidebarVisible = true;
+    private double _sidebarWidth = 260;
+    private Pane? _lastTerminalPane;   // most-recent active terminal pane (cwd source when a document tab is active)
+
+    // The live terminal pane to act on: the active pane if the active tab is a
+    // terminal, otherwise the last terminal pane that was active.
+    private Pane? LiveTerminalPane => _active is { IsDocument: false } ? _active.Active : _lastTerminalPane;
+    private string? CurrentCwd => LiveTerminalPane?.Term.CurrentDirectory;
+
     public MainWindow(string distro, string serverWinPath, Settings settings, string? startDir = null)
     {
         _distro = distro;
@@ -45,6 +58,11 @@ public sealed class MainWindow : Window
         Width = 960; Height = 600;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         Icon = LoadAppIcon();
+
+        // Apply theme colors up front so chrome built in the constructor (title
+        // bar, sidebar) uses the user's scheme — not the Campbell defaults. Panes
+        // re-apply it via ApplySettings, which is idempotent.
+        Theme.Apply(_settings);
 
         _translucent = Math.Clamp(_settings.Opacity, 10, 100) < 100;
         if (_translucent)
@@ -77,6 +95,7 @@ public sealed class MainWindow : Window
 
         Content = BuildLayout();
         Loaded += OnLoaded;
+        Closing += OnClosing;
         Closed += OnClosed;
     }
 
@@ -85,7 +104,7 @@ public sealed class MainWindow : Window
     private UIElement BuildLayout()
     {
         _tabStrip = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Bottom };
-        _plus = MakeToolButton("+", () => AddTab(_active?.Active.Term.CurrentDirectory));
+        _plus = MakeToolButton("+", () => AddTab(CurrentCwd));
 
         var tabArea = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
         if (_translucent)
@@ -96,6 +115,7 @@ public sealed class MainWindow : Window
                 Margin = new Thickness(8, 0, 6, 0),
                 VerticalAlignment = VerticalAlignment.Center,
             });
+        tabArea.Children.Add(MakeToolButton("🗀", ToggleSidebar));   // toggle file sidebar (Ctrl+Shift+E)
         tabArea.Children.Add(_tabStrip);
         tabArea.Children.Add(_plus);
 
@@ -117,11 +137,138 @@ public sealed class MainWindow : Window
         }
 
         _content = new Grid();
+
+        _sidebar = new FileSidebar(_distro);
+        _sidebar.ApplyTheme();
+        _sidebar.InitFontSize(_settings.FontSize);          // panel font defaults to the terminal's
+        _sidebar.InsertPath += OnSidebarInsert;
+        _sidebar.OpenFile += OpenFileInTab;                 // double-click a file -> viewer tab
+        _sidebar.OpenInNewWindow += dir => SpawnNewWindow(dir);   // right-click dir -> new window
+
+        // main area: [sidebar | splitter | content]
+        var mainArea = new Grid();
+        _sidebarCol = new ColumnDefinition { Width = new GridLength(_sidebarWidth), MinWidth = 0 };
+        mainArea.ColumnDefinitions.Add(_sidebarCol);
+        mainArea.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        mainArea.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        Grid.SetColumn(_sidebar, 0);
+        mainArea.Children.Add(_sidebar);
+
+        _sidebarSplitter = new GridSplitter
+        {
+            Width = 3,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Stretch,
+            Background = new SolidColorBrush(Color.FromArgb(0x30, 0xFF, 0xFF, 0xFF)),
+            ResizeBehavior = GridResizeBehavior.PreviousAndNext,
+            ResizeDirection = GridResizeDirection.Columns,
+        };
+        Grid.SetColumn(_sidebarSplitter, 1);
+        mainArea.Children.Add(_sidebarSplitter);
+
+        Grid.SetColumn(_content, 2);
+        mainArea.Children.Add(_content);
+
         var root = new DockPanel { LastChildFill = true };
         DockPanel.SetDock(_topBar, Dock.Top);
         root.Children.Add(_topBar);
-        root.Children.Add(_content);
+        root.Children.Add(mainArea);
         return root;
+    }
+
+    private void OnSidebarInsert(string linuxPath)
+    {
+        var pane = LiveTerminalPane;
+        if (pane?.Session is null) return;
+        string quoted = "'" + linuxPath.Replace("'", "'\\''") + "'";   // shell-safe
+        pane.Session.SendData(System.Text.Encoding.UTF8.GetBytes(quoted + " "));
+        pane.View.Focus();
+    }
+
+    // Open a file in a new document tab: editable syntax-highlighted text (Ctrl+S
+    // saves back to WSL), or a read-only image/binary/over-cap view.
+    private void OpenFileInTab(string linuxPath)
+    {
+        string name = linuxPath.TrimEnd('/');
+        int i = name.LastIndexOf('/'); if (i >= 0) name = name[(i + 1)..];
+        FileDocument? doc = null;
+        try { doc = FilePreview.Create(_distro, linuxPath, name); }
+        catch (Exception ex) { Log("preview failed: " + ex.Message); }
+        if (doc is null) return;
+        AddDocumentTab(doc);
+    }
+
+    private void AddDocumentTab(FileDocument doc)
+    {
+        var tab = new TerminalTab { Title = doc.Name, Document = doc.Element, Doc = doc };
+        MakeChip(tab);
+        _tabs.Add(tab);
+        RebuildStrip();
+        SelectTab(tab);
+
+        doc.DirtyChanged += () => Dispatcher.BeginInvoke(() => RefreshDocChip(tab));
+        if (doc.Editor is not null)
+            doc.Editor.PreviewKeyDown += (_, e) =>
+            {
+                if (e.Key == Key.S && (Keyboard.Modifiers & ModifierKeys.Control) != 0)
+                { SaveDoc(tab); e.Handled = true; }
+            };
+        RefreshDocChip(tab);
+    }
+
+    // Show the dirty marker (●) on a document tab's chip + window title.
+    private void RefreshDocChip(TerminalTab tab)
+    {
+        if (!tab.IsDocument) return;
+        string mark = tab.Doc?.IsDirty == true ? "● " : "";
+        tab.Label.Text = mark + tab.Title;
+        if (_active == tab) Title = $"{mark}{tab.Title} — {_distro}";
+    }
+
+    private bool SaveDoc(TerminalTab tab)
+    {
+        if (tab.Doc is null || !tab.Doc.IsEditable) return false;
+        bool ok = tab.Doc.Save();
+        if (!ok)
+            MessageBox.Show(this, $"Could not save {tab.Doc.Name}.", "Save failed",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+        RefreshDocChip(tab);
+        return ok;
+    }
+
+    // Yes = save (abort close if the save fails), No = discard, Cancel = keep open.
+    private bool ConfirmDiscardOrSave(TerminalTab tab)
+    {
+        if (tab.Doc?.IsDirty != true) return true;
+        var r = MessageBox.Show(this, $"Save changes to {tab.Doc.Name}?", "Unsaved changes",
+            MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
+        return r switch
+        {
+            MessageBoxResult.Yes => SaveDoc(tab),
+            MessageBoxResult.No => true,
+            _ => false,
+        };
+    }
+
+    private void ToggleSidebar()
+    {
+        _sidebarVisible = !_sidebarVisible;
+        if (_sidebarVisible)
+        {
+            _sidebarCol.Width = new GridLength(_sidebarWidth);
+            _sidebar.Visibility = Visibility.Visible;
+            _sidebarSplitter.Visibility = Visibility.Visible;
+            _sidebar.SetDir(CurrentCwd);
+        }
+        else
+        {
+            _sidebarWidth = _sidebarCol.ActualWidth > 40 ? _sidebarCol.ActualWidth : _sidebarWidth;
+            _sidebarCol.Width = new GridLength(0);
+            _sidebar.Visibility = Visibility.Collapsed;
+            _sidebarSplitter.Visibility = Visibility.Collapsed;
+            LiveTerminalPane?.View.Focus();
+        }
     }
 
     // ---- tabs --------------------------------------------------------------
@@ -162,9 +309,16 @@ public sealed class MainWindow : Window
             pane.Title = string.IsNullOrWhiteSpace(t) ? "shell" : t;
             if (tab.Active == pane) UpdateTabTitle(tab);
         });
+        // the sidebar follows whichever pane is active
+        term.DirectoryChanged += d => Dispatcher.BeginInvoke(() =>
+        {
+            if (_active?.Active == pane && _sidebarVisible) _sidebar.SetDir(d);
+        });
 
         view.Focused += () => SetActivePane(tab, pane);
-        view.NewWindowRequested += SpawnNewWindow;
+        view.ToggleSidebarRequested += ToggleSidebar;
+        view.ToggleHiddenRequested += () => _sidebar.ToggleHidden();
+        view.NewWindowRequested += () => SpawnNewWindow();
         view.OpenSettingsRequested += OpenSettings;
         view.NewTabRequested += () => AddTab(pane.Term.CurrentDirectory);
         view.ClosePaneRequested += () => ClosePane(tab, pane);
@@ -240,15 +394,18 @@ public sealed class MainWindow : Window
     private void SetActivePane(TerminalTab tab, Pane pane)
     {
         tab.Active = pane;
+        _lastTerminalPane = pane;   // remember for cwd/new-window while a document tab is active
         foreach (var p in tab.Panes)
             p.Host.BorderBrush = p == pane && tab.Panes.Count > 1 ? AccentBrush() : Brushes.Transparent;
         UpdateTabTitle(tab);
+        if (_sidebarVisible) _sidebar?.SetDir(pane.Term.CurrentDirectory);
         if (!pane.View.IsKeyboardFocusWithin)
             Dispatcher.BeginInvoke(new Action(() => pane.View.Focus()), DispatcherPriority.Input);
     }
 
     private void UpdateTabTitle(TerminalTab tab)
     {
+        if (tab.IsDocument) { if (_active == tab) Title = $"{tab.Title} — {_distro}"; return; }
         tab.Title = tab.Active.Title;
         tab.Label.Text = tab.Title;
         if (_active == tab) Title = $"{tab.Title} — {_distro}";
@@ -308,7 +465,7 @@ public sealed class MainWindow : Window
     private void ShowRoot(TerminalTab tab)
     {
         _content.Children.Clear();
-        _content.Children.Add(tab.Root.Element);
+        _content.Children.Add(tab.Document ?? tab.Root.Element);
     }
 
     private void SelectTab(TerminalTab tab)
@@ -317,13 +474,17 @@ public sealed class MainWindow : Window
         ShowRoot(tab);
         RefreshChips();
         Title = $"{tab.Title} — {_distro}";
-        Dispatcher.BeginInvoke(new Action(() => tab.Active.View.Focus()), DispatcherPriority.Input);
+        if (tab.IsDocument)
+            Dispatcher.BeginInvoke(new Action(() => tab.Document!.Focus()), DispatcherPriority.Input);
+        else
+            Dispatcher.BeginInvoke(new Action(() => tab.Active.View.Focus()), DispatcherPriority.Input);
     }
 
     private void CloseTab(TerminalTab tab)
     {
         int idx = _tabs.IndexOf(tab);
         if (idx < 0) return;
+        if (tab.IsDocument && !ConfirmDiscardOrSave(tab)) return;   // unsaved edits: Save/Discard/Cancel
         foreach (var p in tab.Panes) { try { p.Session?.Close(); } catch { } }
         _tabs.RemoveAt(idx);
         if (_active == tab) _content.Children.Clear();
@@ -485,9 +646,9 @@ public sealed class MainWindow : Window
 
     // ---- window actions ----------------------------------------------------
 
-    private void SpawnNewWindow()
+    private void SpawnNewWindow(string? dir = null)
     {
-        try { new MainWindow(_distro, _serverWinPath, Settings.Load(), _active?.Active.Term.CurrentDirectory).Show(); }
+        try { new MainWindow(_distro, _serverWinPath, Settings.Load(), dir ?? CurrentCwd).Show(); }
         catch (Exception ex) { Log("new window failed: " + ex.Message); }
     }
 
@@ -513,6 +674,7 @@ public sealed class MainWindow : Window
         }
         _topBar.Background = BgBrush();
         Background = _translucent ? Brushes.Transparent : BgBrush();
+        _sidebar?.ApplyTheme();
         RefreshChips();
     }
 
@@ -528,6 +690,17 @@ public sealed class MainWindow : Window
         try { _mux = WslMuxManager.Get(_distro, _serverWinPath); }
         catch (Exception ex) { Log("mux start failed: " + ex.Message); }
         AddTab(_startDir);
+    }
+
+    // Prompt for any unsaved document tabs before the window closes.
+    private void OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        foreach (var t in _tabs)
+        {
+            if (t.Doc?.IsDirty != true) continue;
+            SelectTab(t);                       // show which file is being asked about
+            if (!ConfirmDiscardOrSave(t)) { e.Cancel = true; return; }
+        }
     }
 
     private void OnClosed(object? sender, EventArgs e)
@@ -573,6 +746,19 @@ public sealed class MainWindow : Window
     internal void TestSplit(bool columns) { if (_active is not null) SplitPane(_active, _active.Active, columns); }
     internal int TestPaneCount => _active?.Panes.Count ?? 0;
     internal void TestClosePane() { if (_active is not null) ClosePane(_active, _active.Active); }
+
+    // ---- test hooks (--sidebartest) ---------------------------------------
+    internal bool TestSidebarVisible => _sidebarVisible;
+    internal void TestToggleSidebar() => ToggleSidebar();
+    internal void TestSidebarSetDir(string linuxDir) => _sidebar.SetDir(linuxDir);
+    internal int TestSidebarItemCount => _sidebar.ItemCount;
+    internal string TestSidebarHeader => _sidebar.HeaderText;
+    internal void TestOpenFileTab(string linuxPath) => _sidebar.TestActivateFile(linuxPath);
+    internal bool TestActiveIsDocument => _active?.IsDocument ?? false;
+    internal bool TestShowHidden => _sidebar.TestShowHidden;
+    internal void TestToggleHidden() => _sidebar.TestToggleHidden();
+    internal double TestSidebarFontSize => _sidebar.TestFontSize;
+    internal void TestSidebarBumpFont(double d) => _sidebar.TestBumpFont(d);
 
     internal void CaptureWindow(string png)
     {

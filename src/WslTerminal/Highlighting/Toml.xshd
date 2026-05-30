@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<SyntaxDefinition name="TOML" extensions=".toml"
+                  xmlns="http://icsharpcode.net/sharpdevelop/syntaxdefinition/2008">
+  <Color name="Comment" foreground="#6A9955" />
+  <Color name="String"  foreground="#CE9178" />
+  <Color name="Section" foreground="#569CD6" fontWeight="bold" />
+  <Color name="Key"     foreground="#9CDCFE" />
+  <Color name="Value"   foreground="#569CD6" />
+  <Color name="Number"  foreground="#B5CEA8" />
+  <RuleSet ignoreCase="false">
+    <Span color="Comment"><Begin>\#</Begin></Span>
+    <Span color="Section"><Begin>\[</Begin><End>\]</End></Span>
+    <Span color="String" multiline="true"><Begin>"</Begin><End>"</End></Span>
+    <Span color="String" multiline="true"><Begin>'</Begin><End>'</End></Span>
+    <Rule color="Key">(?&lt;=^\s*)[\w.\-]+(?=\s*=)</Rule>
+    <Keywords color="Value"><Word>true</Word><Word>false</Word></Keywords>
+    <Rule color="Number">\b[0-9][0-9_]*(\.[0-9_]+)?\b</Rule>
+  </RuleSet>
+</SyntaxDefinition>
