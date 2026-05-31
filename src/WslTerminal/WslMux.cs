@@ -98,6 +98,12 @@ public sealed class WslMux : IDisposable
     private void ReaderLoop()
     {
         var hdr = new byte[9];
+        // One reusable payload buffer for the whole connection. DATA is consumed
+        // synchronously by RaiseData -> Terminal.Feed (it parses immediately), so
+        // we can hand out a span over this buffer instead of allocating a fresh
+        // byte[] per frame. Under a firehose (e.g. termbench) that per-frame
+        // allocation was large-object-heap churn that spiked memory.
+        byte[] payload = new byte[65536];
         try
         {
             while (ReadFull(_p.StdOut, hdr, 9))
@@ -107,12 +113,12 @@ public sealed class WslMux : IDisposable
                 uint len = BinaryPrimitives.ReadUInt32LittleEndian(hdr.AsSpan(5));
                 if (len > 64u * 1024 * 1024) break;             // sanity bound
 
-                byte[] payload = len > 0 ? new byte[len] : Array.Empty<byte>();
+                if (len > (uint)payload.Length) payload = new byte[len];   // grow + keep
                 if (len > 0 && !ReadFull(_p.StdOut, payload, (int)len)) break;
 
                 MuxSession? s;
                 lock (_lock) _sessions.TryGetValue(id, out s);
-                if (type == 2) s?.RaiseData(payload);
+                if (type == 2) s?.RaiseData(payload.AsSpan(0, (int)len));
                 else if (type == 6)
                 {
                     int code = len >= 4 ? (int)BinaryPrimitives.ReadUInt32LittleEndian(payload) : 0;
@@ -160,7 +166,11 @@ public sealed class MuxSession
     private readonly WslMux _mux;
     public uint Id { get; }
 
-    public event Action<byte[]>? DataReceived;
+    // The payload is a span over the reader's reusable buffer — valid only for the
+    // duration of the call. Handlers must consume it synchronously (Terminal.Feed
+    // parses immediately) and not stash the reference.
+    public event DataHandler? DataReceived;
+    public delegate void DataHandler(ReadOnlySpan<byte> data);
     public event Action<int>? Exited;
 
     internal MuxSession(WslMux mux, uint id) { _mux = mux; Id = id; }
@@ -170,7 +180,7 @@ public sealed class MuxSession
     public void SendSignal(int signo) => _mux.SendSignal(Id, signo);
     public void Close() => _mux.Close(Id);
 
-    internal void RaiseData(byte[] data) => DataReceived?.Invoke(data);
+    internal void RaiseData(ReadOnlySpan<byte> data) => DataReceived?.Invoke(data);
     internal void RaiseExit(int code) => Exited?.Invoke(code);
 }
 

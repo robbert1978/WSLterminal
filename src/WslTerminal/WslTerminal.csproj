@@ -16,6 +16,16 @@
     <ApplicationIcon>wsl.ico</ApplicationIcon>
     <!-- English only: drop WPF's ~13 locale satellite-resource folders. -->
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+
+    <!-- Memory footprint tuning. A WPF/.NET app can't reach native-terminal RAM
+         levels, but these trim it toward the runtime's floor: Workstation GC (not
+         Server's per-CPU heaps), non-concurrent GC (no extra background-GC heap +
+         thread), and don't retain freed VM segments. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <RetainVMGarbageCollection>false</RetainVMGarbageCollection>
+    <TieredCompilation>true</TieredCompilation>
+    <TieredCompilationQuickJit>true</TieredCompilationQuickJit>
   </PropertyGroup>
 
   <!-- Distribution: a self-contained win-x64 publish emits a single, compressed

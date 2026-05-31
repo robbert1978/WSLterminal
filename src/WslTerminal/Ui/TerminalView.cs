@@ -196,6 +196,11 @@ public sealed class TerminalView : FrameworkElement
     private SolidColorBrush Brush(uint rgb)
     {
         if (_brushes.TryGetValue(rgb, out var b)) return b;
+        // Cap the cache. Truecolor output (e.g. random RGB per cell) would otherwise
+        // grow this unboundedly toward millions of frozen brushes — hundreds of MB.
+        // Frozen brushes are cheap to recreate, so just flush when it gets large;
+        // the 16/256 palette colors that dominate normal use get re-cached at once.
+        if (_brushes.Count >= 4096) _brushes.Clear();
         var c = Color.FromRgb((byte)(rgb >> 16), (byte)(rgb >> 8), (byte)rgb);
         b = new SolidColorBrush(c);
         b.Freeze();
