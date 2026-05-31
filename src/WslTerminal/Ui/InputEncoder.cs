@@ -44,7 +44,10 @@ internal static class InputEncoder
             case Key.F11: return Tilde(23, mod);
             case Key.F12: return Tilde(24, mod);
 
-            case Key.Enter: return alt ? Esc("\r") : Ascii("\r");
+            // Enter = CR. Alt+Enter OR Shift+Enter = ESC CR (meta-Enter): apps like
+            // Claude Code / readline treat meta-Enter as "insert newline", so
+            // Shift+Enter gives a multi-line prompt instead of submitting.
+            case Key.Enter: return (alt || shift) ? Esc("\r") : Ascii("\r");
             case Key.Tab: return shift ? Ascii("\x1b[Z") : Ascii("\t");
             case Key.Escape: return Ascii("\x1b");
             case Key.Back: return alt ? Esc("\x7f") : Ascii(ctrl ? "\b" : "\x7f");

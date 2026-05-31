@@ -377,11 +377,16 @@ public sealed class Screen
 
     // ---- SGR ---------------------------------------------------------------
 
-    public void SetGraphics(IReadOnlyList<int> p)
+    public void SetGraphics(IReadOnlyList<int> p, IReadOnlyList<bool>? colon = null)
     {
         if (p.Count == 0) { ResetPen(); return; }
         for (int i = 0; i < p.Count; i++)
         {
+            // Skip ':' sub-parameters: they belong to the preceding code (the "3"
+            // in 4:3 curly-underline, or the channels of 38:2:r:g:b) and must not
+            // be read as standalone SGR codes — that was leaking underline on.
+            if (colon is not null && i < colon.Count && colon[i]) continue;
+
             int n = p[i];
             switch (n)
             {
@@ -389,7 +394,13 @@ public sealed class Screen
                 case 1: _flags |= CellFlags.Bold; break;
                 case 2: _flags |= CellFlags.Faint; break;
                 case 3: _flags |= CellFlags.Italic; break;
-                case 4: _flags |= CellFlags.Underline; break;
+                case 4:
+                    // 4 = underline on; 4:x = styled underline (x=0 off, else on).
+                    if (colon is not null && i + 1 < p.Count && i + 1 < colon.Count && colon[i + 1] && p[i + 1] == 0)
+                        _flags &= ~CellFlags.Underline;
+                    else
+                        _flags |= CellFlags.Underline;
+                    break;
                 case 5: case 6: _flags |= CellFlags.Blink; break;
                 case 7: _flags |= CellFlags.Reverse; break;
                 case 8: _flags |= CellFlags.Hidden; break;

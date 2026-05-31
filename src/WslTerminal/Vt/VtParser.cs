@@ -24,6 +24,8 @@ public sealed class VtParser
 
     // CSI collection
     private readonly List<int> _params = new();
+    private readonly List<bool> _paramsColon = new();   // true => param is a ':' sub-parameter of the previous
+    private bool _pendingColon;                          // separator before the next param was ':' ?
     private int _cur;
     private bool _curHas;
     private char _priv;            // private marker: ? < = >
@@ -165,7 +167,18 @@ public sealed class VtParser
 
     // ---- CSI ---------------------------------------------------------------
 
-    private void ResetCsi() { _params.Clear(); _cur = 0; _curHas = false; _priv = '\0'; _inter = '\0'; }
+    private void ResetCsi() { _params.Clear(); _paramsColon.Clear(); _pendingColon = false; _cur = 0; _curHas = false; _priv = '\0'; _inter = '\0'; }
+
+    // Flush the accumulating number as a parameter, recording whether the separator
+    // *before* it was a colon (i.e. it's a sub-parameter). sepAfterIsColon is the
+    // separator we just hit, which precedes the next parameter.
+    private void FlushParam(bool sepAfterIsColon)
+    {
+        _params.Add(_curHas ? _cur : 0);
+        _paramsColon.Add(_pendingColon);
+        _pendingColon = sepAfterIsColon;
+        _cur = 0; _curHas = false;
+    }
 
     private void Csi(byte b)
     {
@@ -173,9 +186,10 @@ public sealed class VtParser
         if (b < 0x20) { C0(b); return; }                       // embedded control
         if (c is '?' or '<' or '=' or '>') { _priv = c; return; }
         if (c >= '0' && c <= '9') { _cur = _cur * 10 + (c - '0'); _curHas = true; return; }
-        if (c is ';' or ':') { _params.Add(_curHas ? _cur : 0); _cur = 0; _curHas = false; return; }
+        if (c == ';') { FlushParam(false); return; }   // parameter separator
+        if (c == ':') { FlushParam(true); return; }    // sub-parameter separator (e.g. 4:3, 38:2:r:g:b)
         if (b >= 0x20 && b <= 0x2f) { _inter = c; _state = S.CsiInt; return; }
-        _params.Add(_curHas ? _cur : 0);
+        FlushParam(false);
         DispatchCsi(c);
         _state = S.Ground;
     }
@@ -184,7 +198,7 @@ public sealed class VtParser
     {
         char c = (char)b;
         if (b >= 0x20 && b <= 0x2f) { _inter = c; return; }
-        _params.Add(_curHas ? _cur : 0);
+        FlushParam(false);
         DispatchCsi(c);
         _state = S.Ground;
     }
@@ -198,6 +212,16 @@ public sealed class VtParser
     private void DispatchCsi(char f)
     {
         if (_priv == '?') { DecMode(f); return; }
+
+        // Private CSI with a '>' '<' or '=' prefix (e.g. \e[>4m XTMODKEYS, \e[>c
+        // secondary-DA) is NOT a standard sequence — only secondary DA is handled.
+        // Critically, \e[>4m must NOT fall through to SGR 'm' (it was being read as
+        // SGR 4 = underline, which then bled into all following text).
+        if (_priv is '>' or '<' or '=')
+        {
+            if (f == 'c') PrimaryDa();   // secondary device attributes (_priv '>')
+            return;
+        }
 
         switch (f)
         {
@@ -220,7 +244,7 @@ public sealed class VtParser
             case 'S': _s.ScrollUp(P(0, 1)); break;
             case 'T': _s.ScrollDown(P(0, 1)); break;
             case 'r': _s.SetScrollRegion(P(0), _params.Count > 1 ? P(1) : 0); break;
-            case 'm': _s.SetGraphics(_params); break;
+            case 'm': _s.SetGraphics(_params, _paramsColon); break;
             case 'h': StdMode(true); break;
             case 'l': StdMode(false); break;
             case 'n': DeviceStatus(P(0)); break;

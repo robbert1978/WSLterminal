@@ -17,17 +17,6 @@ public sealed class TerminalView : FrameworkElement
 {
     private readonly Terminal _term;
 
-    // Dirty-row repaint: cache each row's vector drawing and rebuild only the
-    // rows whose content or selection changed; reuse the cached drawing for the
-    // rest. The cursor is a cheap live overlay (drawn below), so moving it never
-    // invalidates a row. With the ~30 fps cap this keeps partial updates (typing,
-    // a refreshing status line) from re-laying-out glyphs for the whole viewport.
-    private DrawingGroup?[] _rowCache = Array.Empty<DrawingGroup?>();
-    private Cell[][] _rendered = Array.Empty<Cell[]>();
-    private (bool on, int s, int e)[] _renderedSel = Array.Empty<(bool, int, int)>();
-    private bool _forceFullRender = true;
-    private double _lastPpd = -1;
-
     // font / metrics
     private GlyphTypeface _gtRegular = null!, _gtBold = null!, _gtItalic = null!, _gtBoldItalic = null!;
     private Typeface _tfRegular = null!, _tfBold = null!, _tfItalic = null!, _tfBoldItalic = null!;
@@ -239,13 +228,6 @@ public sealed class TerminalView : FrameworkElement
         _dest = new Cell[rows][];
         for (int r = 0; r < rows; r++) _dest[r] = new Cell[cols];
 
-        // per-row render cache, sized with the grid (see OnRender dirty-row reuse)
-        _rendered = new Cell[rows][];
-        for (int r = 0; r < rows; r++) _rendered[r] = new Cell[cols];
-        _rowCache = new DrawingGroup?[rows];
-        _renderedSel = new (bool, int, int)[rows];
-        _forceFullRender = true;
-
         _term.Resize(cols, rows);
         Resized?.Invoke(cols, rows);
         _dirty = 1;
@@ -267,63 +249,20 @@ public sealed class TerminalView : FrameworkElement
 
         ViewportInfo vp = _term.CaptureViewport(_scrollOffset, _dest);
 
-        // A DPI change invalidates every cached glyph run.
-        if (_ppd != _lastPpd) { _forceFullRender = true; _lastPpd = _ppd; }
-
-        // Rows: reuse each row's cached drawing unless its content or selection
-        // changed. RenderRow (glyph layout) only runs for rows that actually changed.
+        // Render every row each painted frame. (A previous dirty-row cache reused
+        // per-row drawings to save layout work, but it served stale rows under heavy
+        // TUI redraw — e.g. Claude Code — causing overlapping/garbled output. Frames
+        // are already gated by the _dirty flag and paced to the monitor refresh, so a
+        // full per-row render stays cheap; correctness first.)
         for (int r = 0; r < _rows && r < _dest.Length; r++)
-        {
-            bool selOn = SelSpan(r, out int ss, out int se);
-            if (_forceFullRender || _rowCache[r] is null || RowChanged(r, selOn, ss, se))
-            {
-                var dg = new DrawingGroup();
-                using (DrawingContext rdc = dg.Open())
-                    RenderRow(rdc, r, _dest[r]);
-                dg.Freeze();
-                _rowCache[r] = dg;
-                SnapshotRow(r, selOn, ss, se);
-            }
-            dc.DrawDrawing(_rowCache[r]);
-        }
-        _forceFullRender = false;
+            RenderRow(dc, r, _dest[r]);
 
-        // cursor: live overlay, redrawn every frame over the cached rows (only
-        // when viewing the live bottom). Keeping it here means cursor movement and
-        // focus changes never dirty a row's cache.
+        // cursor: live overlay, redrawn every frame (only when viewing the live bottom)
         if (_scrollOffset == 0 && vp.CursorVisible &&
             vp.CursorX >= 0 && vp.CursorX < _cols && vp.CursorY >= 0 && vp.CursorY < _rows)
         {
             DrawCursor(dc, vp.CursorX, vp.CursorY, _dest[vp.CursorY][vp.CursorX]);
         }
-    }
-
-    // True if row r's rendered appearance (cell content or selection span) differs
-    // from what its cached drawing was built for.
-    private bool RowChanged(int r, bool selOn, int ss, int se)
-    {
-        var prev = _renderedSel[r];
-        if (prev.on != selOn || prev.s != ss || prev.e != se) return true;
-        Cell[] cur = _dest[r], old = _rendered[r];
-        if (cur.Length != old.Length) return true;
-        for (int i = 0; i < cur.Length; i++)
-        {
-            Cell a = cur[i], b = old[i];
-            if (a.Rune != b.Rune || a.Fg != b.Fg || a.Bg != b.Bg ||
-                a.Flags != b.Flags || a.Width != b.Width ||
-                !string.Equals(a.Combo, b.Combo, StringComparison.Ordinal))
-                return true;
-        }
-        return false;
-    }
-
-    // Record what row r's cache was just built from, so RowChanged can detect the
-    // next change. _rendered uses its own arrays (CaptureViewport mutates _dest in
-    // place), so this copy must not alias _dest.
-    private void SnapshotRow(int r, bool selOn, int ss, int se)
-    {
-        Array.Copy(_dest[r], _rendered[r], _dest[r].Length);
-        _renderedSel[r] = (selOn, ss, se);
     }
 
     private void RenderRow(DrawingContext dc, int row, Cell[] cells)

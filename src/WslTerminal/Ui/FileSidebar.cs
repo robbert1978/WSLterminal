@@ -79,18 +79,19 @@ public sealed class FileSidebar : Grid
         Children.Add(_list);
     }
 
-    /// <summary>Set the panel's base font size in points (host calls this with the
-    /// terminal's size; it's also where Ctrl+0 resets to).</summary>
+    /// <summary>Set the panel's base font size from the terminal's size in POINTS.
+    /// WPF FontSize is in DIP, and the terminal renders glyphs at points*96/72 DIP,
+    /// so we convert here to match the terminal's visual size. Ctrl+0 resets here.</summary>
     public void InitFontSize(double points)
     {
-        _baseFontSize = Math.Clamp(points, 6, 48);
+        _baseFontSize = Math.Clamp(points * 96.0 / 72.0, 8, 96);   // points -> WPF DIP
         SetFontSize(_baseFontSize);
     }
 
-    /// <summary>Set the current panel font size in points.</summary>
-    public void SetFontSize(double points)
+    /// <summary>Set the current panel font size in WPF DIP.</summary>
+    public void SetFontSize(double dip)
     {
-        _fontSize = Math.Clamp(points, 6, 48);
+        _fontSize = Math.Clamp(dip, 8, 96);
         ApplyFont();
         Reload();   // rows are rebuilt with the new size
     }

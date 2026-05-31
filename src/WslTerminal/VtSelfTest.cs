@@ -23,6 +23,28 @@ internal static class VtSelfTest
         Case("truecolor SGR", 20, 6, "\x1b[38;2;10;20;30mX", (t, g) =>
             g[0][0].Rune == 'X' && g[0][0].Fg == Theme.Rgb(10, 20, 30));
 
+        // Colon-form styled underline (4:3 = curly): underline ON, and the "3"
+        // sub-parameter must NOT leak as italic. This was the underline-bleed bug.
+        Case("SGR 4:3 styled underline", 20, 6, "\x1b[4:3mU", (t, g) =>
+            (g[0][0].Flags & CellFlags.Underline) != 0 && (g[0][0].Flags & CellFlags.Italic) == 0);
+
+        // 4:0 turns underline OFF (apps pair 4:3 / 4:0).
+        Case("SGR 4:0 underline off", 20, 6, "\x1b[4:3mA\x1b[4:0mB", (t, g) =>
+            (g[0][0].Flags & CellFlags.Underline) != 0 && (g[0][1].Flags & CellFlags.Underline) == 0);
+
+        // Plain 24 still turns underline off.
+        Case("SGR 24 underline off", 20, 6, "\x1b[4mA\x1b[24mB", (t, g) =>
+            (g[0][0].Flags & CellFlags.Underline) != 0 && (g[0][1].Flags & CellFlags.Underline) == 0);
+
+        // Colon-form truecolor (38:2:r:g:b): fg set, no stray flags leak.
+        Case("SGR colon truecolor", 20, 6, "\x1b[38:2:10:20:30mX", (t, g) =>
+            g[0][0].Rune == 'X' && g[0][0].Fg == Theme.Rgb(10, 20, 30) && g[0][0].Flags == CellFlags.None);
+
+        // \e[>4m is XTMODKEYS (private '>' CSI), NOT SGR. It must NOT be read as
+        // SGR 4 = underline (that bug made Claude Code's whole screen underlined).
+        Case("CSI >4m is not underline", 20, 6, "\x1b[>4mX", (t, g) =>
+            g[0][0].Rune == 'X' && (g[0][0].Flags & CellFlags.Underline) == 0);
+
         Case("CR + erase-line + write", 20, 6, "ABC\r\x1b[KZ", (t, g) =>
             g[0][0].Rune == 'Z' && g[0][1].Rune == 0 && g[0][2].Rune == 0);
 
