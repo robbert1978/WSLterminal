@@ -1,18 +1,22 @@
-//! WSL Terminal GUI — Rust rewrite, milestone 1.
+//! WSL Terminal GUI — Rust rewrite.
 //!
-//! A real window that renders the `wslterm-core` terminal grid and pumps the
-//! user's keystrokes (via `wslterm-core::input::encode`) into a live WSL session
-//! driven by `wslterm-pty`. CPU-rendered (winit + softbuffer + ab_glyph) on
-//! purpose: it keeps RAM low and avoids the wgpu/Direct3D managed stack — the
-//! whole point of the rewrite. Color, SGR, scrollback view, tabs, panes, the
-//! sidebar and the editor come in later milestones; this one proves the stack.
+//! A window that renders the `wslterm-core` terminal grid and pumps the user's
+//! keystrokes (via `wslterm-core::input::encode`) into a live WSL session driven
+//! by `wslterm-pty`. CPU-rendered (winit + softbuffer + ab_glyph) on purpose: it
+//! keeps RAM low and avoids the wgpu/Direct3D managed stack — the whole point of
+//! the rewrite.
 //!
-//! NOTE: still a console subsystem app so panics/stderr are visible while we
-//! bring the GUI up. A later milestone switches to the windowless subsystem.
+//! Threading (mirrors the C# app): a background thread owns the mux receiver and
+//! feeds bytes into a shared `Arc<Mutex<Terminal>>`, then wakes the UI to render
+//! (coalesced to one pending wake). The mux uses a *bounded* channel, so under a
+//! flood (e.g. termbench) the reader blocks, back-pressuring wslptyd instead of
+//! buffering the whole burst — memory stays bounded. Rendering is decoupled from
+//! parsing, so a slow repaint never inflates the input queue.
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use softbuffer::{Context, Surface};
@@ -35,9 +39,10 @@ const DEFAULT_FG: u32 = 0xCC_CCCC; // Campbell foreground
 const DEFAULT_BG: u32 = 0x0C_0C0C; // Campbell background
 const CURSOR_RGB: u32 = 0xCC_CCCC;
 
-/// Events delivered to the winit loop from the mux reader thread.
+/// Lightweight events from the feed thread to the UI (no payload — the data is
+/// already in the shared Terminal; this just wakes the loop to render/exit).
 enum UserEvent {
-    Mux(MuxEvent),
+    Redraw,
     Closed,
 }
 
@@ -54,14 +59,17 @@ struct App {
     cell_h: usize,
     ascent: f32,
 
-    term: Terminal,
+    term: Arc<Mutex<Terminal>>,
     mux: Option<WslMux>,
     session: u32,
+    /// Bytes the emulator owes the PTY (DSR/DA), filled by the feed thread,
+    /// flushed by the UI thread (keeps `mux` owned solely by the UI).
+    outbox: Arc<Mutex<Vec<u8>>>,
+    redraw_pending: Arc<AtomicBool>,
+
     mods: ModifiersState,
     scroll_off: usize, // rows scrolled up into scrollback (0 = live bottom)
-
     grid: Vec<Vec<Cell>>, // reused viewport snapshot
-    rx: Option<Receiver<MuxEvent>>,
 }
 
 impl App {
@@ -78,13 +86,14 @@ impl App {
             cell_w: 1,
             cell_h: 1,
             ascent: 0.0,
-            term: Terminal::new(80, 24),
+            term: Arc::new(Mutex::new(Terminal::new(80, 24))),
             mux: None,
             session: 0,
+            outbox: Arc::new(Mutex::new(Vec::new())),
+            redraw_pending: Arc::new(AtomicBool::new(false)),
             mods: ModifiersState::empty(),
             scroll_off: 0,
             grid: Vec::new(),
-            rx: None,
         };
         app.recompute_metrics();
         app
@@ -130,7 +139,7 @@ impl App {
             alt: self.mods.alt_key(),
             shift: self.mods.shift_key(),
         };
-        let app_cursor = self.term.app_cursor_keys();
+        let app_cursor = self.term.lock().unwrap().app_cursor_keys();
 
         // Function keys are most reliable off the physical key code.
         if let PhysicalKey::Code(code) = ev.physical_key {
@@ -156,7 +165,7 @@ impl App {
 
     /// Scroll the view by `lines` into scrollback (+ = up into history).
     fn scroll_by(&mut self, lines: i32) {
-        let max = self.term.scrollback_count() as i32;
+        let max = self.term.lock().unwrap().scrollback_count() as i32;
         let next = (self.scroll_off as i32 + lines).clamp(0, max) as usize;
         if next != self.scroll_off {
             self.scroll_off = next;
@@ -176,7 +185,7 @@ impl App {
 
     fn resize_surface(&mut self, w: u32, h: u32) {
         let (cols, rows) = self.grid_dims(w, h);
-        self.term.resize(cols, rows);
+        self.term.lock().unwrap().resize(cols, rows);
         if let Some(mux) = &self.mux {
             mux.send_resize(self.session, cols as u16, rows as u16);
         }
@@ -199,16 +208,21 @@ impl App {
             Ok(b) => b,
             Err(_) => return,
         };
-        // Clear to background.
         buffer.fill(DEFAULT_BG);
 
-        let off = self.scroll_off.min(self.term.scrollback_count());
-        self.term.capture_viewport(off, &mut self.grid);
-        let cols = self.term.cols();
-        let rows = self.term.rows();
-        let (cx, cy) = (self.term.cx(), self.term.cy());
-        // Cursor only shows in the live view (not while scrolled into history).
-        let cursor_on = self.term.cursor_visible() && off == 0;
+        // Snapshot the grid under the lock, then rasterize without holding it.
+        let (cols, rows, cx, cy, cursor_on);
+        {
+            let t = self.term.lock().unwrap();
+            let off = self.scroll_off.min(t.scrollback_count());
+            t.capture_viewport(off, &mut self.grid);
+            cols = t.cols();
+            rows = t.rows();
+            cx = t.cx();
+            cy = t.cy();
+            // Cursor only shows in the live view (not while scrolled into history).
+            cursor_on = t.cursor_visible() && off == 0;
+        }
 
         let scale = PxScale::from(self.font_px);
         for r in 0..rows.min(self.grid.len()) {
@@ -284,7 +298,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         let (cols, rows) = self.grid_dims(size.width, size.height);
-        self.term = Terminal::new(cols, rows);
+        self.term = Arc::new(Mutex::new(Terminal::new(cols, rows)));
 
         // Bring up the live WSL session.
         let server = bootstrap::resolve_server()
@@ -293,26 +307,46 @@ impl ApplicationHandler<UserEvent> for App {
         let proc = WslProcess::launch(DISTRO, &command).expect("launch wslg.exe");
         let (mux, rx) = WslMux::start(proc);
         self.session = mux.open(cols as u16, rows as u16, "");
+        let session = self.session;
         self.mux = Some(mux);
-        eprintln!(
-            "[wslterm] window up {cols}x{rows}, session {} opened on {DISTRO}",
-            self.session
-        );
+        eprintln!("[wslterm] window up {cols}x{rows}, session {session} opened on {DISTRO}");
 
-        // Forward mux events into the winit loop.
+        // Feed thread: parse bytes into the shared Terminal off the UI thread and
+        // wake the loop to render. Bounded mux channel back-pressures the reader.
+        let term = self.term.clone();
+        let outbox = self.outbox.clone();
+        let pending = self.redraw_pending.clone();
         let proxy = self.proxy.clone();
         std::thread::Builder::new()
-            .name("mux-forward".into())
+            .name("wsl-feed".into())
             .spawn(move || {
                 while let Ok(ev) = rx.recv() {
-                    if proxy.send_event(UserEvent::Mux(ev)).is_err() {
-                        return;
+                    match ev {
+                        MuxEvent::Data { id, bytes } if id == session => {
+                            let mut t = term.lock().unwrap();
+                            t.feed(&bytes);
+                            if !t.respond.is_empty() {
+                                let resp = std::mem::take(&mut t.respond);
+                                drop(t);
+                                outbox.lock().unwrap().extend_from_slice(&resp);
+                            }
+                            // Coalesce: only wake if no redraw is already queued.
+                            if !pending.swap(true, Ordering::AcqRel)
+                                && proxy.send_event(UserEvent::Redraw).is_err()
+                            {
+                                return;
+                            }
+                        }
+                        MuxEvent::Exit { id, .. } if id == session => {
+                            let _ = proxy.send_event(UserEvent::Closed);
+                            return;
+                        }
+                        _ => {}
                     }
                 }
                 let _ = proxy.send_event(UserEvent::Closed);
             })
-            .expect("spawn forwarder");
-        let _ = self.rx.take(); // rx moved into the thread
+            .expect("spawn feed thread");
 
         self.win = Some(win);
         self.context = Some(context);
@@ -321,26 +355,20 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Mux(MuxEvent::Data { id, bytes }) if id == self.session => {
-                self.term.feed(&bytes);
-                if !self.term.respond.is_empty() {
-                    let resp = std::mem::take(&mut self.term.respond);
-                    self.send(&resp);
-                }
+            UserEvent::Redraw => {
+                self.redraw_pending.store(false, Ordering::Release);
                 self.scroll_off = 0; // new output snaps to the live bottom
+                // Flush any DSR/DA responses the feed thread produced.
+                let out = std::mem::take(&mut *self.outbox.lock().unwrap());
+                self.send(&out);
                 if let Some(win) = &self.win {
                     win.request_redraw();
                 }
             }
-            UserEvent::Mux(MuxEvent::Exit { id, code }) if id == self.session => {
-                eprintln!("[wslterm] session {id} exited (code {code})");
-                event_loop.exit();
-            }
             UserEvent::Closed => {
-                eprintln!("[wslterm] mux closed");
+                eprintln!("[wslterm] session ended");
                 event_loop.exit();
             }
-            _ => {}
         }
     }
 

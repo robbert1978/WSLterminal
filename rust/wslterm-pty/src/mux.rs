@@ -6,12 +6,19 @@
 use std::collections::HashSet;
 use std::process::ChildStdin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::process::WslProcess;
 use crate::protocol::{self, T_CLOSE, T_DATA, T_EXIT, T_OPEN, T_RESIZE, T_SIGNAL};
+
+/// Bound on queued, not-yet-consumed server frames. When the owner falls behind
+/// (e.g. a flood like termbench), the reader blocks here, which fills the OS
+/// pipe and back-pressures wslptyd — keeping memory bounded instead of buffering
+/// the entire burst. Frames are at most a 64KB PTY chunk, so worst case is tens
+/// of MB, typically far less.
+const MUX_CHANNEL_BOUND: usize = 512;
 
 /// An event from the server for a session, delivered on the mux channel.
 #[derive(Debug)]
@@ -58,7 +65,7 @@ impl WslMux {
             dead: AtomicBool::new(false),
             live: Mutex::new(HashSet::new()),
         });
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(MUX_CHANNEL_BOUND);
         let reader_shared = shared.clone();
         let reader = std::thread::Builder::new()
             .name("wsl-mux-reader".into())
@@ -118,7 +125,7 @@ impl Drop for WslMux {
     }
 }
 
-fn reader_loop<R: std::io::Read>(mut stdout: R, shared: Arc<Shared>, tx: Sender<MuxEvent>) {
+fn reader_loop<R: std::io::Read>(mut stdout: R, shared: Arc<Shared>, tx: SyncSender<MuxEvent>) {
     let mut scratch = vec![0u8; 65536];
     loop {
         match protocol::read_frame(&mut stdout, &mut scratch) {
