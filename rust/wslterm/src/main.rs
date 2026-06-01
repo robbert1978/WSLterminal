@@ -1886,23 +1886,78 @@ fn load_window_icon() -> Option<Icon> {
 }
 
 fn load_monospace_font(family: &str) -> Option<FontVec> {
-    let fam = family.to_ascii_lowercase();
-    let mut candidates: Vec<&str> = Vec::new();
-    if fam.contains("cascadia") {
-        candidates.push(r"C:\Windows\Fonts\CascadiaMono.ttf");
-        candidates.push(r"C:\Windows\Fonts\CascadiaCode.ttf");
+    // 1. Resolve the configured family by scanning the font directories.
+    if let Some(f) = find_family_font(family) {
+        return Some(f);
     }
-    if fam.contains("consol") {
-        candidates.push(r"C:\Windows\Fonts\consola.ttf");
-    }
-    candidates.extend_from_slice(&[
+    // 2. Fall back to common monospace fonts by filename.
+    for path in [
         r"C:\Windows\Fonts\consola.ttf",
         r"C:\Windows\Fonts\CascadiaMono.ttf",
         r"C:\Windows\Fonts\CascadiaCode.ttf",
         r"C:\Windows\Fonts\lucon.ttf",
-    ]);
-    for path in candidates {
+    ] {
         if let Ok(bytes) = std::fs::read(path) {
+            if let Ok(font) = FontVec::try_from_vec(bytes) {
+                return Some(font);
+            }
+        }
+    }
+    None
+}
+
+/// Lowercase + keep only alphanumerics, for loose font-name matching.
+fn squash(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+/// Find a font file whose name matches `family` by scanning the per-user and
+/// system font folders, preferring the Regular weight. Pure filename matching —
+/// no font-table parsing — which covers Nerd Fonts and the like (their filenames
+/// embed the family name).
+fn find_family_font(family: &str) -> Option<FontVec> {
+    let key = squash(family);
+    if key.len() < 3 {
+        return None;
+    }
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(la) = std::env::var("LOCALAPPDATA") {
+        dirs.push(std::path::PathBuf::from(la).join(r"Microsoft\Windows\Fonts"));
+    }
+    if let Ok(win) = std::env::var("WINDIR") {
+        dirs.push(std::path::PathBuf::from(win).join("Fonts"));
+    } else {
+        dirs.push(std::path::PathBuf::from(r"C:\Windows\Fonts"));
+    }
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for dir in dirs {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            let ext = p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+            if !matches!(ext.as_deref(), Some("ttf") | Some("otf")) {
+                continue; // skip .ttc collections (ab_glyph wants a single face)
+            }
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if squash(stem).contains(&key) {
+                candidates.push(p);
+            }
+        }
+    }
+    // Prefer a Regular face (filename has no weight/style qualifier).
+    candidates.sort_by_key(|p| {
+        let s = squash(p.file_stem().and_then(|s| s.to_str()).unwrap_or(""));
+        let styled = ["bold", "italic", "oblique", "light", "thin", "medium", "semibold", "black"]
+            .iter()
+            .any(|w| s.contains(w));
+        styled as u8
+    });
+    for p in candidates {
+        if let Ok(bytes) = std::fs::read(&p) {
             if let Ok(font) = FontVec::try_from_vec(bytes) {
                 return Some(font);
             }
