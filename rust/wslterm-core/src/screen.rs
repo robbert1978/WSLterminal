@@ -89,6 +89,11 @@ pub struct Screen {
     saved: Saved,
     tabs: Vec<bool>,
     scrollback: Scrollback,
+    /// Monotonic count of lines that have ever scrolled off the top into
+    /// scrollback. The GUI diffs this between frames to keep a scrolled-back
+    /// viewport pinned to the same content as new output arrives (instead of
+    /// snapping to the bottom). Never reset, so the diff is always non-negative.
+    scrolled_total: u64,
     /// Combining-mark strings; a cell's `combo` is a 1-based index here (0 = none).
     /// Kept off the cell so `Cell` stays `Copy`. Grows only when combining marks
     /// appear (rare); bounded so an adversarial stream can't grow it without end.
@@ -128,6 +133,7 @@ impl Screen {
             saved: Saved { cx: 0, cy: 0, fg: color::DEFAULT, bg: color::DEFAULT, fl: CellFlags::default(), origin: false },
             tabs: Vec::new(),
             scrollback: Scrollback::new(5000),
+            scrolled_total: 0,
             combo_pool: Vec::new(),
             last_base_x: -1,
             last_base_y: -1,
@@ -148,6 +154,10 @@ impl Screen {
     #[inline]
     pub fn scrollback_count(&self) -> usize {
         self.scrollback.count()
+    }
+    #[inline]
+    pub fn scrolled_total(&self) -> u64 {
+        self.scrolled_total
     }
     #[inline]
     pub fn in_alt(&self) -> bool {
@@ -338,6 +348,7 @@ impl Screen {
             // Recycle a row: the line evicted from scrollback (when keeping history),
             // or the leaving line itself.
             let reuse = if !self.buf_alt && top == 0 {
+                self.scrolled_total += 1;
                 self.scrollback.push(leaving).unwrap_or_else(Vec::new)
             } else {
                 leaving

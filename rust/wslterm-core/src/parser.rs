@@ -40,7 +40,10 @@ pub struct VtParser {
     inter: char,
 
     esc_inter: char,
-    osc: String,
+    // OSC payload accumulated as raw bytes; decoded as UTF-8 only at osc_done.
+    // (Pushing `b as char` here would treat each UTF-8 byte as Latin-1, turning a
+    // multibyte title like the spinner U+2833 into mojibake "â ³".)
+    osc: Vec<u8>,
 
     g0_special: bool,
     g1_special: bool,
@@ -61,7 +64,7 @@ impl VtParser {
             priv_: '\0',
             inter: '\0',
             esc_inter: '\0',
-            osc: String::new(),
+            osc: Vec::new(),
             g0_special: false,
             g1_special: false,
             shift_out: false,
@@ -429,7 +432,7 @@ impl VtParser {
             self.state = St::OscEsc;
             return;
         }
-        self.osc.push(b as char);
+        self.osc.push(b);
     }
 
     fn osc_esc(&mut self, s: &mut Screen, sinks: &mut ParserSinks, b: u8) {
@@ -443,11 +446,15 @@ impl VtParser {
     }
 
     fn osc_done(&mut self, sinks: &mut ParserSinks) {
-        let s = std::mem::take(&mut self.osc);
+        let bytes = std::mem::take(&mut self.osc);
         self.state = St::Ground;
+        // Decode the whole payload as UTF-8 once (lossy: malformed bytes become
+        // U+FFFD rather than corrupting the rest). The "num;text" split and the
+        // OSC-7 file:// prefix are ASCII, so slicing the decoded &str is safe.
+        let s = String::from_utf8_lossy(&bytes);
         let (num, text) = match s.find(';') {
             Some(semi) => (&s[..semi], &s[semi + 1..]),
-            None => (s.as_str(), ""),
+            None => (s.as_ref(), ""),
         };
         match num {
             "0" | "1" | "2" => sinks.title = Some(text.to_string()),

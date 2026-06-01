@@ -57,6 +57,16 @@ impl Terminal {
     pub fn scrollback_count(&self) -> usize {
         self.screen.scrollback_count()
     }
+    /// Monotonic count of lines scrolled into history; the GUI diffs it to keep
+    /// a scrolled-back view pinned as new output arrives.
+    pub fn scrolled_total(&self) -> u64 {
+        self.screen.scrolled_total()
+    }
+    /// True while the alternate screen is active (full-screen apps); scrollback
+    /// scrolling/scrollbar are suppressed then.
+    pub fn in_alt(&self) -> bool {
+        self.screen.in_alt()
+    }
     pub fn current_directory(&self) -> Option<&str> {
         self.cwd.as_deref()
     }
@@ -266,5 +276,78 @@ mod tests {
     fn double_click_word_span() {
         let (t, _g) = grid(20, 2, "foo bar");
         assert_eq!(t.word_span(0, 1), Some((0, 2)));
+    }
+
+    #[test]
+    fn osc_title_utf8_bel() {
+        // OSC 0 ; <title> BEL — the title carries the braille spinner U+2833.
+        let mut t = Terminal::new(20, 6);
+        t.feed("\x1b]0;\u{2833} spinner\x07".as_bytes());
+        assert_eq!(t.title(), Some("\u{2833} spinner"));
+    }
+
+    #[test]
+    fn osc_title_utf8_st_terminator() {
+        // Same, terminated by ST (ESC \) instead of BEL, with an emoji.
+        let mut t = Terminal::new(20, 6);
+        t.feed("\x1b]2;\u{1F600} hi\x1b\\".as_bytes());
+        assert_eq!(t.title(), Some("\u{1F600} hi"));
+    }
+
+    #[test]
+    fn osc_title_malformed_utf8_is_lossy_not_panic() {
+        // Stray continuation/lead bytes must not panic; they become U+FFFD.
+        let mut t = Terminal::new(20, 6);
+        t.feed(b"\x1b]0;\xff\xfeX\x07");
+        let title = t.title().expect("title set");
+        assert!(title.contains('\u{FFFD}'));
+        assert!(title.ends_with('X'));
+    }
+
+    #[test]
+    fn osc7_cwd_still_parses_after_byte_buffer() {
+        // OSC 7 (file:// URI) must keep working with the raw-byte OSC buffer.
+        let mut t = Terminal::new(20, 6);
+        t.feed("\x1b]7;file://host/home/u\x07".as_bytes());
+        assert_eq!(t.current_directory(), Some("/home/u"));
+    }
+
+    #[test]
+    fn scrollback_viewport_offsets_and_clamps() {
+        // Overflow a 3-row screen so lines enter scrollback, then check that a
+        // larger offset shows older content and that out-of-range clamps.
+        let mut t = Terminal::new(8, 3);
+        let mut feed = String::new();
+        for i in 0..10 {
+            feed.push_str(&format!("L{i}\r\n"));
+        }
+        t.feed(feed.as_bytes());
+        assert!(t.scrollback_count() >= 7, "expected history, got {}", t.scrollback_count());
+
+        let mut live = Vec::new();
+        t.capture_viewport(0, &mut live);
+        let top_live = row_text(&live[0]);
+
+        let mut back = Vec::new();
+        t.capture_viewport(3, &mut back);
+        let top_back = row_text(&back[0]);
+        assert_ne!(top_live, top_back, "scrolling back should change the top line");
+
+        // Out-of-range offset must clamp (no panic) to the oldest available view.
+        let mut clamped = Vec::new();
+        t.capture_viewport(t.scrollback_count() + 50, &mut clamped);
+        assert_eq!(clamped.len(), 3);
+
+        // scrolled_total counts every line pushed into history.
+        assert_eq!(t.scrolled_total(), t.scrollback_count() as u64);
+    }
+
+    fn row_text(row: &[Cell]) -> String {
+        row.iter()
+            .filter(|c| c.width != 0)
+            .filter_map(|c| char::from_u32(c.rune))
+            .collect::<String>()
+            .trim_end()
+            .to_string()
     }
 }

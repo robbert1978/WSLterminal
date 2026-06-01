@@ -115,11 +115,42 @@ impl Rect {
     }
 }
 
+/// Cached geometry of a pane's scrollbar, recomputed each render and used for
+/// hit-testing/dragging. `max_off` is the pane's scrollback line count (the
+/// range of `scroll_off`); `scroll_off == 0` puts the thumb at the bottom.
+#[derive(Clone, Copy)]
+struct ScrollBar {
+    session: u32,
+    track: Rect,
+    thumb_y: usize,
+    thumb_h: usize,
+    max_off: usize,
+}
+
+impl ScrollBar {
+    fn thumb_contains(&self, py: f64) -> bool {
+        py >= self.thumb_y as f64 && py < (self.thumb_y + self.thumb_h) as f64
+    }
+    /// Map a desired thumb-top (px) back to a `scroll_off` value.
+    fn off_for_thumb_top(&self, thumb_top: f64) -> usize {
+        let travel = self.track.h.saturating_sub(self.thumb_h);
+        if travel == 0 || self.max_off == 0 {
+            return 0;
+        }
+        let t = (thumb_top - self.track.y as f64).clamp(0.0, travel as f64);
+        let from_top = (t * self.max_off as f64 / travel as f64).round() as usize;
+        self.max_off.saturating_sub(from_top)
+    }
+}
+
 /// One terminal pane: its session + emulator state + view (scroll/selection).
 struct Pane {
     session: u32,
     term: Arc<Mutex<Terminal>>,
     scroll_off: usize,
+    /// `term.scrolled_total()` seen at the last frame; diffed to keep a
+    /// scrolled-back viewport pinned to the same content as new output arrives.
+    last_scrolled: u64,
     selecting: bool,
     sel_anchor: Option<(i64, i64)>,
     sel: Option<(i64, i64, i64, i64)>,
@@ -127,7 +158,7 @@ struct Pane {
 
 impl Pane {
     fn new(session: u32, term: Arc<Mutex<Terminal>>) -> Pane {
-        Pane { session, term, scroll_off: 0, selecting: false, sel_anchor: None, sel: None }
+        Pane { session, term, scroll_off: 0, last_scrolled: 0, selecting: false, sel_anchor: None, sel: None }
     }
 }
 
@@ -509,6 +540,8 @@ struct App {
     sidebar_btn: (f32, f32),  // sidebar toggle button x-range
     win_btns: [(f32, f32); 3], // minimize / maximize / close x-ranges
     pane_rects: Vec<(u32, Rect)>, // active tab's leaf rects
+    scrollbars: Vec<ScrollBar>,   // active tab's per-pane scrollbar geometry
+    scrollbar_drag: Option<(u32, f64)>, // (session, grab offset within thumb, px)
 
     // File sidebar.
     sidebar_open: bool,
@@ -579,6 +612,8 @@ impl App {
             sidebar_btn: (0.0, 0.0),
             win_btns: [(0.0, 0.0); 3],
             pane_rects: Vec::new(),
+            scrollbars: Vec::new(),
+            scrollbar_drag: None,
             sidebar_open: false,
             show_hidden: false,
             sidebar_dir: String::new(),
@@ -1210,8 +1245,27 @@ impl App {
                     self.toggle_maximize();
                     return;
                 }
+                // Shift+PageUp/Down scroll the local scrollback by a screen
+                // (plain PageUp/Down still go to the app, e.g. less/vim).
+                KeyCode::PageUp if shift => {
+                    let r = self.focused_term().lock().unwrap().rows() as i32;
+                    self.scroll_by(r);
+                    return;
+                }
+                KeyCode::PageDown if shift => {
+                    let r = self.focused_term().lock().unwrap().rows() as i32;
+                    self.scroll_by(-r);
+                    return;
+                }
                 _ => {}
             }
+        }
+
+        // Super/Win combos are OS-level (e.g. Win+Shift+S screen capture): don't
+        // forward them to the PTY/editor and don't snap the view to the bottom —
+        // just let the OS hotkey through. Super is never sent to the terminal.
+        if self.mods.super_key() {
+            return;
         }
 
         // While the editor overlay is open it takes all remaining input.
@@ -1255,6 +1309,9 @@ impl App {
             .iter()
             .find(|(_, r)| r.contains(self.cursor_px.0, self.cursor_px.1))
             .map(|(s, _)| *s)
+    }
+    fn scrollbar_hit(&self, px: f64, py: f64) -> Option<ScrollBar> {
+        self.scrollbars.iter().find(|s| s.track.contains(px, py)).copied()
     }
     fn rect_of(&self, session: u32) -> Option<Rect> {
         self.pane_rects.iter().find(|(s, _)| *s == session).map(|(_, r)| *r)
@@ -1482,6 +1539,7 @@ impl App {
             h: (h as usize).saturating_sub(bar_h),
         };
         self.pane_rects.clear();
+        self.scrollbars.clear();
         self.tabs[self.active_term].root.leaf_rects(area, &mut self.pane_rects);
         let focus = self.focused_session();
         let rects = self.pane_rects.clone();
@@ -1614,17 +1672,19 @@ impl App {
                 };
                 (p.term.clone(), p.scroll_off, p.sel)
             };
-            let (cols, rows, cx, cy, cursor_on, top_abs);
+            let (cols, rows, cx, cy, cursor_on, top_abs, scroll, sb_count, alt);
             {
                 let t = term.lock().unwrap();
-                let scroll = scroll_off.min(t.scrollback_count());
+                sb_count = t.scrollback_count();
+                scroll = scroll_off.min(sb_count);
                 t.capture_viewport(scroll, &mut self.grid);
                 cols = t.cols();
                 rows = t.rows();
                 cx = t.cx();
                 cy = t.cy();
                 cursor_on = t.cursor_visible() && scroll == 0;
-                top_abs = t.scrollback_count() as i64 - scroll as i64;
+                top_abs = sb_count as i64 - scroll as i64;
+                alt = t.in_alt();
             }
             let rcols = (rect.w / cw).min(cols);
             let rrows = (rect.h / ch_px).min(rows);
@@ -1693,6 +1753,39 @@ impl App {
             if *session == focus && rects.len() > 1 {
                 fill_rect(buf, w, h, rect.x, rect.y, rect.w, (2.0 * self.scale) as usize,
                     OPAQUE | self.theme.selection);
+            }
+
+            // Scrollbar on the pane's right edge when there's scrollback history
+            // (primary screen only — alt-screen apps own the whole grid). The
+            // thumb height reflects the visible fraction; scroll == 0 (live) puts
+            // it at the bottom. Overlaid (no reserved width); opaque so it reads
+            // over the translucent terminal background.
+            let sb_w = (4.0 * self.scale).round().max(4.0) as usize;
+            let div = if rect.x + rect.w < w as usize { DIVIDER } else { 0 };
+            // Draw only when there's history, on the primary screen, and the pane
+            // is actually wide enough to hold the bar (else track_x would underflow
+            // to the window's left edge and corrupt hit-testing in tiny splits).
+            if !alt && sb_count > 0 && rect.h > 0 && rect.w > sb_w + div {
+                let track_x = (rect.x + rect.w) - (sb_w + div);
+                let total = sb_count + rows;
+                let min_thumb = ch_px.max(16);
+                let thumb_h = ((rect.h * rows) / total.max(1)).clamp(min_thumb.min(rect.h), rect.h);
+                let travel = rect.h.saturating_sub(thumb_h);
+                let from_top = sb_count.saturating_sub(scroll); // 0 = oldest .. sb_count = live
+                let thumb_y = rect.y + (travel * from_top) / sb_count.max(1);
+                let dragging = self.scrollbar_drag.map(|(s, _)| s == *session).unwrap_or(false);
+                let track_col = (150u32 << 24) | mix(self.theme.bg, self.theme.fg, 0.14);
+                let thumb_col =
+                    OPAQUE | mix(self.theme.bg, self.theme.fg, if dragging { 0.62 } else { 0.42 });
+                fill_rect(buf, w, h, track_x, rect.y, sb_w, rect.h, track_col);
+                fill_rect(buf, w, h, track_x, thumb_y, sb_w, thumb_h, thumb_col);
+                self.scrollbars.push(ScrollBar {
+                    session: *session,
+                    track: Rect { x: track_x, y: rect.y, w: sb_w, h: rect.h },
+                    thumb_y,
+                    thumb_h,
+                    max_off: sb_count,
+                });
             }
         }
         } // end: panes (no doc)
@@ -1935,10 +2028,31 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Redraw => {
                 self.redraw_pending.store(false, Ordering::Release);
-                // New output snaps the focused pane to the bottom (unless dragging).
+                // Keep each scrolled-back pane pinned to the same content as new
+                // output arrives: advance scroll_off by however many lines just
+                // scrolled into history (so the view doesn't get yanked to the
+                // bottom). Panes already at the live bottom (scroll_off == 0) stay
+                // there. Typing is the explicit way back to live (see handle_key).
+                for tab in &mut self.tabs {
+                    let mut sids = Vec::new();
+                    tab.root.collect_sessions(&mut sids);
+                    for sid in sids {
+                        if let Some(p) = tab.root.find_mut(sid) {
+                            let (total, sbc) = {
+                                let t = p.term.lock().unwrap();
+                                (t.scrolled_total(), t.scrollback_count())
+                            };
+                            let delta = total.saturating_sub(p.last_scrolled);
+                            if p.scroll_off > 0 && delta > 0 {
+                                p.scroll_off = (p.scroll_off + delta as usize).min(sbc);
+                            }
+                            p.last_scrolled = total;
+                        }
+                    }
+                }
+                // Clear the focused pane's stale selection on new output.
                 let s = self.focused_session();
                 if let Some(p) = self.pane_mut(s) {
-                    p.scroll_off = 0;
                     if !p.selecting {
                         p.sel = None;
                     }
@@ -2019,6 +2133,17 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_px = (position.x, position.y);
+                // Dragging a scrollbar thumb maps cursor-y straight to scroll_off.
+                if let Some((session, grab)) = self.scrollbar_drag {
+                    if let Some(sb) = self.scrollbars.iter().find(|s| s.session == session).copied() {
+                        let off = sb.off_for_thumb_top(self.cursor_px.1 - grab);
+                        if let Some(p) = self.pane_mut(session) {
+                            p.scroll_off = off;
+                        }
+                        self.request_redraw();
+                    }
+                    return;
+                }
                 self.update_resize_cursor();
                 if self.active_doc.is_none()
                     && self.tabs.get(self.active_term).is_some()
@@ -2068,10 +2193,27 @@ impl ApplicationHandler<UserEvent> for App {
                     } else if self.sidebar_w() > 0 && px < self.sidebar_w() as f64 {
                         self.sidebar_click();
                     } else if self.active_doc.is_none() {
-                        self.begin_selection();
+                        // A press on a pane's scrollbar starts a thumb drag or
+                        // pages the view; otherwise it begins a text selection.
+                        if let Some(sb) = self.scrollbar_hit(px, py) {
+                            self.tabs[self.active_term].focus = sb.session;
+                            if sb.thumb_contains(py) {
+                                self.scrollbar_drag = Some((sb.session, py - sb.thumb_y as f64));
+                            } else {
+                                let rows = self
+                                    .pane(sb.session)
+                                    .map(|p| p.term.lock().unwrap().rows() as i32)
+                                    .unwrap_or(1);
+                                self.scroll_by(if (py as usize) < sb.thumb_y { rows } else { -rows });
+                            }
+                            self.request_redraw();
+                        } else {
+                            self.begin_selection();
+                        }
                     }
                 }
                 (MouseButton::Left, ElementState::Released) => {
+                    self.scrollbar_drag = None;
                     let s = self.focused_session();
                     if let Some(p) = self.pane_mut(s) {
                         p.selecting = false;
