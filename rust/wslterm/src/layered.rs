@@ -5,24 +5,42 @@
 //! framebuffer (alpha in the high byte); `present` premultiplies into the DIB.
 
 #[cfg(windows)]
-pub use imp::Layered;
+pub use imp::{work_area, Layered};
 
 #[cfg(not(windows))]
-pub use stub::Layered;
+pub use stub::{work_area, Layered};
 
 #[cfg(windows)]
 mod imp {
     use std::ptr::null_mut;
-    use windows_sys::Win32::Foundation::{HWND, POINT, SIZE};
+    use windows_sys::Win32::Foundation::{HWND, POINT, RECT, SIZE};
     use windows_sys::Win32::Graphics::Gdi::{
         CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
         SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
         BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, UpdateLayeredWindow, GWL_EXSTYLE, ULW_ALPHA,
-        WS_EX_LAYERED,
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, GetWindowRect, SetWindowLongPtrW, UpdateLayeredWindow, GWL_EXSTYLE,
+        ULW_ALPHA, WS_EX_LAYERED,
+    };
+
+    /// The work area (excluding the taskbar) of the monitor the window is on,
+    /// as (x, y, width, height) in physical pixels.
+    pub fn work_area(hwnd: isize) -> Option<(i32, i32, u32, u32)> {
+        unsafe {
+            let mon = MonitorFromWindow(hwnd as HWND, MONITOR_DEFAULTTONEAREST);
+            let mut mi: MONITORINFO = std::mem::zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(mon, &mut mi) == 0 {
+                return None;
+            }
+            let r = mi.rcWork;
+            Some((r.left, r.top, (r.right - r.left) as u32, (r.bottom - r.top) as u32))
+        }
+    }
 
     pub struct Layered {
         hwnd: HWND,
@@ -118,10 +136,20 @@ mod imp {
                     SourceConstantAlpha: 255,
                     AlphaFormat: AC_SRC_ALPHA as u8,
                 };
+                // Position the layered content at the window's actual screen
+                // top-left. Passing null ("keep position") leaves stale content
+                // after the window moves (e.g. maximize repositions to -8,top),
+                // exposing the window's white default background.
+                let mut wr: RECT = std::mem::zeroed();
+                let dst = if GetWindowRect(self.hwnd, &mut wr) != 0 {
+                    POINT { x: wr.left, y: wr.top }
+                } else {
+                    POINT { x: 0, y: 0 }
+                };
                 UpdateLayeredWindow(
                     self.hwnd,
                     self.screen_dc,
-                    null_mut(), // keep current position (winit owns it)
+                    &dst,
                     &size,
                     self.mem_dc,
                     &src,
@@ -155,5 +183,8 @@ mod stub {
             Layered
         }
         pub fn present(&mut self, _fb: &[u32], _w: u32, _h: u32) {}
+    }
+    pub fn work_area(_hwnd: isize) -> Option<(i32, i32, u32, u32)> {
+        None
     }
 }

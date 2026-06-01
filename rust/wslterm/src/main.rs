@@ -34,7 +34,7 @@ use wslterm_pty::{WslMux, WslProcess};
 mod layered;
 mod settings;
 mod wslfiles;
-use layered::Layered;
+use layered::{work_area, Layered};
 use settings::{Settings, Theme};
 
 /// Opaque alpha in the high byte (for the framebuffer ARGB encoding).
@@ -463,6 +463,10 @@ struct App {
     want_frame: bool,
     last_frame: Instant,
     frame_interval: std::time::Duration,
+    // Custom maximize (avoids Windows' WS_MAXIMIZE phantom border, which a
+    // layered window can't paint -> white strips). Resize to the work area.
+    maximized: bool,
+    restore_rect: Option<(i32, i32, u32, u32)>,
 
     font: FontVec,
     fallback: Vec<FontVec>, // for glyphs the primary font lacks (CJK, Cyrillic, symbols)
@@ -537,6 +541,8 @@ impl App {
             want_frame: false,
             last_frame: Instant::now(),
             frame_interval: std::time::Duration::from_millis(16),
+            maximized: false,
+            restore_rect: None,
             font,
             fallback: load_fallback_fonts(),
             font_family: cfg.font_family.clone(),
@@ -1039,6 +1045,34 @@ impl App {
         self.request_redraw();
     }
 
+    /// Custom maximize: resize the (borderless) window to the monitor work area,
+    /// restoring the previous rect on toggle. Avoids WS_MAXIMIZE, whose phantom
+    /// border a layered window can't paint (white strips).
+    fn toggle_maximize(&mut self) {
+        let win = match &self.win {
+            Some(w) => w.clone(),
+            None => return,
+        };
+        if self.maximized {
+            if let Some((x, y, w, h)) = self.restore_rect.take() {
+                let _ = win.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+                win.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+            }
+            self.maximized = false;
+        } else {
+            if let (Ok(p), s) = (win.outer_position(), win.inner_size()) {
+                self.restore_rect = Some((p.x, p.y, s.width, s.height));
+            }
+            if let Some((x, y, w, h)) = hwnd_of(&win).and_then(work_area) {
+                win.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                let _ = win.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+            }
+            self.maximized = true;
+        }
+        self.reflow();
+        self.request_redraw();
+    }
+
     /// Open a new top-level window (a fresh wslterm process) in the focused cwd.
     fn spawn_new_window(&self) {
         let dir = self.focused_cwd();
@@ -1165,6 +1199,10 @@ impl App {
                 }
                 KeyCode::Comma if ctrl => {
                     self.open_settings();
+                    return;
+                }
+                KeyCode::F11 => {
+                    self.toggle_maximize();
                     return;
                 }
                 _ => {}
@@ -2007,9 +2045,7 @@ impl ApplicationHandler<UserEvent> for App {
                         if x >= self.win_btns[2].0 {
                             event_loop.exit();
                         } else if x >= self.win_btns[1].0 && x < self.win_btns[1].1 {
-                            if let Some(win) = &self.win {
-                                win.set_maximized(!win.is_maximized());
-                            }
+                            self.toggle_maximize();
                         } else if x >= self.win_btns[0].0 && x < self.win_btns[0].1 {
                             if let Some(win) = &self.win {
                                 win.set_minimized(true);
