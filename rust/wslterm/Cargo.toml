@@ -17,6 +17,8 @@ ab_glyph = "0.2"
 # Lightweight, Windows-only clipboard access for copy/paste.
 clipboard-win = "5"
 raw-window-handle = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 # For the layered-window translucency (SetLayeredWindowAttributes).

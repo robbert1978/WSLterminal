@@ -29,18 +29,17 @@ use winit::keyboard::{Key as WKey, KeyCode, ModifiersState, NamedKey, PhysicalKe
 use winit::window::{Window, WindowId};
 
 use wslterm_core::input::{self, Key, Mods};
-use wslterm_core::{color, Cell, CellFlags, Terminal};
+use wslterm_core::{Cell, CellFlags, Terminal};
 use wslterm_pty::bootstrap;
 use wslterm_pty::mux::MuxEvent;
 use wslterm_pty::{WslMux, WslProcess};
 
+mod settings;
+use settings::{Settings, Theme};
+
 const DISTRO: &str = "Ubuntu";
-/// Logical font size; multiplied by the monitor's DPI scale to get device px.
-const BASE_FONT_PX: f32 = 18.0;
-const DEFAULT_FG: u32 = 0xCC_CCCC; // Campbell foreground
-const DEFAULT_BG: u32 = 0x0C_0C0C; // Campbell background
-const CURSOR_RGB: u32 = 0xCC_CCCC;
-const SELECTION_BG: u32 = 0x26_4F78; // VS Code-ish selection blue
+/// points -> device-independent pixels (CSS px); multiplied again by DPI scale.
+const PT_TO_PX: f32 = 96.0 / 72.0;
 
 /// Lightweight events from the feed thread to the UI (no payload — the data is
 /// already in the shared Terminal; this just wakes the loop to render/exit).
@@ -92,11 +91,14 @@ struct App {
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
 
     font: FontVec,
-    scale: f32,    // monitor DPI scale (1.0, 1.5, 2.0, ...)
-    font_px: f32,  // BASE_FONT_PX * scale, in device pixels
+    scale: f32,         // monitor DPI scale (1.0, 1.5, 2.0, ...)
+    font_pts: f32,      // logical font size in points (Ctrl+/- zoom)
+    font_pts_base: f32, // configured size, restored by Ctrl+0
+    font_px: f32,       // font_pts * PT_TO_PX * scale, in device pixels
     cell_w: usize,
     cell_h: usize,
     ascent: f32,
+    theme: Theme,
 
     term: Arc<Mutex<Terminal>>,
     mux: Option<WslMux>,
@@ -121,7 +123,9 @@ struct App {
 
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>) -> App {
-        let font = load_monospace_font().expect("no monospace font found (Consolas/Cascadia)");
+        let cfg = Settings::load();
+        let font = load_monospace_font(&cfg.font_family)
+            .expect("no monospace font found (Consolas/Cascadia)");
         let mut app = App {
             proxy,
             win: None,
@@ -129,10 +133,13 @@ impl App {
             surface: None,
             font,
             scale: 1.0,
-            font_px: BASE_FONT_PX,
+            font_pts: cfg.font_pts,
+            font_pts_base: cfg.font_pts,
+            font_px: cfg.font_pts * PT_TO_PX,
             cell_w: 1,
             cell_h: 1,
             ascent: 0.0,
+            theme: cfg.theme,
             term: Arc::new(Mutex::new(Terminal::new(80, 24))),
             mux: None,
             session: 0,
@@ -143,7 +150,7 @@ impl App {
             selecting: false,
             sel_anchor: None,
             sel: None,
-            opacity: parse_opacity_env(),
+            opacity: parse_opacity_env().unwrap_or(cfg.opacity),
             scroll_off: 0,
             grid: Vec::new(),
             glyph_cache: HashMap::new(),
@@ -152,9 +159,9 @@ impl App {
         app
     }
 
-    /// Recompute font/cell metrics for the current DPI scale.
+    /// Recompute font/cell metrics for the current font size and DPI scale.
     fn recompute_metrics(&mut self) {
-        self.font_px = BASE_FONT_PX * self.scale;
+        self.font_px = self.font_pts * PT_TO_PX * self.scale;
         let sf = self.font.as_scaled(PxScale::from(self.font_px));
         self.ascent = sf.ascent();
         self.cell_h = (sf.ascent() - sf.descent() + sf.line_gap()).ceil().max(1.0) as usize;
@@ -199,13 +206,17 @@ impl App {
                     self.paste();
                     return;
                 }
-                // Ctrl +/- adjusts window opacity.
+                // Ctrl +/-/0 zooms the font (Ctrl+0 resets to configured size).
                 KeyCode::Equal | KeyCode::NumpadAdd if ctrl => {
-                    self.adjust_opacity(0.05);
+                    self.zoom_font(1.0);
                     return;
                 }
                 KeyCode::Minus | KeyCode::NumpadSubtract if ctrl => {
-                    self.adjust_opacity(-0.05);
+                    self.zoom_font(-1.0);
+                    return;
+                }
+                KeyCode::Digit0 | KeyCode::Numpad0 if ctrl => {
+                    self.reset_font();
                     return;
                 }
                 _ => {}
@@ -315,11 +326,18 @@ impl App {
         }
     }
 
-    fn adjust_opacity(&mut self, delta: f32) {
-        self.opacity = (self.opacity + delta).clamp(0.4, 1.0);
-        if let Some(win) = &self.win {
-            set_window_opacity(win, self.opacity);
-        }
+    fn zoom_font(&mut self, delta_pts: f32) {
+        self.font_pts = (self.font_pts + delta_pts).clamp(6.0, 72.0);
+        self.recompute_metrics();
+        self.reflow();
+        self.request_redraw();
+    }
+
+    fn reset_font(&mut self) {
+        self.font_pts = self.font_pts_base;
+        self.recompute_metrics();
+        self.reflow();
+        self.request_redraw();
     }
 
     /// Scroll the view by `lines` into scrollback (+ = up into history).
@@ -367,7 +385,7 @@ impl App {
             Ok(b) => b,
             Err(_) => return,
         };
-        buffer.fill(DEFAULT_BG);
+        buffer.fill(self.theme.bg);
 
         // Snapshot the grid under the lock, then rasterize without holding it.
         let (cols, rows, cx, cy, cursor_on, top_abs);
@@ -415,12 +433,12 @@ impl App {
                 let reverse = cell.flags.contains(CellFlags::REVERSE) ^ is_cursor;
                 let bold = cell.flags.contains(CellFlags::BOLD);
 
-                let mut fg = color::resolve(cell.fg, DEFAULT_FG, bold);
-                let mut bg = color::resolve(cell.bg, DEFAULT_BG, false);
+                let mut fg = self.theme.resolve(cell.fg, self.theme.fg, bold);
+                let mut bg = self.theme.resolve(cell.bg, self.theme.bg, false);
                 if reverse {
                     if is_cursor {
-                        bg = CURSOR_RGB;
-                        fg = DEFAULT_BG;
+                        bg = self.theme.cursor;
+                        fg = self.theme.bg;
                     } else {
                         std::mem::swap(&mut fg, &mut bg);
                     }
@@ -430,7 +448,7 @@ impl App {
                     let after_start = ar > r1 || (ar == r1 && ac >= c1);
                     let before_end = ar < r2 || (ar == r2 && ac <= c2);
                     if after_start && before_end {
-                        bg = SELECTION_BG;
+                        bg = self.theme.selection;
                     }
                 }
 
@@ -602,11 +620,16 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(&event),
             WindowEvent::MouseWheel { delta, .. } => {
-                let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => (y.round() as i32) * 3,
-                    MouseScrollDelta::PixelDelta(p) => (p.y / self.cell_h as f64).round() as i32,
+                let y = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y as f64,
+                    MouseScrollDelta::PixelDelta(p) => p.y / self.cell_h as f64,
                 };
-                self.scroll_by(lines);
+                if self.mods.control_key() {
+                    // Ctrl+wheel zooms the font.
+                    self.zoom_font(if y > 0.0 { 1.0 } else { -1.0 });
+                } else {
+                    self.scroll_by((y.round() as i32) * 3);
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_px = (position.x, position.y);
@@ -649,18 +672,16 @@ fn main() {
     event_loop.run_app(&mut app).expect("run app");
 }
 
-/// Initial window opacity from `$WSLTERM_OPACITY` (accepts 0.0..1.0 or 0..100),
-/// defaulting to 0.92. Clamped to a usable 0.4..1.0.
-fn parse_opacity_env() -> f32 {
-    let raw = std::env::var("WSLTERM_OPACITY")
-        .ok()
-        .and_then(|s| s.trim().parse::<f32>().ok());
-    let v = match raw {
-        Some(v) if v > 1.0 => v / 100.0, // treat 0..100 as a percentage
-        Some(v) => v,
-        None => 0.92,
-    };
-    v.clamp(0.4, 1.0)
+/// Optional `$WSLTERM_OPACITY` override (0.0..1.0 or 0..100); `None` if unset, so
+/// the settings.json value is used. Clamped to a usable 0.4..1.0.
+fn parse_opacity_env() -> Option<f32> {
+    let v = std::env::var("WSLTERM_OPACITY")
+        .ok()?
+        .trim()
+        .parse::<f32>()
+        .ok()?;
+    let v = if v > 1.0 { v / 100.0 } else { v };
+    Some(v.clamp(0.4, 1.0))
 }
 
 /// Apply uniform window translucency via a layered window. The OS composites our
@@ -693,14 +714,26 @@ fn set_window_opacity(window: &Window, opacity: f32) {
 #[cfg(not(windows))]
 fn set_window_opacity(_window: &Window, _opacity: f32) {}
 
-/// Load a system monospace font (Consolas, then Cascadia Mono, then Lucida).
-fn load_monospace_font() -> Option<FontVec> {
-    let candidates = [
+/// Load a monospace font, preferring the configured family, then falling back to
+/// Consolas / Cascadia / Lucida Console. (A full family->file lookup would need
+/// DirectWrite; this covers the common monospace fonts by filename.)
+fn load_monospace_font(family: &str) -> Option<FontVec> {
+    let fam = family.to_ascii_lowercase();
+    let mut candidates: Vec<&str> = Vec::new();
+    if fam.contains("cascadia") {
+        candidates.push(r"C:\Windows\Fonts\CascadiaMono.ttf");
+        candidates.push(r"C:\Windows\Fonts\CascadiaCode.ttf");
+    }
+    if fam.contains("consol") {
+        candidates.push(r"C:\Windows\Fonts\consola.ttf");
+    }
+    // Always-available fallbacks.
+    candidates.extend_from_slice(&[
         r"C:\Windows\Fonts\consola.ttf",
         r"C:\Windows\Fonts\CascadiaMono.ttf",
         r"C:\Windows\Fonts\CascadiaCode.ttf",
         r"C:\Windows\Fonts\lucon.ttf",
-    ];
+    ]);
     for path in candidates {
         if let Ok(bytes) = std::fs::read(path) {
             if let Ok(font) = FontVec::try_from_vec(bytes) {
