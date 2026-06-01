@@ -74,8 +74,14 @@ parity. The win is RAM, GC-free latency, and a smaller binary — not raw speed.
       hidden toggle; click dir = cd, click file = open)
 - [x] `wslterm`: file viewer/editor (line numbers, edit, Ctrl+S save via the
       \\wsl.localhost share, Esc close)
-- [ ] `wslterm`: syntax highlighting in the editor (syntect) — not yet
-- [ ] `wslterm`: faster partial repaint, word/line select, per-pixel translucency, color emoji
+- [x] `wslterm`: per-pixel translucency (terminal transparent, chrome/sidebar
+      opaque) via borderless UpdateLayeredWindow + custom window controls
+- [x] `wslterm`: settings menu (Ctrl+,) — edit settings.json in the editor,
+      live-apply on save
+- [x] `wslterm`: configured font-family loading (scans font folders)
+- [x] `wslterm`: editor syntax highlighting (syntect)
+- [ ] `wslterm`: color emoji + font fallback, double/triple-click select,
+      sidebar right-click menus / `..` / refresh
 
 ### CPU vs GPU rendering
 
