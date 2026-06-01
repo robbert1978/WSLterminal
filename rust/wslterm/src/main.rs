@@ -1,3 +1,8 @@
+// Release builds are GUI-subsystem so Windows never allocates a console window
+// for our stdout/stderr (which showed up as a stray terminal window). Debug
+// builds keep the console for development diagnostics.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! WSL Terminal GUI — Rust rewrite.
 //!
 //! A window that renders the `wslterm-core` terminal grid and pumps the user's
