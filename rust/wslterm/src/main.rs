@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
@@ -283,6 +283,23 @@ struct Doc {
     readonly: bool,
     win_path: Option<std::path::PathBuf>, // Some => a Windows file (settings)
     is_settings: bool,
+    /// Per-line syntax-highlight runs: (rgb, char count). Empty = no highlighting.
+    hl: Vec<Vec<(u32, usize)>>,
+}
+
+/// Bundled syntaxes / theme for the editor (loaded once).
+fn syntax_set() -> &'static syntect::parsing::SyntaxSet {
+    static S: OnceLock<syntect::parsing::SyntaxSet> = OnceLock::new();
+    S.get_or_init(syntect::parsing::SyntaxSet::load_defaults_nonewlines)
+}
+fn hl_theme() -> &'static syntect::highlighting::Theme {
+    static T: OnceLock<syntect::highlighting::Theme> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut ts = syntect::highlighting::ThemeSet::load_defaults();
+        ts.themes
+            .remove("base16-ocean.dark")
+            .unwrap_or_else(|| ts.themes.values().next().cloned().unwrap())
+    })
 }
 
 impl Doc {
@@ -304,6 +321,7 @@ impl Doc {
             readonly,
             win_path: None,
             is_settings: false,
+            hl: Vec::new(),
         }
     }
 
@@ -312,6 +330,7 @@ impl Doc {
         let text = String::from_utf8_lossy(&bytes).into_owned();
         let mut d = Doc::from_text(name, &text, &bytes);
         d.path = linux_path.to_string();
+        d.rehighlight();
         d
     }
 
@@ -322,7 +341,39 @@ impl Doc {
         let mut d = Doc::from_text(name, &text, &bytes);
         d.win_path = Some(path);
         d.is_settings = is_settings;
+        d.rehighlight();
         d
+    }
+
+    /// Recompute per-line syntax-highlight runs (by file extension). Skipped for
+    /// very large files to keep editing snappy.
+    fn rehighlight(&mut self) {
+        self.hl.clear();
+        if self.lines.len() > 20_000 {
+            return;
+        }
+        use syntect::easy::HighlightLines;
+        let ss = syntax_set();
+        let ext = self.name.rsplit('.').next().unwrap_or("");
+        let syntax = ss
+            .find_syntax_by_extension(ext)
+            .unwrap_or_else(|| ss.find_syntax_plain_text());
+        let mut h = HighlightLines::new(syntax, hl_theme());
+        for line in &self.lines {
+            let s: String = line.iter().collect();
+            let mut runs = Vec::new();
+            if let Ok(ranges) = h.highlight_line(&s, ss) {
+                for (style, text) in ranges {
+                    let c = style.foreground;
+                    let rgb = ((c.r as u32) << 16) | ((c.g as u32) << 8) | c.b as u32;
+                    let n = text.chars().count();
+                    if n > 0 {
+                        runs.push((rgb, n));
+                    }
+                }
+            }
+            self.hl.push(runs);
+        }
     }
 
     fn text(&self) -> String {
@@ -610,6 +661,7 @@ impl App {
         let ctrl = self.mods.control_key();
         let mut close = false;
         let mut save = false;
+        let mut edited = false;
         if let Some(doc) = self.doc.as_mut() {
             if let PhysicalKey::Code(code) = ev.physical_key {
                 match code {
@@ -623,23 +675,36 @@ impl App {
                     KeyCode::End => doc.cx = doc.lines[doc.cy].len(),
                     KeyCode::PageUp => doc.move_cursor(-20, 0),
                     KeyCode::PageDown => doc.move_cursor(20, 0),
-                    KeyCode::Backspace => doc.backspace(),
-                    KeyCode::Enter | KeyCode::NumpadEnter => doc.newline(),
+                    KeyCode::Backspace => {
+                        doc.backspace();
+                        edited = true;
+                    }
+                    KeyCode::Enter | KeyCode::NumpadEnter => {
+                        doc.newline();
+                        edited = true;
+                    }
                     KeyCode::Tab => {
                         for _ in 0..4 {
                             doc.insert_char(' ');
                         }
+                        edited = true;
                     }
                     _ => {
                         if let Some(text) = &ev.text {
                             for c in text.chars() {
                                 if !c.is_control() {
                                     doc.insert_char(c);
+                                    edited = true;
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+        if edited {
+            if let Some(d) = self.doc.as_mut() {
+                d.rehighlight();
             }
         }
         let mut reload_settings = false;
@@ -1447,14 +1512,24 @@ impl App {
                     blit_char(buf, w, h, &self.glyph_cache, ch, gx, y, dim);
                     gx += cw;
                 }
-                // line text
+                // line text (syntax-colored when highlight runs are available)
+                let line = &doc.lines[li];
+                let mut colors: Vec<u32> = Vec::with_capacity(line.len());
+                if let Some(runs) = doc.hl.get(li) {
+                    for &(rgb, n) in runs {
+                        for _ in 0..n {
+                            colors.push(rgb);
+                        }
+                    }
+                }
                 let mut gx = ax + gpx;
-                for &ch in &doc.lines[li] {
+                for (i, &ch) in line.iter().enumerate() {
                     if gx + cw > ax + aw {
                         break;
                     }
+                    let color = colors.get(i).copied().unwrap_or(self.theme.fg);
                     ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
-                    blit_char(buf, w, h, &self.glyph_cache, ch, gx, y, self.theme.fg);
+                    blit_char(buf, w, h, &self.glyph_cache, ch, gx, y, color);
                     gx += cw;
                 }
                 // caret
