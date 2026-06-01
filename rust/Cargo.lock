@@ -1862,7 +1862,9 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "clipboard-win",
+ "raw-window-handle",
  "softbuffer",
+ "windows-sys 0.52.0",
  "winit",
  "wslterm-core",
  "wslterm-pty",

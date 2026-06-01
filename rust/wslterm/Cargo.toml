@@ -16,6 +16,14 @@ softbuffer = "0.4"
 ab_glyph = "0.2"
 # Lightweight, Windows-only clipboard access for copy/paste.
 clipboard-win = "5"
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+# For the layered-window translucency (SetLayeredWindowAttributes).
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [[bin]]
 name = "wslterm"

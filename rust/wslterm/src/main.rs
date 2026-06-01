@@ -115,6 +115,8 @@ struct App {
     selecting: bool,       // left button held, dragging a selection
     sel_anchor: Option<(i64, i64)>, // (abs_row, col) where the drag began
     sel: Option<(i64, i64, i64, i64)>, // normalized (r1,c1,r2,c2), abs rows, inclusive
+
+    opacity: f32, // 0.4..=1.0 window opacity (1.0 = fully opaque)
 }
 
 impl App {
@@ -141,6 +143,7 @@ impl App {
             selecting: false,
             sel_anchor: None,
             sel: None,
+            opacity: parse_opacity_env(),
             scroll_off: 0,
             grid: Vec::new(),
             glyph_cache: HashMap::new(),
@@ -194,6 +197,15 @@ impl App {
                 }
                 KeyCode::Insert if shift => {
                     self.paste();
+                    return;
+                }
+                // Ctrl +/- adjusts window opacity.
+                KeyCode::Equal | KeyCode::NumpadAdd if ctrl => {
+                    self.adjust_opacity(0.05);
+                    return;
+                }
+                KeyCode::Minus | KeyCode::NumpadSubtract if ctrl => {
+                    self.adjust_opacity(-0.05);
                     return;
                 }
                 _ => {}
@@ -300,6 +312,13 @@ impl App {
     fn request_redraw(&self) {
         if let Some(win) = &self.win {
             win.request_redraw();
+        }
+    }
+
+    fn adjust_opacity(&mut self, delta: f32) {
+        self.opacity = (self.opacity + delta).clamp(0.4, 1.0);
+        if let Some(win) = &self.win {
+            set_window_opacity(win, self.opacity);
         }
     }
 
@@ -463,6 +482,7 @@ impl ApplicationHandler<UserEvent> for App {
         let win = Rc::new(event_loop.create_window(attrs).expect("create window"));
         self.scale = win.scale_factor() as f32;
         self.recompute_metrics();
+        set_window_opacity(&win, self.opacity);
 
         let context = Context::new(win.clone()).expect("softbuffer context");
         let mut surface = Surface::new(&context, win.clone()).expect("softbuffer surface");
@@ -628,6 +648,50 @@ fn main() {
     let mut app = App::new(proxy);
     event_loop.run_app(&mut app).expect("run app");
 }
+
+/// Initial window opacity from `$WSLTERM_OPACITY` (accepts 0.0..1.0 or 0..100),
+/// defaulting to 0.92. Clamped to a usable 0.4..1.0.
+fn parse_opacity_env() -> f32 {
+    let raw = std::env::var("WSLTERM_OPACITY")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok());
+    let v = match raw {
+        Some(v) if v > 1.0 => v / 100.0, // treat 0..100 as a percentage
+        Some(v) => v,
+        None => 0.92,
+    };
+    v.clamp(0.4, 1.0)
+}
+
+/// Apply uniform window translucency via a layered window. The OS composites our
+/// painted content at `opacity`, so text and background fade together — the
+/// common terminal "transparency" behavior; keeps the normal title bar/resize.
+#[cfg(windows)]
+fn set_window_opacity(window: &Window, opacity: f32) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE, LWA_ALPHA,
+        WS_EX_LAYERED,
+    };
+    let raw = match window.window_handle() {
+        Ok(h) => h.as_raw(),
+        Err(_) => return,
+    };
+    let hwnd = match raw {
+        RawWindowHandle::Win32(h) => h.hwnd.get() as HWND,
+        _ => return,
+    };
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED as isize);
+        let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_window_opacity(_window: &Window, _opacity: f32) {}
 
 /// Load a system monospace font (Consolas, then Cascadia Mono, then Lucida).
 fn load_monospace_font() -> Option<FontVec> {

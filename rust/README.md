@@ -64,6 +64,9 @@ parity. The win is RAM, GC-free latency, and a smaller binary — not raw speed.
       662s -> 56s, ~40 MB, no OOM)
 - [x] `wslterm`: text selection + clipboard — drag to select, Ctrl+Shift+C copy,
       Ctrl+Shift+V / Shift+Insert / middle-click paste (bracketed-paste aware)
+- [x] `wslterm`: window translucency — uniform layered-window opacity
+      (`$WSLTERM_OPACITY`, default 0.92; Ctrl+=/Ctrl+- to adjust live)
+- [ ] `wslterm`: tabs (Ctrl+T/W/Tab), then split panes
 - [ ] `wslterm`: milestone 2b — faster partial repaint, full keymap, word/line select
 - [ ] `wslterm`: milestone 3 — font fallback + color emoji
 - [ ] `wslterm`: milestone 4 — translucency, tabs, panes
