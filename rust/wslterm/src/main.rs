@@ -17,7 +17,7 @@ use std::sync::mpsc::Receiver;
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WKey, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -29,7 +29,8 @@ use wslterm_pty::mux::MuxEvent;
 use wslterm_pty::{WslMux, WslProcess};
 
 const DISTRO: &str = "Ubuntu";
-const FONT_PX: f32 = 17.0;
+/// Logical font size; multiplied by the monitor's DPI scale to get device px.
+const BASE_FONT_PX: f32 = 18.0;
 const DEFAULT_FG: u32 = 0xCC_CCCC; // Campbell foreground
 const DEFAULT_BG: u32 = 0x0C_0C0C; // Campbell background
 const CURSOR_RGB: u32 = 0xCC_CCCC;
@@ -47,6 +48,8 @@ struct App {
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
 
     font: FontVec,
+    scale: f32,    // monitor DPI scale (1.0, 1.5, 2.0, ...)
+    font_px: f32,  // BASE_FONT_PX * scale, in device pixels
     cell_w: usize,
     cell_h: usize,
     ascent: f32,
@@ -55,6 +58,7 @@ struct App {
     mux: Option<WslMux>,
     session: u32,
     mods: ModifiersState,
+    scroll_off: usize, // rows scrolled up into scrollback (0 = live bottom)
 
     grid: Vec<Vec<Cell>>, // reused viewport snapshot
     rx: Option<Receiver<MuxEvent>>,
@@ -63,27 +67,36 @@ struct App {
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>) -> App {
         let font = load_monospace_font().expect("no monospace font found (Consolas/Cascadia)");
-        let scale = PxScale::from(FONT_PX);
-        let sf = font.as_scaled(scale);
-        let ascent = sf.ascent();
-        let cell_h = (sf.ascent() - sf.descent() + sf.line_gap()).ceil().max(1.0) as usize;
-        let cell_w = sf.h_advance(font.glyph_id('M')).ceil().max(1.0) as usize;
-        App {
+        let mut app = App {
             proxy,
             win: None,
             context: None,
             surface: None,
             font,
-            cell_w,
-            cell_h,
-            ascent,
+            scale: 1.0,
+            font_px: BASE_FONT_PX,
+            cell_w: 1,
+            cell_h: 1,
+            ascent: 0.0,
             term: Terminal::new(80, 24),
             mux: None,
             session: 0,
             mods: ModifiersState::empty(),
+            scroll_off: 0,
             grid: Vec::new(),
             rx: None,
-        }
+        };
+        app.recompute_metrics();
+        app
+    }
+
+    /// Recompute font/cell metrics for the current DPI scale.
+    fn recompute_metrics(&mut self) {
+        self.font_px = BASE_FONT_PX * self.scale;
+        let sf = self.font.as_scaled(PxScale::from(self.font_px));
+        self.ascent = sf.ascent();
+        self.cell_h = (sf.ascent() - sf.descent() + sf.line_gap()).ceil().max(1.0) as usize;
+        self.cell_w = sf.h_advance(self.font.glyph_id('M')).ceil().max(1.0) as usize;
     }
 
     fn grid_dims(&self, w: u32, h: u32) -> (usize, usize) {
@@ -104,6 +117,13 @@ impl App {
     fn handle_key(&mut self, ev: &KeyEvent) {
         if ev.state != ElementState::Pressed {
             return;
+        }
+        // Typing snaps the view back to the live bottom.
+        if self.scroll_off != 0 {
+            self.scroll_off = 0;
+            if let Some(win) = &self.win {
+                win.request_redraw();
+            }
         }
         let mods = Mods {
             ctrl: self.mods.control_key(),
@@ -131,6 +151,26 @@ impl App {
         // Plain printable input: send the layout-resolved text directly.
         if let Some(text) = &ev.text {
             self.send(text.as_bytes());
+        }
+    }
+
+    /// Scroll the view by `lines` into scrollback (+ = up into history).
+    fn scroll_by(&mut self, lines: i32) {
+        let max = self.term.scrollback_count() as i32;
+        let next = (self.scroll_off as i32 + lines).clamp(0, max) as usize;
+        if next != self.scroll_off {
+            self.scroll_off = next;
+            if let Some(win) = &self.win {
+                win.request_redraw();
+            }
+        }
+    }
+
+    /// Re-derive grid size from the window's current physical size.
+    fn reflow(&mut self) {
+        if let Some(win) = &self.win {
+            let s = win.inner_size();
+            self.resize_surface(s.width, s.height);
         }
     }
 
@@ -162,13 +202,15 @@ impl App {
         // Clear to background.
         buffer.fill(DEFAULT_BG);
 
-        self.term.capture_viewport(0, &mut self.grid);
+        let off = self.scroll_off.min(self.term.scrollback_count());
+        self.term.capture_viewport(off, &mut self.grid);
         let cols = self.term.cols();
         let rows = self.term.rows();
         let (cx, cy) = (self.term.cx(), self.term.cy());
-        let cursor_on = self.term.cursor_visible();
+        // Cursor only shows in the live view (not while scrolled into history).
+        let cursor_on = self.term.cursor_visible() && off == 0;
 
-        let scale = PxScale::from(FONT_PX);
+        let scale = PxScale::from(self.font_px);
         for r in 0..rows.min(self.grid.len()) {
             let row = &self.grid[r];
             for c in 0..cols.min(row.len()) {
@@ -231,6 +273,8 @@ impl ApplicationHandler<UserEvent> for App {
             .with_title("WSL Terminal (Rust)")
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
         let win = Rc::new(event_loop.create_window(attrs).expect("create window"));
+        self.scale = win.scale_factor() as f32;
+        self.recompute_metrics();
 
         let context = Context::new(win.clone()).expect("softbuffer context");
         let mut surface = Surface::new(&context, win.clone()).expect("softbuffer surface");
@@ -283,6 +327,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let resp = std::mem::take(&mut self.term.respond);
                     self.send(&resp);
                 }
+                self.scroll_off = 0; // new output snaps to the live bottom
                 if let Some(win) = &self.win {
                     win.request_redraw();
                 }
@@ -304,8 +349,23 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(&event),
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => (y.round() as i32) * 3,
+                    MouseScrollDelta::PixelDelta(p) => (p.y / self.cell_h as f64).round() as i32,
+                };
+                self.scroll_by(lines);
+            }
             WindowEvent::Resized(size) => {
                 self.resize_surface(size.width, size.height);
+                if let Some(win) = &self.win {
+                    win.request_redraw();
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.scale = scale_factor as f32;
+                self.recompute_metrics();
+                self.reflow();
                 if let Some(win) = &self.win {
                     win.request_redraw();
                 }

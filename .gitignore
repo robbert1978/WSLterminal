@@ -20,3 +20,6 @@ rust/target/
 
 # GUI milestone screenshots
 rust/*.png
+
+# transient commit message file
+rust/.commitmsg.txt
