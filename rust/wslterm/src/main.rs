@@ -122,6 +122,7 @@ struct App {
 
     tabs: Vec<Tab>,
     active: usize,
+    start_dir: Option<String>, // cwd for the first tab (from --cd)
 
     mods: ModifiersState,
     cursor_px: (f64, f64),
@@ -134,7 +135,7 @@ struct App {
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<UserEvent>) -> App {
+    fn new(proxy: EventLoopProxy<UserEvent>, start_dir: Option<String>) -> App {
         let cfg = Settings::load();
         let font = load_monospace_font(&cfg.font_family)
             .expect("no monospace font found (Consolas/Cascadia)");
@@ -159,6 +160,7 @@ impl App {
             redraw_pending: Arc::new(AtomicBool::new(false)),
             tabs: Vec::new(),
             active: 0,
+            start_dir,
             mods: ModifiersState::empty(),
             cursor_px: (0.0, 0.0),
             grid: Vec::new(),
@@ -267,6 +269,15 @@ impl App {
         self.request_redraw();
     }
 
+    /// Open a new top-level window (a fresh wslterm process) in `dir`.
+    fn spawn_new_window(&self) {
+        let dir = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.term.lock().unwrap().current_directory().map(String::from));
+        spawn_window(dir);
+    }
+
     fn switch_tab(&mut self, delta: i32) {
         if self.tabs.is_empty() {
             return;
@@ -299,6 +310,10 @@ impl App {
                 }
                 KeyCode::KeyT if ctrl && shift => {
                     self.add_tab();
+                    return;
+                }
+                KeyCode::KeyN if ctrl && shift => {
+                    self.spawn_new_window();
                     return;
                 }
                 KeyCode::KeyW if ctrl && shift => {
@@ -667,9 +682,9 @@ impl ApplicationHandler<UserEvent> for App {
         let proc = WslProcess::launch(DISTRO, &command).expect("launch wslg.exe");
         let (mux, rx) = WslMux::start(proc);
 
-        // First tab.
+        // First tab (in --cd directory if given).
         let term = Arc::new(Mutex::new(Terminal::new(cols, rows)));
-        let session = mux.open(cols as u16, rows as u16, "");
+        let session = mux.open(cols as u16, rows as u16, self.start_dir.as_deref().unwrap_or(""));
         self.registry.lock().unwrap().insert(session, term.clone());
         self.tabs.push(Tab {
             session,
@@ -834,13 +849,45 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() {
+    let start_dir = parse_cd_arg();
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("build event loop");
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(proxy);
+    let mut app = App::new(proxy, start_dir);
     event_loop.run_app(&mut app).expect("run app");
 }
+
+/// `--cd <wsl-dir>`: the directory the first tab should start in (used when a
+/// new window is spawned from "Open in new window" / Ctrl+Shift+N).
+fn parse_cd_arg() -> Option<String> {
+    let mut args = std::env::args();
+    while let Some(a) = args.next() {
+        if a == "--cd" {
+            return args.next().filter(|s| !s.is_empty());
+        }
+    }
+    None
+}
+
+/// Launch another wslterm window (a detached, windowless child process).
+#[cfg(windows)]
+fn spawn_window(dir: Option<String>) {
+    use std::os::windows::process::CommandExt;
+    if let Ok(exe) = std::env::current_exe() {
+        let mut cmd = std::process::Command::new(exe);
+        if let Some(d) = dir {
+            if !d.is_empty() {
+                cmd.arg("--cd").arg(d);
+            }
+        }
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW (no console flash)
+        let _ = cmd.spawn();
+    }
+}
+
+#[cfg(not(windows))]
+fn spawn_window(_dir: Option<String>) {}
 
 /// Last path component of a (WSL) path, for tab titles.
 fn basename(path: &str) -> String {
