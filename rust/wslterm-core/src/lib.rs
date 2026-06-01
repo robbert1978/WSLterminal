@@ -12,11 +12,13 @@ mod flags;
 pub mod cell;
 pub mod charwidth;
 pub mod color;
+pub mod input;
 pub mod parser;
 pub mod screen;
 pub mod terminal;
 
 pub use cell::{Cell, CellFlags};
+pub use input::{Key, Mods};
 pub use parser::{ParserSinks, VtParser};
 pub use screen::{MouseTracking, Screen};
 pub use terminal::Terminal;
