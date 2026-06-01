@@ -34,6 +34,7 @@ use wslterm_pty::mux::MuxEvent;
 use wslterm_pty::{WslMux, WslProcess};
 
 mod settings;
+mod wslfiles;
 use settings::{Settings, Theme};
 
 const DISTRO: &str = "Ubuntu";
@@ -267,6 +268,112 @@ struct Tab {
     focus: u32,
 }
 
+/// An open file in the editor overlay (replaces the terminal area while open).
+struct Doc {
+    path: String, // linux path
+    name: String,
+    lines: Vec<Vec<char>>, // editable, per line
+    cy: usize,             // cursor line
+    cx: usize,             // cursor column (char index in line)
+    scroll: usize,         // first visible line
+    dirty: bool,
+    readonly: bool,
+}
+
+impl Doc {
+    fn open(distro: &str, linux_path: &str, name: &str) -> Doc {
+        let bytes = wslfiles::read_bytes(distro, linux_path, 2 * 1024 * 1024).unwrap_or_default();
+        let readonly = wslfiles::looks_binary(&bytes);
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<Vec<char>> = if text.is_empty() {
+            vec![Vec::new()]
+        } else {
+            text.split('\n').map(|l| l.trim_end_matches('\r').chars().collect()).collect()
+        };
+        Doc {
+            path: linux_path.to_string(),
+            name: name.to_string(),
+            lines,
+            cy: 0,
+            cx: 0,
+            scroll: 0,
+            dirty: false,
+            readonly,
+        }
+    }
+
+    fn text(&self) -> String {
+        self.lines.iter().map(|l| l.iter().collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+    fn save(&mut self, distro: &str) -> bool {
+        let ok = wslfiles::write_text(distro, &self.path, &self.text());
+        if ok {
+            self.dirty = false;
+        }
+        ok
+    }
+    fn clamp_cx(&mut self) {
+        let len = self.lines.get(self.cy).map(|l| l.len()).unwrap_or(0);
+        if self.cx > len {
+            self.cx = len;
+        }
+    }
+    fn insert_char(&mut self, c: char) {
+        if self.readonly {
+            return;
+        }
+        let line = &mut self.lines[self.cy];
+        let i = self.cx.min(line.len());
+        line.insert(i, c);
+        self.cx = i + 1;
+        self.dirty = true;
+    }
+    fn newline(&mut self) {
+        if self.readonly {
+            return;
+        }
+        let at = self.cx.min(self.lines[self.cy].len());
+        let tail: Vec<char> = self.lines[self.cy].split_off(at);
+        self.lines.insert(self.cy + 1, tail);
+        self.cy += 1;
+        self.cx = 0;
+        self.dirty = true;
+    }
+    fn backspace(&mut self) {
+        if self.readonly {
+            return;
+        }
+        if self.cx > 0 {
+            self.lines[self.cy].remove(self.cx - 1);
+            self.cx -= 1;
+        } else if self.cy > 0 {
+            let cur = self.lines.remove(self.cy);
+            self.cy -= 1;
+            self.cx = self.lines[self.cy].len();
+            self.lines[self.cy].extend(cur);
+        }
+        self.dirty = true;
+    }
+    fn move_cursor(&mut self, dr: i32, dc: i32) {
+        if dr != 0 {
+            self.cy = (self.cy as i32 + dr).clamp(0, self.lines.len() as i32 - 1) as usize;
+            self.clamp_cx();
+        }
+        if dc != 0 {
+            let len = self.lines[self.cy].len();
+            if dc < 0 && self.cx == 0 && self.cy > 0 {
+                self.cy -= 1;
+                self.cx = self.lines[self.cy].len();
+            } else if dc > 0 && self.cx >= len && self.cy + 1 < self.lines.len() {
+                self.cy += 1;
+                self.cx = 0;
+            } else {
+                self.cx = (self.cx as i32 + dc).clamp(0, len as i32) as usize;
+            }
+        }
+    }
+}
+
 struct App {
     proxy: EventLoopProxy<UserEvent>,
     win: Option<Rc<Window>>,
@@ -302,6 +409,14 @@ struct App {
     chip_ranges: Vec<(f32, f32)>,
     plus_range: (f32, f32),
     pane_rects: Vec<(u32, Rect)>, // active tab's leaf rects
+
+    // File sidebar + editor overlay.
+    sidebar_open: bool,
+    show_hidden: bool,
+    sidebar_dir: String,
+    sidebar_entries: Vec<wslfiles::Entry>,
+    sidebar_scroll: usize,
+    doc: Option<Doc>,
 }
 
 impl App {
@@ -338,9 +453,134 @@ impl App {
             chip_ranges: Vec::new(),
             plus_range: (0.0, 0.0),
             pane_rects: Vec::new(),
+            sidebar_open: false,
+            show_hidden: false,
+            sidebar_dir: String::new(),
+            sidebar_entries: Vec::new(),
+            sidebar_scroll: 0,
+            doc: None,
         };
         app.recompute_metrics();
         app
+    }
+
+    /// Sidebar width in device px (0 when closed).
+    fn sidebar_w(&self) -> usize {
+        if self.sidebar_open {
+            (self.cell_w * 24).clamp(160, 420)
+        } else {
+            0
+        }
+    }
+
+    /// Re-list the sidebar from the focused pane's cwd (called on cwd change /
+    /// toggle). No-op when the sidebar is closed.
+    fn refresh_sidebar(&mut self) {
+        if !self.sidebar_open {
+            return;
+        }
+        let cwd = self.focused_cwd();
+        let dir = if cwd.is_empty() { "/".to_string() } else { cwd };
+        self.sidebar_entries = wslfiles::list(DISTRO, &dir, self.show_hidden);
+        self.sidebar_dir = dir;
+        self.sidebar_scroll = 0;
+    }
+
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_open = !self.sidebar_open;
+        self.refresh_sidebar();
+        self.reflow(); // terminal area width changed
+        self.request_redraw();
+    }
+
+    fn toggle_hidden(&mut self) {
+        self.show_hidden = !self.show_hidden;
+        self.sidebar_dir.clear(); // force re-list
+        self.refresh_sidebar();
+        self.request_redraw();
+    }
+
+    /// Click in the sidebar: cd into a directory (shell follows) or open a file.
+    fn sidebar_click(&mut self) {
+        let bar = self.tab_bar_h();
+        let idx = (self.cursor_px.1 as usize).saturating_sub(bar) / self.cell_h + self.sidebar_scroll;
+        if idx >= self.sidebar_entries.len() {
+            return;
+        }
+        let (is_dir, lp, name) = {
+            let e = &self.sidebar_entries[idx];
+            (e.is_dir, e.linux_path.clone(), e.name.clone())
+        };
+        if is_dir {
+            let cmd = format!(" cd '{}'\r", lp.replace('\'', "'\\''"));
+            self.send(cmd.as_bytes());
+        } else {
+            self.doc = Some(Doc::open(DISTRO, &lp, &name));
+        }
+        self.request_redraw();
+    }
+
+    /// Editor key handling while a document is open.
+    fn doc_key(&mut self, ev: &KeyEvent) {
+        let ctrl = self.mods.control_key();
+        let mut close = false;
+        let mut save = false;
+        if let Some(doc) = self.doc.as_mut() {
+            if let PhysicalKey::Code(code) = ev.physical_key {
+                match code {
+                    KeyCode::Escape => close = true,
+                    KeyCode::KeyS if ctrl => save = true,
+                    KeyCode::ArrowUp => doc.move_cursor(-1, 0),
+                    KeyCode::ArrowDown => doc.move_cursor(1, 0),
+                    KeyCode::ArrowLeft => doc.move_cursor(0, -1),
+                    KeyCode::ArrowRight => doc.move_cursor(0, 1),
+                    KeyCode::Home => doc.cx = 0,
+                    KeyCode::End => doc.cx = doc.lines[doc.cy].len(),
+                    KeyCode::PageUp => doc.move_cursor(-20, 0),
+                    KeyCode::PageDown => doc.move_cursor(20, 0),
+                    KeyCode::Backspace => doc.backspace(),
+                    KeyCode::Enter | KeyCode::NumpadEnter => doc.newline(),
+                    KeyCode::Tab => {
+                        for _ in 0..4 {
+                            doc.insert_char(' ');
+                        }
+                    }
+                    _ => {
+                        if let Some(text) = &ev.text {
+                            for c in text.chars() {
+                                if !c.is_control() {
+                                    doc.insert_char(c);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if save {
+            if let Some(d) = self.doc.as_mut() {
+                d.save(DISTRO);
+            }
+        }
+        if close {
+            self.doc = None;
+        }
+        self.doc_scroll_to_cursor();
+        self.request_redraw();
+    }
+
+    fn doc_scroll_to_cursor(&mut self) {
+        let bar = self.tab_bar_h();
+        let ch = self.cell_h;
+        let wh = self.win.as_ref().map(|w| w.inner_size().height as usize).unwrap_or(0);
+        let rows = (wh.saturating_sub(bar + ch) / ch).max(1);
+        if let Some(doc) = self.doc.as_mut() {
+            if doc.cy < doc.scroll {
+                doc.scroll = doc.cy;
+            } else if doc.cy >= doc.scroll + rows {
+                doc.scroll = doc.cy + 1 - rows;
+            }
+        }
     }
 
     fn recompute_metrics(&mut self) {
@@ -357,11 +597,11 @@ impl App {
         self.cell_h + (8.0 * self.scale).round() as usize
     }
 
-    /// Grid dimensions for the terminal area (below the tab bar).
+    /// Grid dimensions for the terminal area (below the tab bar, right of sidebar).
     fn grid_dims(&self, w: u32, h: u32) -> (usize, usize) {
-        let avail_h = (h as usize).saturating_sub(self.tab_bar_h());
-        let cols = (w as usize / self.cell_w).max(1);
-        let rows = (avail_h / self.cell_h).max(1);
+        let area = self.terminal_area(w, h);
+        let cols = (area.w / self.cell_w).max(1);
+        let rows = (area.h / self.cell_h).max(1);
         (cols, rows)
     }
 
@@ -401,7 +641,13 @@ impl App {
 
     fn terminal_area(&self, w: u32, h: u32) -> Rect {
         let bar = self.tab_bar_h();
-        Rect { x: 0, y: bar, w: w as usize, h: (h as usize).saturating_sub(bar) }
+        let sb = self.sidebar_w();
+        Rect {
+            x: sb,
+            y: bar,
+            w: (w as usize).saturating_sub(sb),
+            h: (h as usize).saturating_sub(bar),
+        }
     }
 
     /// Open a session + terminal and register it.
@@ -580,9 +826,22 @@ impl App {
                     self.spawn_new_window();
                     return;
                 }
+                KeyCode::KeyE if ctrl && shift => {
+                    self.toggle_sidebar();
+                    return;
+                }
+                KeyCode::KeyH if ctrl && shift => {
+                    self.toggle_hidden();
+                    return;
+                }
                 KeyCode::KeyW if ctrl && shift => {
-                    let s = self.focused_session();
-                    self.close_session(s, false, event_loop);
+                    if self.doc.is_some() {
+                        self.doc = None;
+                        self.request_redraw();
+                    } else {
+                        let s = self.focused_session();
+                        self.close_session(s, false, event_loop);
+                    }
                     return;
                 }
                 KeyCode::Tab if ctrl => {
@@ -603,6 +862,12 @@ impl App {
                 }
                 _ => {}
             }
+        }
+
+        // While the editor overlay is open it takes all remaining input.
+        if self.doc.is_some() {
+            self.doc_key(ev);
+            return;
         }
 
         // Typing snaps the focused view to the live bottom.
@@ -831,7 +1096,13 @@ impl App {
             .collect();
 
         // Lay out panes for the active tab (also used for mouse hit-testing).
-        let area = Rect { x: 0, y: bar_h, w: w as usize, h: (h as usize).saturating_sub(bar_h) };
+        let sb = self.sidebar_w();
+        let area = Rect {
+            x: sb,
+            y: bar_h,
+            w: (w as usize).saturating_sub(sb),
+            h: (h as usize).saturating_sub(bar_h),
+        };
         self.pane_rects.clear();
         self.tabs[self.active].root.leaf_rects(area, &mut self.pane_rects);
         let focus = self.focused_session();
@@ -887,8 +1158,10 @@ impl App {
             mix(self.theme.bg, self.theme.fg, 0.7));
         self.plus_range = (px0 as f32, px1 as f32);
 
-        // --- panes ---------------------------------------------------------
+        // --- content: panes or editor overlay -----------------------------
         let divider = mix(self.theme.bg, self.theme.fg, 0.18);
+        let dim = mix(self.theme.bg, self.theme.fg, 0.45);
+        if self.doc.is_none() {
         for (session, rect) in &rects {
             // Snapshot this pane's state, then release its borrow.
             let (term, scroll_off, sel) = {
@@ -975,6 +1248,94 @@ impl App {
                 fill_rect(buf, w, h, rect.x, rect.y, rect.w, (2.0 * self.scale) as usize,
                     self.theme.selection);
             }
+        }
+        } // end: panes (no doc)
+
+        // --- editor overlay (replaces the terminal area) ------------------
+        if let Some(doc) = &self.doc {
+            let ax = sb;
+            let aw = (w as usize).saturating_sub(sb);
+            let ah = (h as usize).saturating_sub(bar_h);
+            fill_rect(buf, w, h, ax, bar_h, aw, ah, self.theme.bg);
+            // header: filename (+ * if dirty / [ro])
+            let mut header = doc.name.clone();
+            if doc.readonly {
+                header.push_str("  [read-only]");
+            } else if doc.dirty {
+                header.push_str("  *");
+            }
+            header.push_str("   (Ctrl+S save, Esc close)");
+            fill_rect(buf, w, h, ax, bar_h, aw, ch_px, mix(self.theme.bg, self.theme.fg, 0.12));
+            let mut gx = ax + pad;
+            for ch in header.chars().take(aw / cw) {
+                ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
+                blit_char(buf, w, h, &self.glyph_cache, ch, gx, bar_h as i32, self.theme.fg);
+                gx += cw;
+            }
+            // text rows below the header
+            let total = doc.lines.len();
+            let gutter = (format!("{total}").len() + 1).max(3);
+            let gpx = gutter * cw;
+            let top = bar_h + ch_px;
+            let rows = ah.saturating_sub(ch_px) / ch_px;
+            for vi in 0..rows {
+                let li = doc.scroll + vi;
+                if li >= total {
+                    break;
+                }
+                let y = (top + vi * ch_px) as i32;
+                // line number (right-aligned in the gutter)
+                let num = format!("{:>w$} ", li + 1, w = gutter - 1);
+                let mut gx = ax;
+                for ch in num.chars() {
+                    ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
+                    blit_char(buf, w, h, &self.glyph_cache, ch, gx, y, dim);
+                    gx += cw;
+                }
+                // line text
+                let mut gx = ax + gpx;
+                for &ch in &doc.lines[li] {
+                    if gx + cw > ax + aw {
+                        break;
+                    }
+                    ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
+                    blit_char(buf, w, h, &self.glyph_cache, ch, gx, y, self.theme.fg);
+                    gx += cw;
+                }
+                // caret
+                if li == doc.cy && !doc.readonly {
+                    let cxpx = ax + gpx + doc.cx * cw;
+                    let caret_w = (cw / 8).max(2);
+                    fill_rect(buf, w, h, cxpx, y as usize, caret_w, ch_px, self.theme.cursor);
+                }
+            }
+        }
+
+        // --- file sidebar --------------------------------------------------
+        if sb > 0 {
+            let sb_bg = mix(self.theme.bg, self.theme.fg, 0.05);
+            fill_rect(buf, w, h, 0, bar_h, sb, (h as usize).saturating_sub(bar_h), sb_bg);
+            let line_h = ch_px;
+            let visible = (h as usize).saturating_sub(bar_h) / line_h;
+            let dir_color = self.theme.ansi[12]; // bright blue
+            for (vi, ent) in
+                self.sidebar_entries.iter().skip(self.sidebar_scroll).take(visible).enumerate()
+            {
+                let y = (bar_h + vi * line_h) as i32;
+                let mut label = ent.name.clone();
+                if ent.is_dir {
+                    label.push('/');
+                }
+                let color = if ent.is_dir { dir_color } else { self.theme.fg };
+                let mut gx = 4;
+                for ch in label.chars().take(sb / cw) {
+                    ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
+                    blit_char(buf, w, h, &self.glyph_cache, ch, gx, y, color);
+                    gx += cw;
+                }
+            }
+            fill_rect(buf, w, h, sb.saturating_sub(DIVIDER), bar_h, DIVIDER,
+                (h as usize).saturating_sub(bar_h), divider);
         }
 
         let _ = buffer.present();
@@ -1096,6 +1457,14 @@ impl ApplicationHandler<UserEvent> for App {
                         mux.send_data(id, &bytes);
                     }
                 }
+                // Follow the shell's cwd in the sidebar.
+                if self.sidebar_open {
+                    let cwd = self.focused_cwd();
+                    let dir = if cwd.is_empty() { "/".into() } else { cwd };
+                    if dir != self.sidebar_dir {
+                        self.refresh_sidebar();
+                    }
+                }
                 self.request_redraw();
             }
             UserEvent::SessionExit(id) => {
@@ -1118,10 +1487,22 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
                     MouseScrollDelta::PixelDelta(p) => p.y / self.cell_h as f64,
                 };
+                let step = (y.round() as i32) * 3;
+                let over_sidebar = self.sidebar_w() > 0
+                    && self.cursor_px.0 < self.sidebar_w() as f64
+                    && self.cursor_px.1 >= self.tab_bar_h() as f64;
                 if self.mods.control_key() {
                     self.zoom_font(if y > 0.0 { 1.0 } else { -1.0 });
+                } else if over_sidebar {
+                    let max = self.sidebar_entries.len().saturating_sub(1) as i32;
+                    self.sidebar_scroll = (self.sidebar_scroll as i32 - step).clamp(0, max) as usize;
+                    self.request_redraw();
+                } else if let Some(doc) = self.doc.as_mut() {
+                    let max = doc.lines.len().saturating_sub(1) as i32;
+                    doc.scroll = (doc.scroll as i32 - step).clamp(0, max) as usize;
+                    self.request_redraw();
                 } else {
-                    self.scroll_by((y.round() as i32) * 3);
+                    self.scroll_by(step);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1134,7 +1515,9 @@ impl ApplicationHandler<UserEvent> for App {
                 (MouseButton::Left, ElementState::Pressed) => {
                     if self.cursor_px.1 < self.tab_bar_h() as f64 {
                         self.tab_bar_click();
-                    } else {
+                    } else if self.sidebar_w() > 0 && self.cursor_px.0 < self.sidebar_w() as f64 {
+                        self.sidebar_click();
+                    } else if self.doc.is_none() {
                         self.begin_selection();
                     }
                 }

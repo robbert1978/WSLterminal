@@ -66,11 +66,16 @@ parity. The win is RAM, GC-free latency, and a smaller binary — not raw speed.
       Ctrl+Shift+V / Shift+Insert / middle-click paste (bracketed-paste aware)
 - [x] `wslterm`: window translucency — uniform layered-window opacity
       (`$WSLTERM_OPACITY`, default 0.92; Ctrl+=/Ctrl+- to adjust live)
-- [ ] `wslterm`: tabs (Ctrl+T/W/Tab), then split panes
-- [ ] `wslterm`: milestone 2b — faster partial repaint, full keymap, word/line select
-- [ ] `wslterm`: milestone 3 — font fallback + color emoji
-- [ ] `wslterm`: milestone 4 — translucency, tabs, panes
-- [ ] sidebar / editor / highlighting (syntect)
+- [x] `wslterm`: settings.json config (colors/font/opacity) + Ctrl+/-/0 font zoom
+- [x] `wslterm`: tabs (Ctrl+Shift+T/W, Ctrl+Tab, click / middle-click close)
+- [x] `wslterm`: new window (Ctrl+Shift+N — spawns a child process; `--cd`)
+- [x] `wslterm`: split panes (Alt+Shift +/-, click-to-focus, per-pane PTY)
+- [x] `wslterm`: file sidebar (Ctrl+Shift+E, follows shell cwd, Ctrl+Shift+H
+      hidden toggle; click dir = cd, click file = open)
+- [x] `wslterm`: file viewer/editor (line numbers, edit, Ctrl+S save via the
+      \\wsl.localhost share, Esc close)
+- [ ] `wslterm`: syntax highlighting in the editor (syntect) — not yet
+- [ ] `wslterm`: faster partial repaint, word/line select, per-pixel translucency, color emoji
 
 ### CPU vs GPU rendering
 
