@@ -1,17 +1,16 @@
 //! WSL Terminal GUI — Rust rewrite.
 //!
 //! A window that renders the `wslterm-core` terminal grid and pumps the user's
-//! keystrokes (via `wslterm-core::input::encode`) into a live WSL session driven
+//! keystrokes (via `wslterm-core::input::encode`) into live WSL sessions driven
 //! by `wslterm-pty`. CPU-rendered (winit + softbuffer + ab_glyph) on purpose: it
 //! keeps RAM low and avoids the wgpu/Direct3D managed stack — the whole point of
 //! the rewrite.
 //!
-//! Threading (mirrors the C# app): a background thread owns the mux receiver and
-//! feeds bytes into a shared `Arc<Mutex<Terminal>>`, then wakes the UI to render
-//! (coalesced to one pending wake). The mux uses a *bounded* channel, so under a
-//! flood (e.g. termbench) the reader blocks, back-pressuring wslptyd instead of
-//! buffering the whole burst — memory stays bounded. Rendering is decoupled from
-//! parsing, so a slow repaint never inflates the input queue.
+//! One window multiplexes many sessions as tabs over a single wslg+wslptyd. A
+//! background feed thread owns the mux receiver, routes each frame to the right
+//! session's `Arc<Mutex<Terminal>>` (by id), and wakes the UI to render
+//! (coalesced). The mux uses a bounded channel so floods back-pressure wslptyd
+//! instead of buffering — memory stays bounded.
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -41,10 +40,15 @@ const DISTRO: &str = "Ubuntu";
 /// points -> device-independent pixels (CSS px); multiplied again by DPI scale.
 const PT_TO_PX: f32 = 96.0 / 72.0;
 
-/// Lightweight events from the feed thread to the UI (no payload — the data is
-/// already in the shared Terminal; this just wakes the loop to render/exit).
+/// Per-session registry shared with the feed thread: session id -> its terminal.
+type Registry = Arc<Mutex<HashMap<u32, Arc<Mutex<Terminal>>>>>;
+/// Responses (DSR/DA) the feed thread owes the PTY, tagged by session.
+type Outbox = Arc<Mutex<Vec<(u32, Vec<u8>)>>>;
+
+/// Lightweight events from the feed thread to the UI.
 enum UserEvent {
     Redraw,
+    SessionExit(u32),
     Closed,
 }
 
@@ -84,6 +88,16 @@ fn rasterize_glyph(font: &FontVec, px: f32, ch: char) -> Option<Glyph> {
     Some(Glyph { left: b.min.x.floor() as i32, top: b.min.y.floor() as i32, w, h, cov })
 }
 
+/// One terminal tab: its session + emulator state + view (scroll/selection).
+struct Tab {
+    session: u32,
+    term: Arc<Mutex<Terminal>>,
+    scroll_off: usize,
+    selecting: bool,
+    sel_anchor: Option<(i64, i64)>,
+    sel: Option<(i64, i64, i64, i64)>,
+}
+
 struct App {
     proxy: EventLoopProxy<UserEvent>,
     win: Option<Rc<Window>>,
@@ -91,34 +105,32 @@ struct App {
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
 
     font: FontVec,
-    scale: f32,         // monitor DPI scale (1.0, 1.5, 2.0, ...)
-    font_pts: f32,      // logical font size in points (Ctrl+/- zoom)
-    font_pts_base: f32, // configured size, restored by Ctrl+0
-    font_px: f32,       // font_pts * PT_TO_PX * scale, in device pixels
+    scale: f32,
+    font_pts: f32,
+    font_pts_base: f32,
+    font_px: f32,
     cell_w: usize,
     cell_h: usize,
     ascent: f32,
     theme: Theme,
+    opacity: f32,
 
-    term: Arc<Mutex<Terminal>>,
     mux: Option<WslMux>,
-    session: u32,
-    /// Bytes the emulator owes the PTY (DSR/DA), filled by the feed thread,
-    /// flushed by the UI thread (keeps `mux` owned solely by the UI).
-    outbox: Arc<Mutex<Vec<u8>>>,
+    registry: Registry,
+    outbox: Outbox,
     redraw_pending: Arc<AtomicBool>,
 
+    tabs: Vec<Tab>,
+    active: usize,
+
     mods: ModifiersState,
-    scroll_off: usize, // rows scrolled up into scrollback (0 = live bottom)
-    grid: Vec<Vec<Cell>>, // reused viewport snapshot
-    glyph_cache: HashMap<char, Option<Glyph>>, // rasterized once per char per size
+    cursor_px: (f64, f64),
+    grid: Vec<Vec<Cell>>,
+    glyph_cache: HashMap<char, Option<Glyph>>,
 
-    cursor_px: (f64, f64), // last mouse position (device px)
-    selecting: bool,       // left button held, dragging a selection
-    sel_anchor: Option<(i64, i64)>, // (abs_row, col) where the drag began
-    sel: Option<(i64, i64, i64, i64)>, // normalized (r1,c1,r2,c2), abs rows, inclusive
-
-    opacity: f32, // 0.4..=1.0 window opacity (1.0 = fully opaque)
+    // Tab-bar hit-test ranges (device px), recomputed each render.
+    chip_ranges: Vec<(f32, f32)>,
+    plus_range: (f32, f32),
 }
 
 impl App {
@@ -140,58 +152,137 @@ impl App {
             cell_h: 1,
             ascent: 0.0,
             theme: cfg.theme,
-            term: Arc::new(Mutex::new(Terminal::new(80, 24))),
+            opacity: parse_opacity_env().unwrap_or(cfg.opacity),
             mux: None,
-            session: 0,
+            registry: Arc::new(Mutex::new(HashMap::new())),
             outbox: Arc::new(Mutex::new(Vec::new())),
             redraw_pending: Arc::new(AtomicBool::new(false)),
+            tabs: Vec::new(),
+            active: 0,
             mods: ModifiersState::empty(),
             cursor_px: (0.0, 0.0),
-            selecting: false,
-            sel_anchor: None,
-            sel: None,
-            opacity: parse_opacity_env().unwrap_or(cfg.opacity),
-            scroll_off: 0,
             grid: Vec::new(),
             glyph_cache: HashMap::new(),
+            chip_ranges: Vec::new(),
+            plus_range: (0.0, 0.0),
         };
         app.recompute_metrics();
         app
     }
 
-    /// Recompute font/cell metrics for the current font size and DPI scale.
     fn recompute_metrics(&mut self) {
         self.font_px = self.font_pts * PT_TO_PX * self.scale;
         let sf = self.font.as_scaled(PxScale::from(self.font_px));
         self.ascent = sf.ascent();
         self.cell_h = (sf.ascent() - sf.descent() + sf.line_gap()).ceil().max(1.0) as usize;
         self.cell_w = sf.h_advance(self.font.glyph_id('M')).ceil().max(1.0) as usize;
-        self.glyph_cache.clear(); // cached glyphs are size-specific
+        self.glyph_cache.clear();
     }
 
+    /// Height of the tab strip, in device px.
+    fn tab_bar_h(&self) -> usize {
+        self.cell_h + (8.0 * self.scale).round() as usize
+    }
+
+    /// Grid dimensions for the terminal area (below the tab bar).
     fn grid_dims(&self, w: u32, h: u32) -> (usize, usize) {
+        let avail_h = (h as usize).saturating_sub(self.tab_bar_h());
         let cols = (w as usize / self.cell_w).max(1);
-        let rows = (h as usize / self.cell_h).max(1);
+        let rows = (avail_h / self.cell_h).max(1);
         (cols, rows)
     }
 
-    /// Send bytes to the live session (no-op before the mux is up).
+    fn active_tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+    fn active_tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+    fn active_term(&self) -> Arc<Mutex<Terminal>> {
+        self.tabs[self.active].term.clone()
+    }
+
+    /// Send bytes to the active session.
     fn send(&self, bytes: &[u8]) {
-        if let Some(mux) = &self.mux {
-            if !bytes.is_empty() {
-                mux.send_data(self.session, bytes);
-            }
+        if bytes.is_empty() {
+            return;
+        }
+        if let (Some(mux), Some(tab)) = (&self.mux, self.tabs.get(self.active)) {
+            mux.send_data(tab.session, bytes);
         }
     }
 
-    fn handle_key(&mut self, ev: &KeyEvent) {
+    /// Open a new tab, inheriting the active tab's working directory.
+    fn add_tab(&mut self) {
+        let (cols, rows) = match &self.win {
+            Some(w) => {
+                let s = w.inner_size();
+                self.grid_dims(s.width, s.height)
+            }
+            None => (80, 24),
+        };
+        let cwd = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.term.lock().unwrap().current_directory().map(String::from))
+            .unwrap_or_default();
+        let term = Arc::new(Mutex::new(Terminal::new(cols, rows)));
+        let session = match &self.mux {
+            Some(mux) => mux.open(cols as u16, rows as u16, &cwd),
+            None => return,
+        };
+        self.registry.lock().unwrap().insert(session, term.clone());
+        self.tabs.push(Tab {
+            session,
+            term,
+            scroll_off: 0,
+            selecting: false,
+            sel_anchor: None,
+            sel: None,
+        });
+        self.active = self.tabs.len() - 1;
+        self.request_redraw();
+    }
+
+    /// Close the tab at `idx`. `exited` = the session already died (don't re-close
+    /// the PTY). Exits the app when the last tab closes.
+    fn close_tab_at(&mut self, idx: usize, exited: bool, event_loop: &ActiveEventLoop) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(idx);
+        self.registry.lock().unwrap().remove(&tab.session);
+        if !exited {
+            if let Some(mux) = &self.mux {
+                mux.close(tab.session);
+            }
+        }
+        if self.tabs.is_empty() {
+            event_loop.exit();
+            return;
+        }
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len() - 1;
+        }
+        self.request_redraw();
+    }
+
+    fn switch_tab(&mut self, delta: i32) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let n = self.tabs.len() as i32;
+        self.active = (self.active as i32 + delta).rem_euclid(n) as usize;
+        self.request_redraw();
+    }
+
+    fn handle_key(&mut self, ev: &KeyEvent, event_loop: &ActiveEventLoop) {
         if ev.state != ElementState::Pressed {
             return;
         }
         let ctrl = self.mods.control_key();
         let shift = self.mods.shift_key();
 
-        // Clipboard shortcuts (don't reach the shell): Ctrl+Shift+C/V, Shift+Ins.
         if let PhysicalKey::Code(code) = ev.physical_key {
             match code {
                 KeyCode::KeyC if ctrl && shift => {
@@ -206,7 +297,18 @@ impl App {
                     self.paste();
                     return;
                 }
-                // Ctrl +/-/0 zooms the font (Ctrl+0 resets to configured size).
+                KeyCode::KeyT if ctrl && shift => {
+                    self.add_tab();
+                    return;
+                }
+                KeyCode::KeyW if ctrl && shift => {
+                    self.close_tab_at(self.active, false, event_loop);
+                    return;
+                }
+                KeyCode::Tab if ctrl => {
+                    self.switch_tab(if shift { -1 } else { 1 });
+                    return;
+                }
                 KeyCode::Equal | KeyCode::NumpadAdd if ctrl => {
                     self.zoom_font(1.0);
                     return;
@@ -223,21 +325,14 @@ impl App {
             }
         }
 
-        // Typing snaps the view back to the live bottom.
-        if self.scroll_off != 0 {
-            self.scroll_off = 0;
-            if let Some(win) = &self.win {
-                win.request_redraw();
-            }
+        // Typing snaps the active view to the live bottom.
+        if self.active_tab().scroll_off != 0 {
+            self.active_tab_mut().scroll_off = 0;
+            self.request_redraw();
         }
-        let mods = Mods {
-            ctrl: self.mods.control_key(),
-            alt: self.mods.alt_key(),
-            shift: self.mods.shift_key(),
-        };
-        let app_cursor = self.term.lock().unwrap().app_cursor_keys();
+        let mods = Mods { ctrl, alt: self.mods.alt_key(), shift };
+        let app_cursor = self.active_term().lock().unwrap().app_cursor_keys();
 
-        // Function keys are most reliable off the physical key code.
         if let PhysicalKey::Code(code) = ev.physical_key {
             if let Some(n) = function_number(code) {
                 if let Some(b) = input::encode(Key::F(n), mods, app_cursor) {
@@ -248,54 +343,52 @@ impl App {
         }
 
         let key = map_key(&ev.logical_key);
-        let encoded = key.and_then(|k| input::encode(k, mods, app_cursor));
-        if let Some(bytes) = encoded {
+        if let Some(bytes) = key.and_then(|k| input::encode(k, mods, app_cursor)) {
             self.send(&bytes);
             return;
         }
-        // Plain printable input: send the layout-resolved text directly.
         if let Some(text) = &ev.text {
             self.send(text.as_bytes());
         }
     }
 
-    /// Map the last mouse position to an (absolute row, column) cell. Absolute
-    /// rows count from the oldest scrollback line, matching `Terminal::get_text`.
+    /// Map the mouse position to an (absolute row, column) cell in the active tab.
     fn cell_at_cursor(&self) -> (i64, i64) {
+        let bar = self.tab_bar_h() as f64;
         let col = (self.cursor_px.0 / self.cell_w as f64).floor() as i64;
-        let vrow = (self.cursor_px.1 / self.cell_h as f64).floor() as i64;
-        let t = self.term.lock().unwrap();
+        let vrow = ((self.cursor_px.1 - bar) / self.cell_h as f64).floor() as i64;
+        let t = self.active_term();
+        let t = t.lock().unwrap();
         let cols = t.cols() as i64;
-        let top_abs = t.scrollback_count() as i64 - self.scroll_off as i64;
+        let off = self.active_tab().scroll_off as i64;
+        let top_abs = t.scrollback_count() as i64 - off;
         let total = t.scrollback_count() as i64 + t.rows() as i64;
         let abs = (top_abs + vrow).clamp(0, (total - 1).max(0));
         (abs, col.clamp(0, (cols - 1).max(0)))
     }
 
     fn begin_selection(&mut self) {
-        let (r, c) = self.cell_at_cursor();
-        self.sel_anchor = Some((r, c));
-        self.sel = Some((r, c, r, c));
-        self.selecting = true;
+        let cell = self.cell_at_cursor();
+        let tab = self.active_tab_mut();
+        tab.sel_anchor = Some(cell);
+        tab.sel = Some((cell.0, cell.1, cell.0, cell.1));
+        tab.selecting = true;
         self.request_redraw();
     }
 
     fn update_selection(&mut self) {
-        if let Some((ar, ac)) = self.sel_anchor {
+        let anchor = self.active_tab().sel_anchor;
+        if let Some((ar, ac)) = anchor {
             let (r, c) = self.cell_at_cursor();
-            // Order anchor and current point in reading order.
-            self.sel = Some(if (r, c) < (ar, ac) {
-                (r, c, ar, ac)
-            } else {
-                (ar, ac, r, c)
-            });
+            let sel = if (r, c) < (ar, ac) { (r, c, ar, ac) } else { (ar, ac, r, c) };
+            self.active_tab_mut().sel = Some(sel);
             self.request_redraw();
         }
     }
 
     fn copy_selection(&self) {
-        if let Some((r1, c1, r2, c2)) = self.sel {
-            let text = self.term.lock().unwrap().get_text(r1, c1, r2, c2);
+        if let Some((r1, c1, r2, c2)) = self.active_tab().sel {
+            let text = self.active_term().lock().unwrap().get_text(r1, c1, r2, c2);
             if !text.is_empty() {
                 let _ = clipboard_win::set_clipboard_string(&text);
             }
@@ -308,7 +401,7 @@ impl App {
             Err(_) => return,
         };
         let s = s.replace("\r\n", "\r").replace('\n', "\r");
-        let bracketed = self.term.lock().unwrap().bracketed_paste();
+        let bracketed = self.active_term().lock().unwrap().bracketed_paste();
         let mut out = Vec::new();
         if bracketed {
             out.extend_from_slice(b"\x1b[200~");
@@ -340,19 +433,16 @@ impl App {
         self.request_redraw();
     }
 
-    /// Scroll the view by `lines` into scrollback (+ = up into history).
     fn scroll_by(&mut self, lines: i32) {
-        let max = self.term.lock().unwrap().scrollback_count() as i32;
-        let next = (self.scroll_off as i32 + lines).clamp(0, max) as usize;
-        if next != self.scroll_off {
-            self.scroll_off = next;
-            if let Some(win) = &self.win {
-                win.request_redraw();
-            }
+        let max = self.active_term().lock().unwrap().scrollback_count() as i32;
+        let cur = self.active_tab().scroll_off as i32;
+        let next = (cur + lines).clamp(0, max) as usize;
+        if next != self.active_tab().scroll_off {
+            self.active_tab_mut().scroll_off = next;
+            self.request_redraw();
         }
     }
 
-    /// Re-derive grid size from the window's current physical size.
     fn reflow(&mut self) {
         if let Some(win) = &self.win {
             let s = win.inner_size();
@@ -362,9 +452,11 @@ impl App {
 
     fn resize_surface(&mut self, w: u32, h: u32) {
         let (cols, rows) = self.grid_dims(w, h);
-        self.term.lock().unwrap().resize(cols, rows);
-        if let Some(mux) = &self.mux {
-            mux.send_resize(self.session, cols as u16, rows as u16);
+        for tab in &self.tabs {
+            tab.term.lock().unwrap().resize(cols, rows);
+            if let Some(mux) = &self.mux {
+                mux.send_resize(tab.session, cols as u16, rows as u16);
+            }
         }
         if let (Some(surface), Some(nw), Some(nh)) =
             (&mut self.surface, NonZeroU32::new(w), NonZeroU32::new(h))
@@ -373,61 +465,139 @@ impl App {
         }
     }
 
+    /// Index of the tab chip under device-x, if any.
+    fn chip_at(&self, x: f32) -> Option<usize> {
+        self.chip_ranges
+            .iter()
+            .position(|&(x0, x1)| x >= x0 && x < x1)
+    }
+
+    /// Handle a left-click in the tab bar: switch tab or open a new one.
+    fn tab_bar_click(&mut self) {
+        let x = self.cursor_px.0 as f32;
+        if x >= self.plus_range.0 && x < self.plus_range.1 {
+            self.add_tab();
+        } else if let Some(i) = self.chip_at(x) {
+            self.active = i;
+            self.request_redraw();
+        }
+    }
+
     fn render(&mut self) {
-        let (win, surface) = match (&self.win, &mut self.surface) {
-            (Some(w), Some(s)) => (w, s),
-            _ => return,
+        // Clone the Rc so we drop the borrow on self.win before touching surface
+        // and other fields (avoids &self-method-vs-&mut-surface borrow conflicts).
+        let win = match &self.win {
+            Some(w) => w.clone(),
+            None => return,
         };
         let size = win.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
+        let bar_h = self.tab_bar_h();
+        let (cw, ch_px) = (self.cell_w, self.cell_h);
+        let pad = (6.0 * self.scale).round().max(2.0) as usize;
+        let text_top = ((bar_h.saturating_sub(ch_px)) / 2) as i32;
 
+        // Tab titles (gathered before borrowing the surface).
+        let titles: Vec<String> = self
+            .tabs
+            .iter()
+            .map(|t| {
+                let g = t.term.lock().unwrap();
+                g.title()
+                    .map(str::to_string)
+                    .or_else(|| g.current_directory().map(basename))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "wsl".into())
+            })
+            .collect();
+
+        let surface = match &mut self.surface {
+            Some(s) => s,
+            None => return,
+        };
         let mut buffer = match surface.buffer_mut() {
             Ok(b) => b,
             Err(_) => return,
         };
-        buffer.fill(self.theme.bg);
+        let buf: &mut [u32] = &mut buffer;
+        for px in buf.iter_mut() {
+            *px = self.theme.bg;
+        }
 
-        // Snapshot the grid under the lock, then rasterize without holding it.
+        // --- tab bar -------------------------------------------------------
+        let chrome = mix(self.theme.bg, self.theme.fg, 0.10);
+        let chip_active = mix(self.theme.bg, self.theme.fg, 0.22);
+        fill_rect(buf, w, h, 0, 0, w as usize, bar_h, chrome);
+
+        self.chip_ranges.clear();
+        let active = self.active;
+        let mut x = pad;
+        for (i, title) in titles.iter().enumerate() {
+            let text: String = title.chars().take(18).collect();
+            let chip_w = (text.chars().count() * cw + pad * 2).clamp(40, 240);
+            let x0 = x;
+            let x1 = (x + chip_w).min(w as usize);
+            if i == active {
+                fill_rect(buf, w, h, x0, 2, x1 - x0, bar_h.saturating_sub(4), chip_active);
+            }
+            let fg = if i == active {
+                self.theme.fg
+            } else {
+                mix(self.theme.bg, self.theme.fg, 0.55)
+            };
+            let mut gx = x0 + pad;
+            for ch in text.chars() {
+                ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
+                blit_char(buf, w, h, &self.glyph_cache, ch, gx, text_top, fg);
+                gx += cw;
+            }
+            self.chip_ranges.push((x0 as f32, x1 as f32));
+            x = x1 + (2.0 * self.scale) as usize;
+        }
+        // '+' new-tab button
+        let px0 = x;
+        let px1 = (x + cw + pad * 2).min(w as usize);
+        ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, '+');
+        blit_char(buf, w, h, &self.glyph_cache, '+', px0 + pad, text_top,
+            mix(self.theme.bg, self.theme.fg, 0.7));
+        self.plus_range = (px0 as f32, px1 as f32);
+
+        // --- terminal area -------------------------------------------------
         let (cols, rows, cx, cy, cursor_on, top_abs);
+        let sel;
         {
-            let t = self.term.lock().unwrap();
-            let off = self.scroll_off.min(t.scrollback_count());
-            t.capture_viewport(off, &mut self.grid);
+            let tab = &self.tabs[self.active];
+            let t = tab.term.lock().unwrap();
+            let scroll = tab.scroll_off.min(t.scrollback_count());
+            t.capture_viewport(scroll, &mut self.grid);
             cols = t.cols();
             rows = t.rows();
             cx = t.cx();
             cy = t.cy();
-            // Cursor only shows in the live view (not while scrolled into history).
-            cursor_on = t.cursor_visible() && off == 0;
-            // Absolute row of the top visible line, for selection hit-testing.
-            top_abs = t.scrollback_count() as i64 - off as i64;
+            cursor_on = t.cursor_visible() && scroll == 0;
+            top_abs = t.scrollback_count() as i64 - scroll as i64;
+            sel = tab.sel;
         }
-        let sel = self.sel;
 
-        // Pass 1: make sure every visible glyph is rasterized into the cache.
-        // (Direct field access keeps `font`/`glyph_cache` as disjoint borrows.)
+        // Pass 1: ensure glyphs cached.
         for r in 0..rows.min(self.grid.len()) {
             for c in 0..cols.min(self.grid[r].len()) {
                 let rune = self.grid[r][c].rune;
-                if rune < 0x20 {
-                    continue;
-                }
-                let ch = char::from_u32(rune).unwrap_or(' ');
-                if ch != ' ' && !self.glyph_cache.contains_key(&ch) {
-                    let g = rasterize_glyph(&self.font, self.font_px, ch);
-                    self.glyph_cache.insert(ch, g);
+                if rune >= 0x20 {
+                    if let Some(ch) = char::from_u32(rune) {
+                        ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
+                    }
                 }
             }
         }
 
-        // Pass 2: fill backgrounds and blit cached glyph coverage.
-        let (cw, ch_px) = (self.cell_w, self.cell_h);
+        // Pass 2: fill backgrounds + blit glyphs.
         for r in 0..rows.min(self.grid.len()) {
             let row = &self.grid[r];
             for c in 0..cols.min(row.len()) {
                 let cell = &row[c];
                 if cell.width == 0 {
-                    continue; // trailing slot of a wide glyph
+                    continue;
                 }
                 let is_cursor = cursor_on && r == cy && c == cx;
                 let reverse = cell.flags.contains(CellFlags::REVERSE) ^ is_cursor;
@@ -445,41 +615,20 @@ impl App {
                 }
                 if let Some((r1, c1, r2, c2)) = sel {
                     let (ar, ac) = (top_abs + r as i64, c as i64);
-                    let after_start = ar > r1 || (ar == r1 && ac >= c1);
-                    let before_end = ar < r2 || (ar == r2 && ac <= c2);
-                    if after_start && before_end {
+                    let after = ar > r1 || (ar == r1 && ac >= c1);
+                    let before = ar < r2 || (ar == r2 && ac <= c2);
+                    if after && before {
                         bg = self.theme.selection;
                     }
                 }
 
                 let x0 = c * cw;
-                let y0 = r * ch_px;
-                fill_rect(&mut buffer, w, h, x0, y0, cw, ch_px, bg);
+                let y0 = bar_h + r * ch_px;
+                fill_rect(buf, w, h, x0, y0, cw, ch_px, bg);
 
-                if cell.rune < 0x20 {
-                    continue;
-                }
-                let glyph_ch = char::from_u32(cell.rune).unwrap_or(' ');
-                if let Some(Some(g)) = self.glyph_cache.get(&glyph_ch) {
-                    for gy in 0..g.h {
-                        let py = y0 as i32 + g.top + gy as i32;
-                        if py < 0 || py as u32 >= h {
-                            continue;
-                        }
-                        let base = py as usize * w as usize;
-                        let row_cov = &g.cov[gy * g.w..gy * g.w + g.w];
-                        for gx in 0..g.w {
-                            let cov = row_cov[gx];
-                            if cov == 0 {
-                                continue;
-                            }
-                            let px = x0 as i32 + g.left + gx as i32;
-                            if px < 0 || px as u32 >= w {
-                                continue;
-                            }
-                            let idx = base + px as usize;
-                            buffer[idx] = blend(buffer[idx], fg, cov as f32 / 255.0);
-                        }
+                if cell.rune >= 0x20 {
+                    if let Some(ch) = char::from_u32(cell.rune) {
+                        blit_char(buf, w, h, &self.glyph_cache, ch, x0, y0 as i32, fg);
                     }
                 }
             }
@@ -492,7 +641,7 @@ impl App {
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.win.is_some() {
-            return; // already initialized
+            return;
         }
         let attrs = Window::default_attributes()
             .with_title("WSL Terminal (Rust)")
@@ -510,22 +659,32 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         let (cols, rows) = self.grid_dims(size.width, size.height);
-        self.term = Arc::new(Mutex::new(Terminal::new(cols, rows)));
 
-        // Bring up the live WSL session.
+        // Bring up the live WSL server.
         let server = bootstrap::resolve_server()
             .expect("wslptyd not found (build native/ and place under artifacts/)");
         let command = bootstrap::build_server_command(&server);
         let proc = WslProcess::launch(DISTRO, &command).expect("launch wslg.exe");
         let (mux, rx) = WslMux::start(proc);
-        self.session = mux.open(cols as u16, rows as u16, "");
-        let session = self.session;
-        self.mux = Some(mux);
-        eprintln!("[wslterm] window up {cols}x{rows}, session {session} opened on {DISTRO}");
 
-        // Feed thread: parse bytes into the shared Terminal off the UI thread and
-        // wake the loop to render. Bounded mux channel back-pressures the reader.
-        let term = self.term.clone();
+        // First tab.
+        let term = Arc::new(Mutex::new(Terminal::new(cols, rows)));
+        let session = mux.open(cols as u16, rows as u16, "");
+        self.registry.lock().unwrap().insert(session, term.clone());
+        self.tabs.push(Tab {
+            session,
+            term,
+            scroll_off: 0,
+            selecting: false,
+            sel_anchor: None,
+            sel: None,
+        });
+        self.active = 0;
+        self.mux = Some(mux);
+        eprintln!("[wslterm] window up {cols}x{rows}, first session {session} on {DISTRO}");
+
+        // Feed thread: route frames to the right session's terminal by id.
+        let registry = self.registry.clone();
         let outbox = self.outbox.clone();
         let pending = self.redraw_pending.clone();
         let proxy = self.proxy.clone();
@@ -534,39 +693,30 @@ impl ApplicationHandler<UserEvent> for App {
             .spawn(move || {
                 let mut acc: u64 = 0;
                 let mut mark = Instant::now();
-                let mut resp_batch: Vec<u8> = Vec::new();
-                // Block for the next frame, then drain ALL queued frames under one
-                // lock before waking the UI. Batching amortizes lock + wake cost
-                // (the per-frame churn that was capping feed throughput) and lets
-                // the parser run near full speed under a flood.
                 while let Ok(first) = rx.recv() {
-                    let mut ev = first;
-                    let mut t = term.lock().unwrap();
-                    loop {
-                        match ev {
-                            MuxEvent::Data { id, bytes } if id == session => {
+                    let mut ev = Some(first);
+                    let mut resp: Vec<(u32, Vec<u8>)> = Vec::new();
+                    while let Some(e) = ev.take() {
+                        match e {
+                            MuxEvent::Data { id, bytes } => {
                                 acc += bytes.len() as u64;
-                                t.feed(&bytes);
-                                if !t.respond.is_empty() {
-                                    resp_batch.append(&mut t.respond);
+                                let term = registry.lock().unwrap().get(&id).cloned();
+                                if let Some(term) = term {
+                                    let mut t = term.lock().unwrap();
+                                    t.feed(&bytes);
+                                    if !t.respond.is_empty() {
+                                        resp.push((id, std::mem::take(&mut t.respond)));
+                                    }
                                 }
                             }
-                            MuxEvent::Exit { id, .. } if id == session => {
-                                drop(t);
-                                let _ = proxy.send_event(UserEvent::Closed);
-                                return;
+                            MuxEvent::Exit { id, .. } => {
+                                let _ = proxy.send_event(UserEvent::SessionExit(id));
                             }
-                            _ => {}
                         }
-                        match rx.try_recv() {
-                            Ok(next) => ev = next,
-                            Err(_) => break, // nothing more queued right now
-                        }
+                        ev = rx.try_recv().ok();
                     }
-                    drop(t);
-
-                    if !resp_batch.is_empty() {
-                        outbox.lock().unwrap().append(&mut resp_batch);
+                    if !resp.is_empty() {
+                        outbox.lock().unwrap().extend(resp);
                     }
                     let dt = mark.elapsed().as_secs_f64();
                     if dt >= 1.0 {
@@ -576,7 +726,6 @@ impl ApplicationHandler<UserEvent> for App {
                         acc = 0;
                         mark = Instant::now();
                     }
-                    // Coalesce: only wake if no redraw is already queued.
                     if !pending.swap(true, Ordering::AcqRel)
                         && proxy.send_event(UserEvent::Redraw).is_err()
                     {
@@ -596,19 +745,29 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Redraw => {
                 self.redraw_pending.store(false, Ordering::Release);
-                self.scroll_off = 0; // new output snaps to the live bottom
-                if !self.selecting {
-                    self.sel = None; // absolute coords shift as content scrolls
+                // New output snaps the active tab to the bottom (unless dragging).
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.scroll_off = 0;
+                    if !tab.selecting {
+                        tab.sel = None;
+                    }
                 }
-                // Flush any DSR/DA responses the feed thread produced.
+                // Flush DSR/DA responses to their sessions.
                 let out = std::mem::take(&mut *self.outbox.lock().unwrap());
-                self.send(&out);
-                if let Some(win) = &self.win {
-                    win.request_redraw();
+                if let Some(mux) = &self.mux {
+                    for (id, bytes) in out {
+                        mux.send_data(id, &bytes);
+                    }
+                }
+                self.request_redraw();
+            }
+            UserEvent::SessionExit(id) => {
+                if let Some(idx) = self.tabs.iter().position(|t| t.session == id) {
+                    self.close_tab_at(idx, true, event_loop);
                 }
             }
             UserEvent::Closed => {
-                eprintln!("[wslterm] session ended");
+                eprintln!("[wslterm] mux ended");
                 event_loop.exit();
             }
         }
@@ -618,14 +777,13 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
-            WindowEvent::KeyboardInput { event, .. } => self.handle_key(&event),
+            WindowEvent::KeyboardInput { event, .. } => self.handle_key(&event, event_loop),
             WindowEvent::MouseWheel { delta, .. } => {
                 let y = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
                     MouseScrollDelta::PixelDelta(p) => p.y / self.cell_h as f64,
                 };
                 if self.mods.control_key() {
-                    // Ctrl+wheel zooms the font.
                     self.zoom_font(if y > 0.0 { 1.0 } else { -1.0 });
                 } else {
                     self.scroll_by((y.round() as i32) * 3);
@@ -633,29 +791,41 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_px = (position.x, position.y);
-                if self.selecting {
+                if self.active_tab().selecting {
                     self.update_selection();
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
-                (MouseButton::Left, ElementState::Pressed) => self.begin_selection(),
-                (MouseButton::Left, ElementState::Released) => self.selecting = false,
-                (MouseButton::Middle, ElementState::Pressed) => self.paste(),
+                (MouseButton::Left, ElementState::Pressed) => {
+                    if self.cursor_px.1 < self.tab_bar_h() as f64 {
+                        self.tab_bar_click();
+                    } else {
+                        self.begin_selection();
+                    }
+                }
+                (MouseButton::Left, ElementState::Released) => {
+                    self.active_tab_mut().selecting = false;
+                }
+                (MouseButton::Middle, ElementState::Pressed) => {
+                    if self.cursor_px.1 < self.tab_bar_h() as f64 {
+                        if let Some(idx) = self.chip_at(self.cursor_px.0 as f32) {
+                            self.close_tab_at(idx, false, event_loop);
+                        }
+                    } else {
+                        self.paste(); // X11-style middle-click paste in the terminal
+                    }
+                }
                 _ => {}
             },
             WindowEvent::Resized(size) => {
                 self.resize_surface(size.width, size.height);
-                if let Some(win) = &self.win {
-                    win.request_redraw();
-                }
+                self.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor as f32;
                 self.recompute_metrics();
                 self.reflow();
-                if let Some(win) = &self.win {
-                    win.request_redraw();
-                }
+                self.request_redraw();
             }
             WindowEvent::RedrawRequested => self.render(),
             _ => {}
@@ -672,21 +842,82 @@ fn main() {
     event_loop.run_app(&mut app).expect("run app");
 }
 
-/// Optional `$WSLTERM_OPACITY` override (0.0..1.0 or 0..100); `None` if unset, so
-/// the settings.json value is used. Clamped to a usable 0.4..1.0.
+/// Last path component of a (WSL) path, for tab titles.
+fn basename(path: &str) -> String {
+    let p = path.trim_end_matches('/');
+    match p.rsplit('/').next() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => "/".to_string(),
+    }
+}
+
+/// Linear blend between two 0RGB colors by `t` (0 = a, 1 = b).
+fn mix(a: u32, b: u32, t: f32) -> u32 {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |sh: u32| {
+        let av = ((a >> sh) & 0xff) as f32;
+        let bv = ((b >> sh) & 0xff) as f32;
+        (av + (bv - av) * t) as u32
+    };
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+/// Rasterize `ch` into the cache if not already present (free fn so it borrows
+/// only `font`/`cache`, not all of `self`, while the surface buffer is alive).
+fn ensure_glyph(font: &FontVec, cache: &mut HashMap<char, Option<Glyph>>, px: f32, ch: char) {
+    if ch != ' ' && !ch.is_control() && !cache.contains_key(&ch) {
+        cache.insert(ch, rasterize_glyph(font, px, ch));
+    }
+}
+
+/// Blit a cached glyph with its top-left cell at (x, cell_top) in color `fg`.
+/// `g.left`/`g.top` are the glyph box offsets from the cell origin (the glyph was
+/// rasterized with the pen at y = ascent), so pixel pos = cell origin + offset.
+fn blit_char(
+    buf: &mut [u32],
+    w: u32,
+    h: u32,
+    cache: &HashMap<char, Option<Glyph>>,
+    ch: char,
+    x: usize,
+    cell_top: i32,
+    fg: u32,
+) {
+    let g = match cache.get(&ch) {
+        Some(Some(g)) => g,
+        _ => return,
+    };
+    for gy in 0..g.h {
+        let py = cell_top + g.top + gy as i32;
+        if py < 0 || py as u32 >= h {
+            continue;
+        }
+        let base = py as usize * w as usize;
+        let cov_row = &g.cov[gy * g.w..gy * g.w + g.w];
+        for gx in 0..g.w {
+            let cov = cov_row[gx];
+            if cov == 0 {
+                continue;
+            }
+            let px = x as i32 + g.left + gx as i32;
+            if px < 0 || px as u32 >= w {
+                continue;
+            }
+            let idx = base + px as usize;
+            if idx < buf.len() {
+                buf[idx] = blend(buf[idx], fg, cov as f32 / 255.0);
+            }
+        }
+    }
+}
+
+/// Optional `$WSLTERM_OPACITY` override (0.0..1.0 or 0..100); `None` if unset.
 fn parse_opacity_env() -> Option<f32> {
-    let v = std::env::var("WSLTERM_OPACITY")
-        .ok()?
-        .trim()
-        .parse::<f32>()
-        .ok()?;
+    let v = std::env::var("WSLTERM_OPACITY").ok()?.trim().parse::<f32>().ok()?;
     let v = if v > 1.0 { v / 100.0 } else { v };
     Some(v.clamp(0.4, 1.0))
 }
 
-/// Apply uniform window translucency via a layered window. The OS composites our
-/// painted content at `opacity`, so text and background fade together — the
-/// common terminal "transparency" behavior; keeps the normal title bar/resize.
 #[cfg(windows)]
 fn set_window_opacity(window: &Window, opacity: f32) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -714,9 +945,6 @@ fn set_window_opacity(window: &Window, opacity: f32) {
 #[cfg(not(windows))]
 fn set_window_opacity(_window: &Window, _opacity: f32) {}
 
-/// Load a monospace font, preferring the configured family, then falling back to
-/// Consolas / Cascadia / Lucida Console. (A full family->file lookup would need
-/// DirectWrite; this covers the common monospace fonts by filename.)
 fn load_monospace_font(family: &str) -> Option<FontVec> {
     let fam = family.to_ascii_lowercase();
     let mut candidates: Vec<&str> = Vec::new();
@@ -727,7 +955,6 @@ fn load_monospace_font(family: &str) -> Option<FontVec> {
     if fam.contains("consol") {
         candidates.push(r"C:\Windows\Fonts\consola.ttf");
     }
-    // Always-available fallbacks.
     candidates.extend_from_slice(&[
         r"C:\Windows\Fonts\consola.ttf",
         r"C:\Windows\Fonts\CascadiaMono.ttf",
@@ -787,7 +1014,6 @@ fn function_number(code: KeyCode) -> Option<u8> {
     })
 }
 
-/// Fill a clipped rectangle in the 0RGB pixel buffer.
 fn fill_rect(buf: &mut [u32], w: u32, h: u32, x: usize, y: usize, rw: usize, rh: usize, rgb: u32) {
     let x1 = (x + rw).min(w as usize);
     let y1 = (y + rh).min(h as usize);
@@ -799,7 +1025,6 @@ fn fill_rect(buf: &mut [u32], w: u32, h: u32, x: usize, y: usize, rw: usize, rh:
     }
 }
 
-/// Alpha-blend `fg` over `dst` by coverage (0..1). Both are 0RGB.
 fn blend(dst: u32, fg: u32, cov: f32) -> u32 {
     let cov = cov.clamp(0.0, 1.0);
     let inv = 1.0 - cov;
