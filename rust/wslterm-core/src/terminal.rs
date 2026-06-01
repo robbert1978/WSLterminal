@@ -66,6 +66,9 @@ impl Terminal {
     pub fn app_cursor_keys(&self) -> bool {
         self.screen.app_cursor_keys
     }
+    pub fn cursor_visible(&self) -> bool {
+        self.screen.cursor_visible
+    }
     pub fn bracketed_paste(&self) -> bool {
         self.screen.bracketed_paste
     }

@@ -5,6 +5,7 @@ resolver = "2"
 members = [
     "wslterm-core",
     "wslterm-pty",
+    "wslterm",
 ]
 
 [workspace.package]

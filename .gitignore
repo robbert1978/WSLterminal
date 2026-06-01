@@ -17,3 +17,6 @@ artifacts/wslptyd
 
 # Rust rewrite build output
 rust/target/
+
+# GUI milestone screenshots
+rust/*.png

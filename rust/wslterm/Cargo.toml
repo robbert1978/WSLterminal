@@ -1,0 +1,20 @@
+[package]
+name = "wslterm"
+description = "WSL Terminal GUI (Rust rewrite) — milestone 1: render grid + type into a live WSL session."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+default-run = "wslterm"
+
+[dependencies]
+wslterm-core = { path = "../wslterm-core" }
+wslterm-pty = { path = "../wslterm-pty" }
+
+# CPU-rendered window: keeps RAM low and avoids the wgpu/D3D managed stack.
+winit = "0.30"
+softbuffer = "0.4"
+ab_glyph = "0.2"
+
+[[bin]]
+name = "wslterm"
+path = "src/main.rs"

@@ -24,8 +24,8 @@ parity. The win is RAM, GC-free latency, and a smaller binary — not raw speed.
 | concern            | C#/WPF today                 | Rust plan |
 |--------------------|------------------------------|-----------|
 | window / input     | WPF Window                   | `winit` |
-| GPU surface        | WPF visual tree              | `wgpu` |
-| text + atlas       | WPF GlyphRun                 | `swash` (shaping) + glyph atlas on wgpu |
+| surface            | WPF visual tree              | `softbuffer` CPU buffer (chosen over `wgpu` — see below) |
+| text               | WPF GlyphRun                 | `ab_glyph` rasterization now; `swash` shaping later |
 | color emoji        | Direct2D/DirectWrite         | COLR/CBDT via `swash`, or DirectWrite over `windows` crate |
 | translucency       | AllowsTransparency (layered) | layered window via `windows` crate |
 | launch wslg.exe    | CreateProcess + pipes        | `std::process` + `windows` pipes |
@@ -48,12 +48,28 @@ parity. The win is RAM, GC-free latency, and a smaller binary — not raw speed.
 - [x] `wslterm-core`: VT parser + screen + scrollback + SGR/color + charwidth
       (27 tests, incl. all 21 ported `--vttest` cases and the v1.0.2 SGR/`>4m`
       regression tests)
-- [ ] `wslterm-core`: input encoder (port InputEncoder.cs)
+- [x] `wslterm-core`: input encoder (port InputEncoder.cs) — 8 tests
 - [x] `wslterm-pty`: wslptyd protocol + bootstrap + wslg launch + mux reader
       (7 tests over in-memory transports; live wslg spawn is a thin std::process
       wrapper, not covered by unit tests)
-- [ ] `wslterm`: renderer, window, tabs/panes  ← in progress (step 3)
-- [ ] sidebar / editor / highlighting
+- [x] `wslterm`: **GUI milestone 1** — winit + softbuffer + ab_glyph window that
+      renders the core grid (SGR color, wide glyphs, block cursor) fed by a live
+      `wslterm-pty` WSL session; keystrokes encoded via `core::input`. Verified on
+      Windows: live zsh prompt renders, ~19 MB RSS (vs ~150 MB on WPF).
+- [ ] `wslterm`: milestone 2 — scrollback view, faster repaint, full keymap
+- [ ] `wslterm`: milestone 3 — font fallback + color emoji
+- [ ] `wslterm`: milestone 4 — translucency, tabs, panes
+- [ ] sidebar / editor / highlighting (syntect)
+
+### CPU vs GPU rendering
+
+Milestone 1 renders on the CPU (`softbuffer` pixel buffer + `ab_glyph`
+rasterization) rather than `wgpu`. This keeps RAM at terminal-appropriate levels
+(the wgpu/D3D device + swapchain alone cost tens of MB — defeating the rewrite's
+purpose) and removes a large class of init/driver failure. A full-grid repaint of
+an 80×25 cell window is well under a millisecond; the throughput bottleneck is the
+shared WSL transport, as predicted. We revisit GPU only if a real workload needs
+it.
 
 ## Build
 

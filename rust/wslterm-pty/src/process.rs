@@ -43,21 +43,25 @@ impl WslProcess {
     /// already-built shell snippet (see `bootstrap::build_server_command`).
     pub fn launch(distribution: &str, command: &str) -> io::Result<WslProcess> {
         let launcher = resolve_launcher();
-        // wsl/wslg take: `~ --distribution <name> <argv...>`. We pass the shell
-        // snippet as a single trailing arg; wslg runs it via the login shell.
         let mut cmd = Command::new(&launcher);
-        cmd.arg("~")
-            .arg("--distribution")
-            .arg(distribution)
-            .arg(command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        build_tail(&mut cmd, distribution, command);
         no_window(&mut cmd);
 
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().ok_or_else(|| io::Error::other("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| io::Error::other("no stdout"))?;
+        // Drain the launcher's stderr to ours so WSL-side errors are visible
+        // (the C# app surfaced these in a console; here we just forward them).
+        if let Some(mut err) = child.stderr.take() {
+            std::thread::Builder::new()
+                .name("wsl-stderr".into())
+                .spawn(move || {
+                    let mut sink = io::stderr();
+                    let _ = io::copy(&mut err, &mut sink);
+                })
+                .ok();
+        }
         Ok(WslProcess { child, stdin: Some(stdin), stdout: Some(stdout) })
     }
 
@@ -72,6 +76,26 @@ impl WslProcess {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
     }
+}
+
+/// Build `~ --distribution <name> <command>` as the launcher's argument tail.
+///
+/// wsl/wslg parse their tail raw and run it through the login shell, so the
+/// shell snippet must reach them VERBATIM. On Windows we use `raw_arg` to append
+/// it without std's usual quoting — otherwise the whole `d=...; rm -f...` snippet
+/// would be wrapped in one quoted argv element and the login shell (zsh) would
+/// try to `exec` it as a single program name. This mirrors the C# `CreateProcess`
+/// path, which appends the command unquoted. The distro name is also unquoted
+/// (quotes would yield WSL_E_DISTRO_NOT_FOUND).
+#[cfg(windows)]
+fn build_tail(cmd: &mut Command, distribution: &str, command: &str) {
+    use std::os::windows::process::CommandExt;
+    cmd.raw_arg(format!("~ --distribution {distribution} {command}"));
+}
+
+#[cfg(not(windows))]
+fn build_tail(cmd: &mut Command, distribution: &str, command: &str) {
+    cmd.arg("~").arg("--distribution").arg(distribution).arg(command);
 }
 
 #[cfg(windows)]
