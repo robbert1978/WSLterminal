@@ -15,21 +15,24 @@ bitflags_lite! {
 }
 
 /// A single grid cell. `rune == 0` renders blank. `width`: 1 normal, 2 lead of a
-/// wide glyph, 0 the trailing continuation slot. `combo` holds combining marks
-/// appended to the base rune (e.g. a kaomoji overlay), `None` for the common case.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+/// wide glyph, 0 the trailing continuation slot. `combo` is an id into the
+/// `Screen`'s combining-mark pool (0 = none); combining marks are rare and the
+/// renderer ignores them, so keeping them out of the cell lets `Cell` be `Copy`
+/// — which makes scroll/clear/snapshot value-fills (a `memcpy`) instead of
+/// per-cell clone+drop, matching the C# blittable-struct grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Cell {
     pub rune: u32,
     pub fg: i32,
     pub bg: i32,
     pub flags: CellFlags,
     pub width: u8,
-    pub combo: Option<String>,
+    pub combo: u32,
 }
 
 impl Cell {
     pub fn blank(fg: i32, bg: i32, flags: CellFlags) -> Self {
-        Cell { rune: 0, fg, bg, flags, width: 1, combo: None }
+        Cell { rune: 0, fg, bg, flags, width: 1, combo: 0 }
     }
 }
 
@@ -55,6 +58,6 @@ mod tests {
         let c = Cell::blank(-1, -1, CellFlags::default());
         assert_eq!(c.rune, 0);
         assert_eq!(c.width, 1);
-        assert!(c.combo.is_none());
+        assert_eq!(c.combo, 0);
     }
 }

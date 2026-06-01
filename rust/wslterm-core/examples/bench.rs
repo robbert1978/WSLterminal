@@ -20,6 +20,14 @@ fn bench(name: &str, data: &[u8], iters: usize) {
 }
 
 fn main() {
+    // ManyLine: many short lines, each ending in \n -> a scroll per line. This is
+    // the scroll/clear-heavy path that termbench's ManyLine stresses.
+    let mut manyline = Vec::new();
+    for i in 0..200000u32 {
+        manyline.extend_from_slice(format!("line {i} of the manyline benchmark\n").as_bytes());
+    }
+    bench("ManyLine", &manyline, 8);
+
     // LongLine: plain ascii, lots of wrapping/scrolling.
     let mut longline = Vec::new();
     for _ in 0..20000 {

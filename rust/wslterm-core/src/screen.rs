@@ -89,6 +89,10 @@ pub struct Screen {
     saved: Saved,
     tabs: Vec<bool>,
     scrollback: Scrollback,
+    /// Combining-mark strings; a cell's `combo` is a 1-based index here (0 = none).
+    /// Kept off the cell so `Cell` stays `Copy`. Grows only when combining marks
+    /// appear (rare); bounded so an adversarial stream can't grow it without end.
+    combo_pool: Vec<String>,
 
     last_base_x: isize,
     last_base_y: isize,
@@ -124,6 +128,7 @@ impl Screen {
             saved: Saved { cx: 0, cy: 0, fg: color::DEFAULT, bg: color::DEFAULT, fl: CellFlags::default(), origin: false },
             tabs: Vec::new(),
             scrollback: Scrollback::new(5000),
+            combo_pool: Vec::new(),
             last_base_x: -1,
             last_base_y: -1,
             auto_wrap: true,
@@ -158,7 +163,7 @@ impl Screen {
     }
 
     fn blank_cell(&self) -> Cell {
-        Cell { rune: 0, fg: color::DEFAULT, bg: self.bg, flags: CellFlags::default(), width: 1, combo: None }
+        Cell { rune: 0, fg: color::DEFAULT, bg: self.bg, flags: CellFlags::default(), width: 1, combo: 0 }
     }
     fn blank_line(&self) -> Vec<Cell> {
         vec![self.blank_cell(); self.cols]
@@ -177,7 +182,7 @@ impl Screen {
                     if r < old.len() && c < old_cols {
                         line.push(old[r][c].clone());
                     } else {
-                        line.push(Cell { rune: 0, fg: color::DEFAULT, bg: color::DEFAULT, flags: CellFlags::default(), width: 1, combo: None });
+                        line.push(Cell { rune: 0, fg: color::DEFAULT, bg: color::DEFAULT, flags: CellFlags::default(), width: 1, combo: 0 });
                     }
                 }
                 nb.push(line);
@@ -206,10 +211,20 @@ impl Screen {
             if self.last_base_x >= 0 && self.last_base_y >= 0 {
                 let (bx, by) = (self.last_base_x as usize, self.last_base_y as usize);
                 if by < self.rows && bx < self.cols {
-                    let base = &mut self.buf_mut()[by][bx];
-                    if base.rune != 0 && base.combo.as_ref().map_or(0, |s| s.chars().count()) < 16 {
+                    let base = self.buf()[by][bx]; // Cell is Copy
+                    if base.rune != 0 {
                         if let Some(ch) = char::from_u32(cp) {
-                            base.combo.get_or_insert_with(String::new).push(ch);
+                            if base.combo == 0 {
+                                if self.combo_pool.len() < 1_000_000 {
+                                    self.combo_pool.push(ch.to_string());
+                                    let id = self.combo_pool.len() as u32; // 1-based
+                                    self.buf_mut()[by][bx].combo = id;
+                                }
+                            } else if let Some(s) = self.combo_pool.get_mut((base.combo - 1) as usize) {
+                                if s.chars().count() < 16 {
+                                    s.push(ch);
+                                }
+                            }
                         }
                     }
                 }
@@ -240,9 +255,9 @@ impl Screen {
                 c -= 1;
             }
         }
-        row[cx] = Cell { rune: cp, fg, bg, flags, width: w, combo: None };
+        row[cx] = Cell { rune: cp, fg, bg, flags, width: w, combo: 0 };
         if w == 2 && cx + 1 < cols {
-            row[cx + 1] = Cell { rune: 0, fg, bg, flags, width: 0, combo: None };
+            row[cx + 1] = Cell { rune: 0, fg, bg, flags, width: 0, combo: 0 };
         }
 
         self.last_base_x = cx as isize;
@@ -337,13 +352,11 @@ impl Screen {
     }
 
     fn clear_line(&self, mut line: Vec<Cell>) -> Vec<Cell> {
+        let blank = self.blank_cell();
         if line.len() != self.cols {
-            line = vec![self.blank_cell(); self.cols];
+            line = vec![blank; self.cols];
         } else {
-            let blank = self.blank_cell();
-            for c in line.iter_mut() {
-                *c = blank.clone();
-            }
+            line.fill(blank); // Cell is Copy: a fast value-fill, no per-cell drop
         }
         line
     }
@@ -575,6 +588,7 @@ impl Screen {
         }
         self.erase_in_display(2);
         self.scrollback.clear();
+        self.combo_pool.clear(); // no live cell references a combo after a reset
     }
 
     // ---- alternate screen --------------------------------------------------
@@ -731,8 +745,10 @@ impl Screen {
                     } else if let Some(ch) = char::from_u32(cell.rune) {
                         row.push(ch);
                     }
-                    if let Some(combo) = &cell.combo {
-                        row.push_str(combo);
+                    if cell.combo != 0 {
+                        if let Some(s) = self.combo_pool.get((cell.combo - 1) as usize) {
+                            row.push_str(s);
+                        }
                     }
                     c += 1;
                 }
