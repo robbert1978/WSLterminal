@@ -23,7 +23,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WKey, KeyCode, ModifiersState, NamedKey, PhysicalKey};
-use winit::window::{Icon, ResizeDirection, Window, WindowId};
+use winit::window::{CursorIcon, Icon, ResizeDirection, Window, WindowId};
 
 use wslterm_core::input::{self, Key, Mods};
 use wslterm_core::{Cell, CellFlags, Terminal};
@@ -1332,6 +1332,23 @@ impl App {
         }
     }
 
+    /// Show a resize cursor when hovering a window edge (borderless feedback).
+    fn update_resize_cursor(&self) {
+        let win = match &self.win {
+            Some(w) => w,
+            None => return,
+        };
+        let s = win.inner_size();
+        let icon = match resize_dir_at(self.cursor_px.0, self.cursor_px.1, s.width, s.height, self.scale) {
+            Some(ResizeDirection::North | ResizeDirection::South) => CursorIcon::NsResize,
+            Some(ResizeDirection::East | ResizeDirection::West) => CursorIcon::EwResize,
+            Some(ResizeDirection::NorthEast | ResizeDirection::SouthWest) => CursorIcon::NeswResize,
+            Some(ResizeDirection::NorthWest | ResizeDirection::SouthEast) => CursorIcon::NwseResize,
+            None => CursorIcon::Default,
+        };
+        win.set_cursor(icon);
+    }
+
     /// Resize the surface and every pane's PTY to match its rect.
     fn resize_surface(&mut self, w: u32, h: u32) {
         let area = self.terminal_area(w, h);
@@ -1473,13 +1490,17 @@ impl App {
         }
 
         let mut x = bar_h + pad; // tab chips start right of the sidebar button
+        let chips_right = (w as usize).saturating_sub(bar_h * 4); // leave room for win controls + '+'
         for (label, target, active) in &chips {
+            if x >= chips_right {
+                break; // no room for more chips (narrow window)
+            }
             let text: String = label.chars().take(18).collect();
             let chip_w = (text.chars().count() * cw + pad * 2).clamp(40, 240);
             let x0 = x;
-            let x1 = (x + chip_w).min(w as usize);
+            let x1 = (x + chip_w).min(chips_right);
             if *active {
-                fill_rect(buf, w, h, x0, 2, x1 - x0, bar_h.saturating_sub(4), chip_active);
+                fill_rect(buf, w, h, x0, 2, x1.saturating_sub(x0), bar_h.saturating_sub(4), chip_active);
             }
             let fg = if *active {
                 self.theme.fg
@@ -1955,7 +1976,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_px = (position.x, position.y);
-                if self.tabs.get(self.active_term).is_some() && self.focused().selecting {
+                self.update_resize_cursor();
+                if self.active_doc.is_none()
+                    && self.tabs.get(self.active_term).is_some()
+                    && self.focused().selecting
+                {
                     self.update_selection();
                 }
             }
@@ -2064,6 +2089,7 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() {
+    install_panic_log();
     let start_dir = parse_cd_arg();
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
@@ -2071,6 +2097,28 @@ fn main() {
     let proxy = event_loop.create_proxy();
     let mut app = App::new(proxy, start_dir);
     event_loop.run_app(&mut app).expect("run app");
+}
+
+/// Log any panic (message + location + backtrace) to a file so crashes — like
+/// the reported full-screen one — can be diagnosed after the fact.
+fn install_panic_log() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let path = std::env::var("APPDATA")
+            .map(|a| std::path::PathBuf::from(a).join("WslTerminal").join("panic.log"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("wslterm-panic.log"));
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let bt = std::backtrace::Backtrace::force_capture();
+        let line = format!("=== panic ===\n{info}\nbacktrace:\n{bt}\n");
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = f.write_all(line.as_bytes());
+        }
+        eprintln!("{line}");
+        default(info);
+    }));
 }
 
 /// `--cd <wsl-dir>`: the directory the first tab should start in (used when a
@@ -2370,7 +2418,7 @@ fn function_number(code: KeyCode) -> Option<u8> {
 /// If the cursor is within the resize border of a (borderless) window edge,
 /// which direction to resize. `None` = not on an edge.
 fn resize_dir_at(px: f64, py: f64, w: u32, h: u32, scale: f32) -> Option<ResizeDirection> {
-    let m = (6.0 * scale as f64).max(4.0);
+    let m = (8.0 * scale as f64).max(5.0);
     let (w, h) = (w as f64, h as f64);
     let (left, right) = (px < m, px > w - m);
     let (top, bottom) = (py < m, py > h - m);
