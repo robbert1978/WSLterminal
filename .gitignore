@@ -14,3 +14,6 @@ artifacts/wslptyd
 
 # Local Claude Code agent data (not part of the project)
 .claude/
+
+# Rust rewrite build output
+rust/target/

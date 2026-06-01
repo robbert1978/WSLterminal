@@ -1,0 +1,10 @@
+[package]
+name = "wslterm-core"
+description = "Portable VT emulator core (parser, screen, input) for WSL Terminal — no GUI."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lib]

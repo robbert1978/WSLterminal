@@ -1,0 +1,19 @@
+# Rust rewrite workspace. The GUI app targets Windows; wslterm-core is portable
+# and unit-tested anywhere. See rust/README.md for the plan.
+[workspace]
+resolver = "2"
+members = [
+    "wslterm-core",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
