@@ -33,6 +33,21 @@ windows-sys = { version = "0.52", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# GPU presentation: Direct3D11 + Direct2D/DirectWrite drawing into a
+# premultiplied-alpha DirectComposition swapchain (true see-through, color emoji).
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_Gdi",
+    "Foundation_Numerics",
+] }
 
 [[bin]]
 name = "wslterm"

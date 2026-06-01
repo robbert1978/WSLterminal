@@ -36,9 +36,11 @@ use wslterm_pty::bootstrap;
 use wslterm_pty::mux::MuxEvent;
 use wslterm_pty::{WslMux, WslProcess};
 
+mod gpu;
 mod layered;
 mod settings;
 mod wslfiles;
+use gpu::Gpu;
 use layered::{work_area, Layered};
 use settings::{Settings, Theme};
 
@@ -491,7 +493,8 @@ impl Doc {
 struct App {
     proxy: EventLoopProxy<UserEvent>,
     win: Option<Rc<Window>>,
-    layered: Option<Layered>,
+    gpu: Option<Gpu>,          // GPU present path (DirectComposition); preferred
+    layered: Option<Layered>,  // CPU fallback (UpdateLayeredWindow)
     fb: Vec<u32>, // ARGB framebuffer (alpha in high byte)
 
     // Frame pacing: coalesce feed-driven redraws to the monitor refresh so heavy
@@ -574,6 +577,7 @@ impl App {
         let mut app = App {
             proxy,
             win: None,
+            gpu: None,
             layered: None,
             fb: Vec::new(),
             want_frame: false,
@@ -1913,7 +1917,11 @@ impl App {
             }
         }
 
-        if let Some(layered) = &mut self.layered {
+        if let Some(g) = &mut self.gpu {
+            if let Err(e) = g.present(&self.fb, w, h) {
+                eprintln!("[wslterm] GPU present failed: {e:?}");
+            }
+        } else if let Some(layered) = &mut self.layered {
             layered.present(&self.fb, w, h);
         }
         self.last_frame = Instant::now();
@@ -1926,14 +1934,22 @@ impl ApplicationHandler<UserEvent> for App {
         if self.win.is_some() {
             return;
         }
-        // Borderless: per-pixel translucency via UpdateLayeredWindow needs the
-        // window to own its whole surface (we draw our own title/tab bar chrome).
-        let attrs = Window::default_attributes()
+        // Prefer the GPU path (DirectComposition). It needs a window with no
+        // opaque redirection surface so DWM composites our premultiplied-alpha
+        // swapchain straight against the desktop; the CPU fallback instead uses a
+        // layered window (UpdateLayeredWindow) and must NOT set those flags.
+        let use_gpu = gpu::available();
+        // Borderless either way (we draw our own title/tab bar chrome).
+        let mut attrs = Window::default_attributes()
             .with_title("WSL Terminal")
             .with_window_icon(load_window_icon())
             .with_decorations(false)
             .with_resizable(true)
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
+        if use_gpu {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_transparent(true).with_no_redirection_bitmap(true);
+        }
         let win = Rc::new(event_loop.create_window(attrs).expect("create window"));
         self.scale = win.scale_factor() as f32;
         self.recompute_metrics();
@@ -1946,7 +1962,17 @@ impl ApplicationHandler<UserEvent> for App {
             .unwrap_or(std::time::Duration::from_millis(16));
 
         if let Some(hwnd) = hwnd_of(&win) {
-            self.layered = Some(Layered::new(hwnd));
+            if use_gpu {
+                match Gpu::new(hwnd) {
+                    Ok(g) => self.gpu = Some(g),
+                    Err(e) => {
+                        eprintln!("[wslterm] GPU init failed ({e:?}); falling back to layered");
+                        self.layered = Some(Layered::new(hwnd));
+                    }
+                }
+            } else {
+                self.layered = Some(Layered::new(hwnd));
+            }
         }
         let size = win.inner_size();
         let (cols, rows) = self.grid_dims(size.width, size.height);
