@@ -13,19 +13,17 @@
 //! instead of buffering — memory stays bounded.
 
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
-use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WKey, KeyCode, ModifiersState, NamedKey, PhysicalKey};
-use winit::window::{Icon, Window, WindowId};
+use winit::window::{Icon, ResizeDirection, Window, WindowId};
 
 use wslterm_core::input::{self, Key, Mods};
 use wslterm_core::{Cell, CellFlags, Terminal};
@@ -33,9 +31,14 @@ use wslterm_pty::bootstrap;
 use wslterm_pty::mux::MuxEvent;
 use wslterm_pty::{WslMux, WslProcess};
 
+mod layered;
 mod settings;
 mod wslfiles;
+use layered::Layered;
 use settings::{Settings, Theme};
+
+/// Opaque alpha in the high byte (for the framebuffer ARGB encoding).
+const OPAQUE: u32 = 0xFF00_0000;
 
 const DISTRO: &str = "Ubuntu";
 /// points -> device-independent pixels (CSS px); multiplied again by DPI scale.
@@ -278,20 +281,20 @@ struct Doc {
     scroll: usize,         // first visible line
     dirty: bool,
     readonly: bool,
+    win_path: Option<std::path::PathBuf>, // Some => a Windows file (settings)
+    is_settings: bool,
 }
 
 impl Doc {
-    fn open(distro: &str, linux_path: &str, name: &str) -> Doc {
-        let bytes = wslfiles::read_bytes(distro, linux_path, 2 * 1024 * 1024).unwrap_or_default();
-        let readonly = wslfiles::looks_binary(&bytes);
-        let text = String::from_utf8_lossy(&bytes);
+    fn from_text(name: &str, text: &str, bytes_for_binary_check: &[u8]) -> Doc {
+        let readonly = wslfiles::looks_binary(bytes_for_binary_check);
         let lines: Vec<Vec<char>> = if text.is_empty() {
             vec![Vec::new()]
         } else {
             text.split('\n').map(|l| l.trim_end_matches('\r').chars().collect()).collect()
         };
         Doc {
-            path: linux_path.to_string(),
+            path: String::new(),
             name: name.to_string(),
             lines,
             cy: 0,
@@ -299,14 +302,38 @@ impl Doc {
             scroll: 0,
             dirty: false,
             readonly,
+            win_path: None,
+            is_settings: false,
         }
+    }
+
+    fn open(distro: &str, linux_path: &str, name: &str) -> Doc {
+        let bytes = wslfiles::read_bytes(distro, linux_path, 2 * 1024 * 1024).unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let mut d = Doc::from_text(name, &text, &bytes);
+        d.path = linux_path.to_string();
+        d
+    }
+
+    /// Open a Windows-side file (used for settings.json) for editing.
+    fn open_windows(path: std::path::PathBuf, name: &str, is_settings: bool) -> Doc {
+        let bytes = std::fs::read(&path).unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let mut d = Doc::from_text(name, &text, &bytes);
+        d.win_path = Some(path);
+        d.is_settings = is_settings;
+        d
     }
 
     fn text(&self) -> String {
         self.lines.iter().map(|l| l.iter().collect::<String>()).collect::<Vec<_>>().join("\n")
     }
     fn save(&mut self, distro: &str) -> bool {
-        let ok = wslfiles::write_text(distro, &self.path, &self.text());
+        let ok = if let Some(p) = &self.win_path {
+            std::fs::write(p, self.text()).is_ok()
+        } else {
+            wslfiles::write_text(distro, &self.path, &self.text())
+        };
         if ok {
             self.dirty = false;
         }
@@ -377,10 +404,11 @@ impl Doc {
 struct App {
     proxy: EventLoopProxy<UserEvent>,
     win: Option<Rc<Window>>,
-    context: Option<Context<Rc<Window>>>,
-    surface: Option<Surface<Rc<Window>, Rc<Window>>>,
+    layered: Option<Layered>,
+    fb: Vec<u32>, // ARGB framebuffer (alpha in high byte)
 
     font: FontVec,
+    font_family: String,
     scale: f32,
     font_pts: f32,
     font_pts_base: f32,
@@ -408,7 +436,8 @@ struct App {
     // Hit-test caches (device px), recomputed each render.
     chip_ranges: Vec<(f32, f32)>,
     plus_range: (f32, f32),
-    sidebar_btn: (f32, f32), // sidebar toggle button x-range in the tab bar
+    sidebar_btn: (f32, f32),  // sidebar toggle button x-range
+    win_btns: [(f32, f32); 3], // minimize / maximize / close x-ranges
     pane_rects: Vec<(u32, Rect)>, // active tab's leaf rects
 
     // File sidebar + editor overlay.
@@ -428,9 +457,10 @@ impl App {
         let mut app = App {
             proxy,
             win: None,
-            context: None,
-            surface: None,
+            layered: None,
+            fb: Vec::new(),
             font,
+            font_family: cfg.font_family.clone(),
             scale: 1.0,
             font_pts: cfg.font_pts,
             font_pts_base: cfg.font_pts,
@@ -454,6 +484,7 @@ impl App {
             chip_ranges: Vec::new(),
             plus_range: (0.0, 0.0),
             sidebar_btn: (0.0, 0.0),
+            win_btns: [(0.0, 0.0); 3],
             pane_rects: Vec::new(),
             sidebar_open: false,
             show_hidden: false,
@@ -486,6 +517,58 @@ impl App {
         self.sidebar_entries = wslfiles::list(DISTRO, &dir, self.show_hidden);
         self.sidebar_dir = dir;
         self.sidebar_scroll = 0;
+    }
+
+    /// Open settings.json in the editor (Ctrl+,). Creates it with current values
+    /// if missing; saving (Ctrl+S) reloads + applies live.
+    fn open_settings(&mut self) {
+        let path = match Settings::path() {
+            Some(p) => p,
+            None => return,
+        };
+        if !path.exists() {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&path, self.settings_json());
+        }
+        self.doc = Some(Doc::open_windows(path, "settings.json", true));
+        self.request_redraw();
+    }
+
+    /// Serialize the current appearance to the settings.json schema.
+    fn settings_json(&self) -> String {
+        let hx = |c: u32| format!("\"#{:06X}\"", c & 0xFF_FFFF);
+        let ansi: Vec<String> = self.theme.ansi.iter().map(|c| hx(*c)).collect();
+        format!(
+            "{{\n  \"FontFamily\": \"{}\",\n  \"FontSize\": {},\n  \"Background\": {},\n  \"Foreground\": {},\n  \"Cursor\": {},\n  \"Selection\": {},\n  \"Opacity\": {},\n  \"Ansi\": [{}]\n}}\n",
+            self.font_family,
+            self.font_pts_base,
+            hx(self.theme.bg),
+            hx(self.theme.fg),
+            hx(self.theme.cursor),
+            hx(self.theme.selection),
+            (self.opacity * 100.0).round() as u32,
+            ansi.join(", ")
+        )
+    }
+
+    /// Re-load settings.json and apply colors/opacity/font live.
+    fn apply_settings(&mut self) {
+        let cfg = Settings::load();
+        self.theme = cfg.theme;
+        self.opacity = cfg.opacity;
+        self.font_pts = cfg.font_pts;
+        self.font_pts_base = cfg.font_pts;
+        if cfg.font_family != self.font_family {
+            if let Some(f) = load_monospace_font(&cfg.font_family) {
+                self.font = f;
+            }
+            self.font_family = cfg.font_family;
+        }
+        self.recompute_metrics();
+        self.reflow();
+        self.request_redraw();
     }
 
     fn toggle_sidebar(&mut self) {
@@ -559,13 +642,18 @@ impl App {
                 }
             }
         }
+        let mut reload_settings = false;
         if save {
             if let Some(d) = self.doc.as_mut() {
                 d.save(DISTRO);
+                reload_settings = d.is_settings;
             }
         }
         if close {
             self.doc = None;
+        }
+        if reload_settings {
+            self.apply_settings();
         }
         self.doc_scroll_to_cursor();
         self.request_redraw();
@@ -862,6 +950,10 @@ impl App {
                     self.reset_font();
                     return;
                 }
+                KeyCode::Comma if ctrl => {
+                    self.open_settings();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -1045,11 +1137,6 @@ impl App {
                 }
             }
         }
-        if let (Some(surface), Some(nw), Some(nh)) =
-            (&mut self.surface, NonZeroU32::new(w), NonZeroU32::new(h))
-        {
-            let _ = surface.resize(nw, nh);
-        }
     }
 
     fn chip_at(&self, x: f32) -> Option<usize> {
@@ -1112,22 +1199,18 @@ impl App {
         let focus = self.focused_session();
         let rects = self.pane_rects.clone();
 
-        let surface = match &mut self.surface {
-            Some(s) => s,
-            None => return,
-        };
-        let mut buffer = match surface.buffer_mut() {
-            Ok(b) => b,
-            Err(_) => return,
-        };
-        let buf: &mut [u32] = &mut buffer;
-        for px in buf.iter_mut() {
-            *px = self.theme.bg;
-        }
+        // Render into our ARGB framebuffer (alpha in the high byte). Everything
+        // is opaque (0xFF) except terminal-pane backgrounds, which use the
+        // configured opacity so only the terminal shows the desktop through it.
+        let npx = (w as usize) * (h as usize);
+        self.fb.clear();
+        self.fb.resize(npx, OPAQUE | self.theme.bg);
+        let buf: &mut [u32] = &mut self.fb;
+        let op = (self.opacity.clamp(0.0, 1.0) * 255.0).round() as u32; // pane bg alpha
 
         // --- tab bar -------------------------------------------------------
-        let chrome = mix(self.theme.bg, self.theme.fg, 0.10);
-        let chip_active = mix(self.theme.bg, self.theme.fg, 0.22);
+        let chrome = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.10);
+        let chip_active = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.22);
         fill_rect(buf, w, h, 0, 0, w as usize, bar_h, chrome);
 
         self.chip_ranges.clear();
@@ -1166,15 +1249,17 @@ impl App {
         // icon drawn with rects, highlighted when the sidebar is open.
         {
             let bw = bar_h;
-            let bx0 = (w as usize).saturating_sub(bw + pad);
+            // Left of the 3 window-control buttons (min/max/close).
+            let bx0 = (w as usize).saturating_sub(bw * 4);
             if self.sidebar_open {
                 fill_rect(buf, w, h, bx0, 2, bw, bar_h.saturating_sub(4), chip_active);
             }
-            let fc = if self.sidebar_open {
-                self.theme.selection
-            } else {
-                mix(self.theme.bg, self.theme.fg, 0.7)
-            };
+            let fc = OPAQUE
+                | if self.sidebar_open {
+                    self.theme.selection
+                } else {
+                    mix(self.theme.bg, self.theme.fg, 0.7)
+                };
             let s = (bar_h as f32 * 0.55) as usize;
             let ix = bx0 + (bw - s) / 2;
             let iy = (bar_h - s) / 2;
@@ -1191,9 +1276,43 @@ impl App {
             self.sidebar_btn = (bx0 as f32, (bx0 + bw) as f32);
         }
 
+        // Window controls (right edge): minimize, maximize, close.
+        {
+            let bw = bar_h;
+            let close_x = (w as usize).saturating_sub(bw);
+            let max_x = close_x.saturating_sub(bw);
+            let min_x = max_x.saturating_sub(bw);
+            let cy = bar_h / 2;
+            let fg = mix(self.theme.bg, self.theme.fg, 0.75);
+            let half = (bw as f32 * 0.22) as usize;
+            let t = (1.5 * self.scale).round().max(1.0) as usize;
+            // minimize: a bottom bar
+            fill_rect(buf, w, h, min_x + bw / 2 - half, cy + half, half * 2, t, OPAQUE | fg);
+            // maximize: a square outline
+            let mx = max_x + bw / 2 - half;
+            let my = cy - half;
+            let sq = half * 2;
+            fill_rect(buf, w, h, mx, my, sq, t, OPAQUE | fg);
+            fill_rect(buf, w, h, mx, my + sq - t, sq, t, OPAQUE | fg);
+            fill_rect(buf, w, h, mx, my, t, sq, OPAQUE | fg);
+            fill_rect(buf, w, h, mx + sq - t, my, t, sq, OPAQUE | fg);
+            // close: an X (drawn as a filled box tinted red on the glyph)
+            let cxx = close_x + bw / 2;
+            ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, 'x');
+            blit_char(buf, w, h, &self.glyph_cache, 'x', cxx - cw / 2, text_top, 0xE0_6C75);
+            self.win_btns = [
+                (min_x as f32, (min_x + bw) as f32),
+                (max_x as f32, (max_x + bw) as f32),
+                (close_x as f32, (close_x + bw) as f32),
+            ];
+            // Keep the sidebar toggle left of the window controls.
+            let toggled_left = min_x.saturating_sub(bw + pad);
+            let _ = toggled_left; // (sidebar button already placed; layout is fixed width)
+        }
+
         // --- content: panes or editor overlay -----------------------------
-        let divider = mix(self.theme.bg, self.theme.fg, 0.18);
-        let dim = mix(self.theme.bg, self.theme.fg, 0.45);
+        let divider = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.18);
+        let dim = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.45);
         if self.doc.is_none() {
         for (session, rect) in &rects {
             // Snapshot this pane's state, then release its borrow.
@@ -1260,7 +1379,10 @@ impl App {
                     }
                     let x0 = rect.x + c * cw;
                     let y0 = rect.y + r * ch_px;
-                    fill_rect(buf, w, h, x0, y0, cw, ch_px, bg);
+                    // Terminal background uses the configured opacity; the cursor
+                    // cell stays opaque so the block reads clearly.
+                    let a = if is_cursor || reverse { 255 } else { op };
+                    fill_rect(buf, w, h, x0, y0, cw, ch_px, (a << 24) | bg);
                     if cell.rune >= 0x20 {
                         if let Some(ch) = char::from_u32(cell.rune) {
                             blit_char(buf, w, h, &self.glyph_cache, ch, x0, y0 as i32, fg);
@@ -1279,7 +1401,7 @@ impl App {
             // Focused pane: thin accent line along its top edge.
             if *session == focus && rects.len() > 1 {
                 fill_rect(buf, w, h, rect.x, rect.y, rect.w, (2.0 * self.scale) as usize,
-                    self.theme.selection);
+                    OPAQUE | self.theme.selection);
             }
         }
         } // end: panes (no doc)
@@ -1289,7 +1411,7 @@ impl App {
             let ax = sb;
             let aw = (w as usize).saturating_sub(sb);
             let ah = (h as usize).saturating_sub(bar_h);
-            fill_rect(buf, w, h, ax, bar_h, aw, ah, self.theme.bg);
+            fill_rect(buf, w, h, ax, bar_h, aw, ah, OPAQUE | self.theme.bg);
             // header: filename (+ * if dirty / [ro])
             let mut header = doc.name.clone();
             if doc.readonly {
@@ -1298,7 +1420,7 @@ impl App {
                 header.push_str("  *");
             }
             header.push_str("   (Ctrl+S save, Esc close)");
-            fill_rect(buf, w, h, ax, bar_h, aw, ch_px, mix(self.theme.bg, self.theme.fg, 0.12));
+            fill_rect(buf, w, h, ax, bar_h, aw, ch_px, OPAQUE | mix(self.theme.bg, self.theme.fg, 0.12));
             let mut gx = ax + pad;
             for ch in header.chars().take(aw / cw) {
                 ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
@@ -1339,14 +1461,14 @@ impl App {
                 if li == doc.cy && !doc.readonly {
                     let cxpx = ax + gpx + doc.cx * cw;
                     let caret_w = (cw / 8).max(2);
-                    fill_rect(buf, w, h, cxpx, y as usize, caret_w, ch_px, self.theme.cursor);
+                    fill_rect(buf, w, h, cxpx, y as usize, caret_w, ch_px, OPAQUE | self.theme.cursor);
                 }
             }
         }
 
         // --- file sidebar --------------------------------------------------
         if sb > 0 {
-            let sb_bg = mix(self.theme.bg, self.theme.fg, 0.05);
+            let sb_bg = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.05);
             fill_rect(buf, w, h, 0, bar_h, sb, (h as usize).saturating_sub(bar_h), sb_bg);
             let line_h = ch_px;
             let visible = (h as usize).saturating_sub(bar_h) / line_h;
@@ -1371,7 +1493,9 @@ impl App {
                 (h as usize).saturating_sub(bar_h), divider);
         }
 
-        let _ = buffer.present();
+        if let Some(layered) = &mut self.layered {
+            layered.present(&self.fb, w, h);
+        }
     }
 }
 
@@ -1380,22 +1504,22 @@ impl ApplicationHandler<UserEvent> for App {
         if self.win.is_some() {
             return;
         }
+        // Borderless: per-pixel translucency via UpdateLayeredWindow needs the
+        // window to own its whole surface (we draw our own title/tab bar chrome).
         let attrs = Window::default_attributes()
             .with_title("WSL Terminal")
             .with_window_icon(load_window_icon())
+            .with_decorations(false)
+            .with_resizable(true)
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
         let win = Rc::new(event_loop.create_window(attrs).expect("create window"));
         self.scale = win.scale_factor() as f32;
         self.recompute_metrics();
-        set_window_opacity(&win, self.opacity);
 
-        let context = Context::new(win.clone()).expect("softbuffer context");
-        let mut surface = Surface::new(&context, win.clone()).expect("softbuffer surface");
-        let size = win.inner_size();
-        if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
-            let _ = surface.resize(w, h);
+        if let Some(hwnd) = hwnd_of(&win) {
+            self.layered = Some(Layered::new(hwnd));
         }
-
+        let size = win.inner_size();
         let (cols, rows) = self.grid_dims(size.width, size.height);
 
         // Bring up the live WSL server.
@@ -1468,8 +1592,7 @@ impl ApplicationHandler<UserEvent> for App {
             .expect("spawn feed thread");
 
         self.win = Some(win);
-        self.context = Some(context);
-        self.surface = Some(surface);
+        self.request_redraw(); // paint chrome immediately (before first output)
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -1547,9 +1670,41 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
                 (MouseButton::Left, ElementState::Pressed) => {
-                    if self.cursor_px.1 < self.tab_bar_h() as f64 {
-                        self.tab_bar_click();
-                    } else if self.sidebar_w() > 0 && self.cursor_px.0 < self.sidebar_w() as f64 {
+                    let (px, py) = self.cursor_px;
+                    let size = self.win.as_ref().map(|w| w.inner_size());
+                    // 1) Resize from a window edge (borderless window).
+                    if let Some(s) = size {
+                        if let Some(dir) = resize_dir_at(px, py, s.width, s.height, self.scale) {
+                            if let Some(win) = &self.win {
+                                let _ = win.drag_resize_window(dir);
+                            }
+                            return;
+                        }
+                    }
+                    if py < self.tab_bar_h() as f64 {
+                        let x = px as f32;
+                        // 2) Window controls.
+                        if x >= self.win_btns[2].0 {
+                            event_loop.exit();
+                        } else if x >= self.win_btns[1].0 && x < self.win_btns[1].1 {
+                            if let Some(win) = &self.win {
+                                win.set_maximized(!win.is_maximized());
+                            }
+                        } else if x >= self.win_btns[0].0 && x < self.win_btns[0].1 {
+                            if let Some(win) = &self.win {
+                                win.set_minimized(true);
+                            }
+                        } else if x >= self.sidebar_btn.0 && x < self.sidebar_btn.1 {
+                            self.toggle_sidebar();
+                        } else if (x >= self.plus_range.0 && x < self.plus_range.1)
+                            || self.chip_at(x).is_some()
+                        {
+                            self.tab_bar_click();
+                        } else if let Some(win) = &self.win {
+                            // 3) Empty tab-bar area drags the window.
+                            let _ = win.drag_window();
+                        }
+                    } else if self.sidebar_w() > 0 && px < self.sidebar_w() as f64 {
                         self.sidebar_click();
                     } else if self.doc.is_none() {
                         self.begin_selection();
@@ -1693,7 +1848,13 @@ fn blit_char(
             }
             let idx = base + px as usize;
             if idx < buf.len() {
-                buf[idx] = blend(buf[idx], fg, cov as f32 / 255.0);
+                let dpx = buf[idx];
+                let nrgb = blend(dpx, fg, cov as f32 / 255.0);
+                // Text raises the pixel alpha toward opaque (crisp text over a
+                // translucent terminal background).
+                let da = (dpx >> 24) & 0xff;
+                let na = da + (255 - da) * cov as u32 / 255;
+                buf[idx] = (na << 24) | nrgb;
             }
         }
     }
@@ -1706,32 +1867,14 @@ fn parse_opacity_env() -> Option<f32> {
     Some(v.clamp(0.4, 1.0))
 }
 
-#[cfg(windows)]
-fn set_window_opacity(window: &Window, opacity: f32) {
+/// Raw Win32 HWND (as isize) for the window, if available.
+fn hwnd_of(window: &Window) -> Option<isize> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE, LWA_ALPHA,
-        WS_EX_LAYERED,
-    };
-    let raw = match window.window_handle() {
-        Ok(h) => h.as_raw(),
-        Err(_) => return,
-    };
-    let hwnd = match raw {
-        RawWindowHandle::Win32(h) => h.hwnd.get() as HWND,
-        _ => return,
-    };
-    unsafe {
-        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED as isize);
-        let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
-        SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+    match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+        _ => None,
     }
 }
-
-#[cfg(not(windows))]
-fn set_window_opacity(_window: &Window, _opacity: f32) {}
 
 /// Decode the bundled WSL icon (largest frame) into a winit window icon.
 fn load_window_icon() -> Option<Icon> {
@@ -1807,6 +1950,27 @@ fn function_number(code: KeyCode) -> Option<u8> {
         KeyCode::F10 => 10,
         KeyCode::F11 => 11,
         KeyCode::F12 => 12,
+        _ => return None,
+    })
+}
+
+/// If the cursor is within the resize border of a (borderless) window edge,
+/// which direction to resize. `None` = not on an edge.
+fn resize_dir_at(px: f64, py: f64, w: u32, h: u32, scale: f32) -> Option<ResizeDirection> {
+    let m = (6.0 * scale as f64).max(4.0);
+    let (w, h) = (w as f64, h as f64);
+    let (left, right) = (px < m, px > w - m);
+    let (top, bottom) = (py < m, py > h - m);
+    use ResizeDirection::*;
+    Some(match (top, bottom, left, right) {
+        (true, _, true, _) => NorthWest,
+        (true, _, _, true) => NorthEast,
+        (_, true, true, _) => SouthWest,
+        (_, true, _, true) => SouthEast,
+        (true, ..) => North,
+        (_, true, ..) => South,
+        (_, _, true, _) => West,
+        (_, _, _, true) => East,
         _ => return None,
     })
 }

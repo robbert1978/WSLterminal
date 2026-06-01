@@ -11,8 +11,8 @@ wslterm-core = { path = "../wslterm-core" }
 wslterm-pty = { path = "../wslterm-pty" }
 
 # CPU-rendered window: keeps RAM low and avoids the wgpu/D3D managed stack.
+# Presentation is via UpdateLayeredWindow (see layered.rs) for per-pixel alpha.
 winit = "0.30"
-softbuffer = "0.4"
 ab_glyph = "0.2"
 # Lightweight, Windows-only clipboard access for copy/paste.
 clipboard-win = "5"
@@ -25,9 +25,10 @@ ico = "0.3"
 winresource = "0.1"
 
 [target.'cfg(windows)'.dependencies]
-# For the layered-window translucency (SetLayeredWindowAttributes).
+# For per-pixel translucency (UpdateLayeredWindow) on a borderless window.
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
