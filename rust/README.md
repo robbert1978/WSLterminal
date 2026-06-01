@@ -48,9 +48,11 @@ parity. The win is RAM, GC-free latency, and a smaller binary — not raw speed.
 - [x] `wslterm-core`: VT parser + screen + scrollback + SGR/color + charwidth
       (27 tests, incl. all 21 ported `--vttest` cases and the v1.0.2 SGR/`>4m`
       regression tests)
-- [ ] `wslterm-core`: input encoder
-- [ ] `wslterm-pty`: wslg launch + mux client
-- [ ] `wslterm`: renderer, window, tabs/panes
+- [ ] `wslterm-core`: input encoder (port InputEncoder.cs)
+- [x] `wslterm-pty`: wslptyd protocol + bootstrap + wslg launch + mux reader
+      (7 tests over in-memory transports; live wslg spawn is a thin std::process
+      wrapper, not covered by unit tests)
+- [ ] `wslterm`: renderer, window, tabs/panes  ← in progress (step 3)
 - [ ] sidebar / editor / highlighting
 
 ## Build

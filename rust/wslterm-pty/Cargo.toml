@@ -1,0 +1,10 @@
+[package]
+name = "wslterm-pty"
+description = "Windows-side WSL launch (wslg.exe) + wslptyd multiplex client for WSL Terminal."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lib]

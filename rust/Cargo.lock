@@ -5,3 +5,7 @@ version = 4
 [[package]]
 name = "wslterm-core"
 version = "0.1.0"
+
+[[package]]
+name = "wslterm-pty"
+version = "0.1.0"
