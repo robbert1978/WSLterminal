@@ -7,9 +7,21 @@
 //! `WS_EX_NOREDIRECTIONBITMAP` (winit `with_no_redirection_bitmap`) so there is
 //! no opaque GDI surface behind our content.
 //!
-//! Phase 1 (this revision) blits the CPU framebuffer through a D2D bitmap to
-//! prove the pipeline + transparency end-to-end. Phase 2 will draw text natively
-//! via DirectWrite (giving color emoji) instead of uploading a CPU buffer.
+//! The frame is composited in two layers: the CPU framebuffer (window chrome,
+//! tab bar, sidebar, editor, cell backgrounds/cursor/selection) is blitted as a
+//! D2D bitmap, then the terminal **glyphs are drawn natively with DirectWrite**
+//! on top — which gives system font fallback and color emoji for free, on the
+//! GPU, instead of the CPU rasterizer.
+
+/// One terminal glyph to draw on the GPU: a char at a pixel origin in an opaque
+/// color (`rgb`, 0x00RRGGBB).
+#[derive(Clone, Copy)]
+pub struct GlyphDraw {
+    pub ch: char,
+    pub x: f32,
+    pub y: f32,
+    pub rgb: u32,
+}
 
 #[cfg(windows)]
 pub use imp::{available, Gpu};
@@ -19,15 +31,19 @@ pub use stub::{available, Gpu};
 
 #[cfg(windows)]
 mod imp {
-    use windows::core::{Interface, Result};
+    use super::GlyphDraw;
+    use std::collections::HashMap;
+    use windows::core::{Interface, Result, PCWSTR};
     use windows::Win32::Foundation::{HMODULE, HWND};
     use windows::Win32::Graphics::Direct2D::Common::{
-        D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+        D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
+        D2D_SIZE_U,
     };
     use windows::Win32::Graphics::Direct2D::{
         D2D1CreateFactory, ID2D1Bitmap1, ID2D1DeviceContext, ID2D1Factory1, ID2D1Image,
-        D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
-        D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        ID2D1SolidColorBrush, D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+        D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_FACTORY_TYPE_SINGLE_THREADED,
         D2D1_INTERPOLATION_MODE_LINEAR,
     };
     use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
@@ -36,6 +52,11 @@ mod imp {
     };
     use windows::Win32::Graphics::DirectComposition::{
         DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+    };
+    use windows::Win32::Graphics::DirectWrite::{
+        DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
+        DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_WORD_WRAPPING_NO_WRAP,
     };
     use windows::Win32::Graphics::Dxgi::Common::{
         DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -46,7 +67,12 @@ mod imp {
         DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
     };
 
+    fn to_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
     fn create_device() -> Result<ID3D11Device> {
+        let mut last = windows::core::Error::from_win32();
         for dt in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
             let mut dev: Option<ID3D11Device> = None;
             let r = unsafe {
@@ -62,28 +88,16 @@ mod imp {
                     None,
                 )
             };
-            if r.is_ok() {
-                if let Some(d) = dev {
-                    return Ok(d);
+            match r {
+                Ok(()) => {
+                    if let Some(d) = dev {
+                        return Ok(d);
+                    }
                 }
+                Err(e) => last = e,
             }
         }
-        // Final attempt surfaces the real error.
-        let mut dev: Option<ID3D11Device> = None;
-        unsafe {
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut dev),
-                None,
-                None,
-            )?;
-        }
-        dev.ok_or_else(|| windows::core::Error::from_win32())
+        Err(last)
     }
 
     /// True if a D3D11 device can be created (so the GPU path is usable). Cheap
@@ -99,6 +113,12 @@ mod imp {
         _dcomp: IDCompositionDevice,
         _target: IDCompositionTarget,
         _visual: IDCompositionVisual,
+        dwrite: IDWriteFactory,
+        text_format: Option<IDWriteTextFormat>,
+        layouts: HashMap<char, IDWriteTextLayout>,
+        brush: Option<ID2D1SolidColorBrush>,
+        cell_w: f32,
+        cell_h: f32,
         target_bitmap: Option<ID2D1Bitmap1>,
         premul: Vec<u8>,
         w: u32,
@@ -126,7 +146,6 @@ mod imp {
                 };
                 let swapchain = factory.CreateSwapChainForComposition(&device, &desc, None)?;
 
-                // Direct2D device context targeting the swapchain's back buffer.
                 let d2d_factory: ID2D1Factory1 =
                     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
                 let d2d_device = d2d_factory.CreateDevice(&dxgi_device)?;
@@ -134,7 +153,8 @@ mod imp {
                 // 1 DIP == 1 physical pixel (main.rs lays everything out in px).
                 dc.SetDpi(96.0, 96.0);
 
-                // DirectComposition: bind the swapchain to the HWND.
+                let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+
                 let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
                 let target = dcomp.CreateTargetForHwnd(HWND(hwnd as *mut _), true)?;
                 let visual = dcomp.CreateVisual()?;
@@ -149,6 +169,12 @@ mod imp {
                     _dcomp: dcomp,
                     _target: target,
                     _visual: visual,
+                    dwrite,
+                    text_format: None,
+                    layouts: HashMap::new(),
+                    brush: None,
+                    cell_w: 1.0,
+                    cell_h: 1.0,
                     target_bitmap: None,
                     premul: Vec::new(),
                     w: 0,
@@ -157,13 +183,62 @@ mod imp {
             }
         }
 
+        /// (Re)build the DirectWrite text format for the given font + cell size,
+        /// dropping the cached per-char layouts. Called on init and font change.
+        pub fn set_font(&mut self, family: &str, px: f32, cell_w: f32, cell_h: f32) {
+            self.cell_w = cell_w.max(1.0);
+            self.cell_h = cell_h.max(1.0);
+            self.layouts.clear();
+            let family_w = to_wide(family);
+            let locale = to_wide("en-us");
+            let fmt = unsafe {
+                self.dwrite.CreateTextFormat(
+                    PCWSTR(family_w.as_ptr()),
+                    None,
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    px.max(1.0),
+                    PCWSTR(locale.as_ptr()),
+                )
+            };
+            match fmt {
+                Ok(f) => {
+                    unsafe {
+                        let _ = f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                    }
+                    self.text_format = Some(f);
+                }
+                Err(e) => eprintln!("[wslterm] DWrite CreateTextFormat failed: {e:?}"),
+            }
+            if self.brush.is_none() {
+                let black = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+                self.brush = unsafe { self.dc.CreateSolidColorBrush(&black, None).ok() };
+            }
+        }
+
+        fn layout_for(&mut self, ch: char) -> Option<IDWriteTextLayout> {
+            if let Some(l) = self.layouts.get(&ch) {
+                return Some(l.clone());
+            }
+            let fmt = self.text_format.as_ref()?;
+            let mut buf = [0u16; 2];
+            let s = ch.encode_utf16(&mut buf);
+            let layout = unsafe {
+                self.dwrite
+                    .CreateTextLayout(s, fmt, self.cell_w * 2.0, self.cell_h)
+                    .ok()?
+            };
+            self.layouts.insert(ch, layout.clone());
+            Some(layout)
+        }
+
         /// (Re)create the swapchain buffers + the D2D target bitmap for `w`×`h`.
         fn ensure_size(&mut self, w: u32, h: u32) -> Result<()> {
             if w == self.w && h == self.h && self.target_bitmap.is_some() {
                 return Ok(());
             }
             unsafe {
-                // Release the old target before resizing the swapchain buffers.
                 self.dc.SetTarget(None);
                 self.target_bitmap = None;
                 self.swapchain.ResizeBuffers(
@@ -191,9 +266,10 @@ mod imp {
             Ok(())
         }
 
-        /// Present the ARGB framebuffer (alpha in the high byte). Premultiplies
-        /// into BGRA (the swapchain is premultiplied-alpha) and blits via D2D.
-        pub fn present(&mut self, fb: &[u32], w: u32, h: u32) -> Result<()> {
+        /// Present a frame: blit the CPU framebuffer (chrome + cell backgrounds),
+        /// then draw the terminal glyphs natively via DirectWrite (color emoji),
+        /// then flip the composition swapchain.
+        pub fn present(&mut self, fb: &[u32], w: u32, h: u32, glyphs: &[GlyphDraw]) -> Result<()> {
             if w == 0 || h == 0 {
                 return Ok(());
             }
@@ -222,6 +298,8 @@ mod imp {
                 self.dc.SetTarget(&target);
                 self.dc.BeginDraw();
                 self.dc.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+
+                // Layer 1: the CPU framebuffer (chrome, backgrounds, cursor, sel).
                 let size = D2D_SIZE_U { width: w, height: h };
                 let props = D2D1_BITMAP_PROPERTIES1 {
                     pixelFormat: D2D1_PIXEL_FORMAT {
@@ -247,6 +325,30 @@ mod imp {
                     None,
                     None,
                 );
+
+                // Layer 2: terminal glyphs (system fallback + color emoji).
+                if let Some(brush) = self.brush.clone() {
+                    for gph in glyphs {
+                        let layout = match self.layout_for(gph.ch) {
+                            Some(l) => l,
+                            None => break, // no text format yet
+                        };
+                        let col = D2D1_COLOR_F {
+                            r: ((gph.rgb >> 16) & 0xff) as f32 / 255.0,
+                            g: ((gph.rgb >> 8) & 0xff) as f32 / 255.0,
+                            b: (gph.rgb & 0xff) as f32 / 255.0,
+                            a: 1.0,
+                        };
+                        brush.SetColor(&col);
+                        self.dc.DrawTextLayout(
+                            D2D_POINT_2F { x: gph.x, y: gph.y },
+                            &layout,
+                            &brush,
+                            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+                        );
+                    }
+                }
+
                 self.dc.EndDraw(None, None)?;
                 self.swapchain.Present(1, DXGI_PRESENT(0)).ok()?;
             }
@@ -257,6 +359,7 @@ mod imp {
 
 #[cfg(not(windows))]
 mod stub {
+    use super::GlyphDraw;
     pub fn available() -> bool {
         false
     }
@@ -265,6 +368,7 @@ mod stub {
         pub fn new(_hwnd: isize) -> Result<Gpu, ()> {
             Err(())
         }
-        pub fn present(&mut self, _fb: &[u32], _w: u32, _h: u32) {}
+        pub fn set_font(&mut self, _family: &str, _px: f32, _cell_w: f32, _cell_h: f32) {}
+        pub fn present(&mut self, _fb: &[u32], _w: u32, _h: u32, _glyphs: &[GlyphDraw]) {}
     }
 }

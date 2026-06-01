@@ -40,7 +40,7 @@ mod gpu;
 mod layered;
 mod settings;
 mod wslfiles;
-use gpu::Gpu;
+use gpu::{Gpu, GlyphDraw};
 use layered::{work_area, Layered};
 use settings::{Settings, Theme};
 
@@ -495,6 +495,8 @@ struct App {
     win: Option<Rc<Window>>,
     gpu: Option<Gpu>,          // GPU present path (DirectComposition); preferred
     layered: Option<Layered>,  // CPU fallback (UpdateLayeredWindow)
+    gpu_text: bool,            // draw terminal glyphs via DirectWrite (GPU path)
+    term_glyphs: Vec<GlyphDraw>, // terminal glyphs collected this frame for the GPU
     fb: Vec<u32>, // ARGB framebuffer (alpha in high byte)
 
     // Frame pacing: coalesce feed-driven redraws to the monitor refresh so heavy
@@ -579,6 +581,8 @@ impl App {
             win: None,
             gpu: None,
             layered: None,
+            gpu_text: false,
+            term_glyphs: Vec::new(),
             fb: Vec::new(),
             want_frame: false,
             last_frame: Instant::now(),
@@ -708,6 +712,7 @@ impl App {
             self.font_family = cfg.font_family;
         }
         self.recompute_metrics();
+        self.sync_gpu_font();
         self.reflow();
         self.request_redraw();
     }
@@ -1403,6 +1408,7 @@ impl App {
     fn zoom_font(&mut self, delta_pts: f32) {
         self.font_pts = (self.font_pts + delta_pts).clamp(6.0, 72.0);
         self.recompute_metrics();
+        self.sync_gpu_font();
         self.reflow();
         self.request_redraw();
     }
@@ -1410,8 +1416,17 @@ impl App {
     fn reset_font(&mut self) {
         self.font_pts = self.font_pts_base;
         self.recompute_metrics();
+        self.sync_gpu_font();
         self.reflow();
         self.request_redraw();
+    }
+
+    /// Push the current font family + cell metrics to the GPU text renderer
+    /// (no-op on the CPU/layered path).
+    fn sync_gpu_font(&mut self) {
+        if let Some(g) = &mut self.gpu {
+            g.set_font(&self.font_family, self.font_px, self.cell_w as f32, self.cell_h as f32);
+        }
     }
 
     fn scroll_by(&mut self, lines: i32) {
@@ -1554,6 +1569,7 @@ impl App {
         let npx = (w as usize) * (h as usize);
         self.fb.clear();
         self.fb.resize(npx, OPAQUE | self.theme.bg);
+        self.term_glyphs.clear(); // GPU path collects pane glyphs here this frame
         let buf: &mut [u32] = &mut self.fb;
         let op = (self.opacity.clamp(0.0, 1.0) * 255.0).round() as u32; // pane bg alpha
 
@@ -1693,12 +1709,16 @@ impl App {
             let rcols = (rect.w / cw).min(cols);
             let rrows = (rect.h / ch_px).min(rows);
 
-            for r in 0..rrows.min(self.grid.len()) {
-                for c in 0..rcols.min(self.grid[r].len()) {
-                    let rune = self.grid[r][c].rune;
-                    if rune >= 0x20 {
-                        if let Some(ch) = char::from_u32(rune) {
-                            ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+            // CPU path pre-rasterizes glyphs into the cache; the GPU path draws
+            // them natively via DirectWrite (no cache needed).
+            if !self.gpu_text {
+                for r in 0..rrows.min(self.grid.len()) {
+                    for c in 0..rcols.min(self.grid[r].len()) {
+                        let rune = self.grid[r][c].rune;
+                        if rune >= 0x20 {
+                            if let Some(ch) = char::from_u32(rune) {
+                                ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                            }
                         }
                     }
                 }
@@ -1740,7 +1760,16 @@ impl App {
                     fill_rect(buf, w, h, x0, y0, cw, ch_px, (a << 24) | bg);
                     if cell.rune >= 0x20 {
                         if let Some(ch) = char::from_u32(cell.rune) {
-                            blit_char(buf, w, h, &self.glyph_cache, ch, x0, y0 as i32, fg);
+                            if self.gpu_text {
+                                self.term_glyphs.push(GlyphDraw {
+                                    ch,
+                                    x: x0 as f32,
+                                    y: y0 as f32,
+                                    rgb: fg,
+                                });
+                            } else {
+                                blit_char(buf, w, h, &self.glyph_cache, ch, x0, y0 as i32, fg);
+                            }
                         }
                     }
                 }
@@ -1918,7 +1947,7 @@ impl App {
         }
 
         if let Some(g) = &mut self.gpu {
-            if let Err(e) = g.present(&self.fb, w, h) {
+            if let Err(e) = g.present(&self.fb, w, h, &self.term_glyphs) {
                 eprintln!("[wslterm] GPU present failed: {e:?}");
             }
         } else if let Some(layered) = &mut self.layered {
@@ -1964,7 +1993,11 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(hwnd) = hwnd_of(&win) {
             if use_gpu {
                 match Gpu::new(hwnd) {
-                    Ok(g) => self.gpu = Some(g),
+                    Ok(mut g) => {
+                        g.set_font(&self.font_family, self.font_px, self.cell_w as f32, self.cell_h as f32);
+                        self.gpu = Some(g);
+                        self.gpu_text = true;
+                    }
                     Err(e) => {
                         eprintln!("[wslterm] GPU init failed ({e:?}); falling back to layered");
                         self.layered = Some(Layered::new(hwnd));
