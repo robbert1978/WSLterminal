@@ -6,6 +6,9 @@ fn main() {
     {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("wsl.ico");
-        let _ = res.compile();
+        if let Err(e) = res.compile() {
+            println!("cargo:warning=icon embed failed: {e}");
+        }
     }
 }
+// 2026-06-01T20:37:35.8455516+07:00

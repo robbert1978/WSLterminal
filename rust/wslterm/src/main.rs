@@ -476,7 +476,9 @@ struct App {
     redraw_pending: Arc<AtomicBool>,
 
     tabs: Vec<Tab>,
-    active: usize,
+    active_term: usize, // index into `tabs` of the current terminal tab
+    docs: Vec<Doc>,     // open file/editor tabs
+    active_doc: Option<usize>, // Some(i) => doc tab is foreground; None => terminal
     start_dir: Option<String>, // cwd for the first tab (from --cd)
 
     mods: ModifiersState,
@@ -486,18 +488,33 @@ struct App {
 
     // Hit-test caches (device px), recomputed each render.
     chip_ranges: Vec<(f32, f32)>,
+    chip_targets: Vec<ChipTarget>, // what each chip selects (parallel to chip_ranges)
     plus_range: (f32, f32),
     sidebar_btn: (f32, f32),  // sidebar toggle button x-range
     win_btns: [(f32, f32); 3], // minimize / maximize / close x-ranges
     pane_rects: Vec<(u32, Rect)>, // active tab's leaf rects
 
-    // File sidebar + editor overlay.
+    // File sidebar.
     sidebar_open: bool,
     show_hidden: bool,
     sidebar_dir: String,
     sidebar_entries: Vec<wslfiles::Entry>,
     sidebar_scroll: usize,
-    doc: Option<Doc>,
+    sidebar_menu: Option<SidebarMenu>, // right-click context menu
+}
+
+/// What a tab-bar chip selects.
+#[derive(Clone, Copy)]
+enum ChipTarget {
+    Term(usize),
+    Doc(usize),
+}
+
+/// Right-click context menu over a sidebar entry.
+struct SidebarMenu {
+    entry: usize,             // index into sidebar_entries
+    items: Vec<&'static str>, // menu labels
+    rect: Rect,               // popup rect (device px)
 }
 
 impl App {
@@ -526,13 +543,16 @@ impl App {
             outbox: Arc::new(Mutex::new(Vec::new())),
             redraw_pending: Arc::new(AtomicBool::new(false)),
             tabs: Vec::new(),
-            active: 0,
+            active_term: 0,
+            docs: Vec::new(),
+            active_doc: None,
             start_dir,
             mods: ModifiersState::empty(),
             cursor_px: (0.0, 0.0),
             grid: Vec::new(),
             glyph_cache: HashMap::new(),
             chip_ranges: Vec::new(),
+            chip_targets: Vec::new(),
             plus_range: (0.0, 0.0),
             sidebar_btn: (0.0, 0.0),
             win_btns: [(0.0, 0.0); 3],
@@ -542,7 +562,7 @@ impl App {
             sidebar_dir: String::new(),
             sidebar_entries: Vec::new(),
             sidebar_scroll: 0,
-            doc: None,
+            sidebar_menu: None,
         };
         app.recompute_metrics();
         app
@@ -583,8 +603,7 @@ impl App {
             }
             let _ = std::fs::write(&path, self.settings_json());
         }
-        self.doc = Some(Doc::open_windows(path, "settings.json", true));
-        self.request_redraw();
+        self.open_doc(Doc::open_windows(path, "settings.json", true));
     }
 
     /// Serialize the current appearance to the settings.json schema.
@@ -636,13 +655,22 @@ impl App {
         self.request_redraw();
     }
 
+    /// Sidebar entry index under the mouse, if any.
+    fn sidebar_entry_at_cursor(&self) -> Option<usize> {
+        let bar = self.tab_bar_h();
+        if (self.cursor_px.1 as usize) < bar {
+            return None;
+        }
+        let idx = (self.cursor_px.1 as usize - bar) / self.cell_h + self.sidebar_scroll;
+        (idx < self.sidebar_entries.len()).then_some(idx)
+    }
+
     /// Click in the sidebar: cd into a directory (shell follows) or open a file.
     fn sidebar_click(&mut self) {
-        let bar = self.tab_bar_h();
-        let idx = (self.cursor_px.1 as usize).saturating_sub(bar) / self.cell_h + self.sidebar_scroll;
-        if idx >= self.sidebar_entries.len() {
-            return;
-        }
+        let idx = match self.sidebar_entry_at_cursor() {
+            Some(i) => i,
+            None => return,
+        };
         let (is_dir, lp, name) = {
             let e = &self.sidebar_entries[idx];
             (e.is_dir, e.linux_path.clone(), e.name.clone())
@@ -651,21 +679,88 @@ impl App {
             let cmd = format!(" cd '{}'\r", lp.replace('\'', "'\\''"));
             self.send(cmd.as_bytes());
         } else {
-            self.doc = Some(Doc::open(DISTRO, &lp, &name));
+            self.open_doc(Doc::open(DISTRO, &lp, &name));
         }
         self.request_redraw();
+    }
+
+    /// Open a right-click context menu over the sidebar entry under the cursor.
+    fn open_sidebar_menu(&mut self) {
+        let idx = match self.sidebar_entry_at_cursor() {
+            Some(i) => i,
+            None => {
+                self.sidebar_menu = None;
+                return;
+            }
+        };
+        let is_dir = self.sidebar_entries[idx].is_dir;
+        let items: Vec<&'static str> = if is_dir {
+            vec!["Open in new window", "Open"]
+        } else {
+            vec!["Open", "Insert path at prompt"]
+        };
+        let pad = (6.0 * self.scale).round().max(2.0) as usize;
+        let mw = items.iter().map(|s| s.len()).max().unwrap_or(8) * self.cell_w + pad * 2;
+        let line_h = self.cell_h + 4;
+        let rect = Rect {
+            x: self.cursor_px.0 as usize,
+            y: self.cursor_px.1 as usize,
+            w: mw,
+            h: items.len() * line_h + 4,
+        };
+        self.sidebar_menu = Some(SidebarMenu { entry: idx, items, rect });
+        self.request_redraw();
+    }
+
+    /// Handle a click while the sidebar context menu is open. Returns true if the
+    /// click was consumed (menu was open).
+    fn menu_click(&mut self) -> bool {
+        let menu = match self.sidebar_menu.take() {
+            Some(m) => m,
+            None => return false,
+        };
+        self.request_redraw();
+        let (mx, my) = self.cursor_px;
+        if !menu.rect.contains(mx, my) {
+            return true; // clicked outside: dismissed
+        }
+        let line_h = self.cell_h + 4;
+        let row = (my as usize - menu.rect.y).saturating_sub(2) / line_h;
+        let item = match menu.items.get(row) {
+            Some(s) => *s,
+            None => return true,
+        };
+        let (is_dir, lp, name) = match self.sidebar_entries.get(menu.entry) {
+            Some(e) => (e.is_dir, e.linux_path.clone(), e.name.clone()),
+            None => return true,
+        };
+        match item {
+            "Open in new window" => spawn_window(Some(lp)),
+            "Open" => {
+                if is_dir {
+                    let cmd = format!(" cd '{}'\r", lp.replace('\'', "'\\''"));
+                    self.send(cmd.as_bytes());
+                } else {
+                    self.open_doc(Doc::open(DISTRO, &lp, &name));
+                }
+            }
+            "Insert path at prompt" => {
+                let quoted = format!("'{}'", lp.replace('\'', "'\\''"));
+                self.send(quoted.as_bytes());
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Editor key handling while a document is open.
     fn doc_key(&mut self, ev: &KeyEvent) {
         let ctrl = self.mods.control_key();
-        let mut close = false;
         let mut save = false;
         let mut edited = false;
-        if let Some(doc) = self.doc.as_mut() {
+        if let Some(doc) = self.cur_doc_mut() {
             if let PhysicalKey::Code(code) = ev.physical_key {
                 match code {
-                    KeyCode::Escape => close = true,
                     KeyCode::KeyS if ctrl => save = true,
                     KeyCode::ArrowUp => doc.move_cursor(-1, 0),
                     KeyCode::ArrowDown => doc.move_cursor(1, 0),
@@ -703,19 +798,16 @@ impl App {
             }
         }
         if edited {
-            if let Some(d) = self.doc.as_mut() {
+            if let Some(d) = self.cur_doc_mut() {
                 d.rehighlight();
             }
         }
         let mut reload_settings = false;
         if save {
-            if let Some(d) = self.doc.as_mut() {
+            if let Some(d) = self.cur_doc_mut() {
                 d.save(DISTRO);
                 reload_settings = d.is_settings;
             }
-        }
-        if close {
-            self.doc = None;
         }
         if reload_settings {
             self.apply_settings();
@@ -729,7 +821,7 @@ impl App {
         let ch = self.cell_h;
         let wh = self.win.as_ref().map(|w| w.inner_size().height as usize).unwrap_or(0);
         let rows = (wh.saturating_sub(bar + ch) / ch).max(1);
-        if let Some(doc) = self.doc.as_mut() {
+        if let Some(doc) = self.cur_doc_mut() {
             if doc.cy < doc.scroll {
                 doc.scroll = doc.cy;
             } else if doc.cy >= doc.scroll + rows {
@@ -762,7 +854,7 @@ impl App {
 
     // ---- focused-pane accessors ----------------------------------------
     fn focused_session(&self) -> u32 {
-        let tab = &self.tabs[self.active];
+        let tab = &self.tabs[self.active_term];
         if tab.root.find(tab.focus).is_some() {
             tab.focus
         } else {
@@ -771,17 +863,40 @@ impl App {
     }
     fn focused(&self) -> &Pane {
         let s = self.focused_session();
-        self.tabs[self.active].root.find(s).expect("focused pane")
+        self.tabs[self.active_term].root.find(s).expect("focused pane")
     }
     fn focused_term(&self) -> Arc<Mutex<Terminal>> {
         self.focused().term.clone()
     }
     fn pane(&self, session: u32) -> Option<&Pane> {
-        self.tabs.get(self.active).and_then(|t| t.root.find(session))
+        self.tabs.get(self.active_term).and_then(|t| t.root.find(session))
     }
     fn pane_mut(&mut self, session: u32) -> Option<&mut Pane> {
-        let active = self.active;
+        let active = self.active_term;
         self.tabs.get_mut(active).and_then(|t| t.root.find_mut(session))
+    }
+
+    // ---- document (editor) tabs ----------------------------------------
+    fn cur_doc_mut(&mut self) -> Option<&mut Doc> {
+        match self.active_doc {
+            Some(i) => self.docs.get_mut(i),
+            None => None,
+        }
+    }
+    /// Open a document as a foreground tab.
+    fn open_doc(&mut self, doc: Doc) {
+        self.docs.push(doc);
+        self.active_doc = Some(self.docs.len() - 1);
+        self.request_redraw();
+    }
+    /// Close the active document tab (back to the terminal view).
+    fn close_active_doc(&mut self) {
+        if let Some(i) = self.active_doc.take() {
+            if i < self.docs.len() {
+                self.docs.remove(i);
+            }
+            self.request_redraw();
+        }
     }
 
     /// Send bytes to the focused session.
@@ -816,7 +931,7 @@ impl App {
 
     fn focused_cwd(&self) -> String {
         self.tabs
-            .get(self.active)
+            .get(self.active_term)
             .and_then(|_| self.pane(self.focused_session()))
             .and_then(|p| p.term.lock().unwrap().current_directory().map(String::from))
             .unwrap_or_default()
@@ -837,7 +952,8 @@ impl App {
             None => return,
         };
         self.tabs.push(Tab { root: Layout::Leaf(Pane::new(session, term)), focus: session });
-        self.active = self.tabs.len() - 1;
+        self.active_term = self.tabs.len() - 1;
+        self.active_doc = None;
         self.reflow();
         self.request_redraw();
     }
@@ -856,7 +972,7 @@ impl App {
             None => return,
         };
         let mut newp = Some(Pane::new(session, term));
-        let tab = &mut self.tabs[self.active];
+        let tab = &mut self.tabs[self.active_term];
         let root = std::mem::replace(&mut tab.root, Layout::Empty);
         tab.root = split_layout(root, target, side_by_side, &mut newp);
         tab.focus = session;
@@ -893,8 +1009,8 @@ impl App {
                     event_loop.exit();
                     return;
                 }
-                if self.active >= self.tabs.len() {
-                    self.active = self.tabs.len() - 1;
+                if self.active_term >= self.tabs.len() {
+                    self.active_term = self.tabs.len() - 1;
                 }
             }
         }
@@ -926,19 +1042,31 @@ impl App {
             event_loop.exit();
             return;
         }
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
+        if self.active_term >= self.tabs.len() {
+            self.active_term = self.tabs.len() - 1;
         }
         self.reflow();
         self.request_redraw();
     }
 
+    /// Cycle through the combined tab strip: terminal tabs then document tabs.
     fn switch_tab(&mut self, delta: i32) {
-        if self.tabs.is_empty() {
+        let nterm = self.tabs.len();
+        let total = nterm + self.docs.len();
+        if total == 0 {
             return;
         }
-        let n = self.tabs.len() as i32;
-        self.active = (self.active as i32 + delta).rem_euclid(n) as usize;
+        let cur = match self.active_doc {
+            Some(d) => nterm + d,
+            None => self.active_term.min(nterm.saturating_sub(1)),
+        };
+        let next = (cur as i32 + delta).rem_euclid(total as i32) as usize;
+        if next < nterm {
+            self.active_term = next;
+            self.active_doc = None;
+        } else {
+            self.active_doc = Some(next - nterm);
+        }
         self.request_redraw();
     }
 
@@ -990,9 +1118,8 @@ impl App {
                     return;
                 }
                 KeyCode::KeyW if ctrl && shift => {
-                    if self.doc.is_some() {
-                        self.doc = None;
-                        self.request_redraw();
+                    if self.active_doc.is_some() {
+                        self.close_active_doc();
                     } else {
                         let s = self.focused_session();
                         self.close_session(s, false, event_loop);
@@ -1024,7 +1151,7 @@ impl App {
         }
 
         // While the editor overlay is open it takes all remaining input.
-        if self.doc.is_some() {
+        if self.active_doc.is_some() {
             self.doc_key(ev);
             return;
         }
@@ -1090,7 +1217,7 @@ impl App {
             Some(s) => s,
             None => return,
         };
-        self.tabs[self.active].focus = session; // click focuses the pane
+        self.tabs[self.active_term].focus = session; // click focuses the pane
         if let Some(rect) = self.rect_of(session) {
             let (r, c) = self.cell_in(session, rect);
             if let Some(p) = self.pane_mut(session) {
@@ -1215,7 +1342,14 @@ impl App {
         } else if x >= self.plus_range.0 && x < self.plus_range.1 {
             self.add_tab();
         } else if let Some(i) = self.chip_at(x) {
-            self.active = i;
+            match self.chip_targets.get(i).copied() {
+                Some(ChipTarget::Term(t)) => {
+                    self.active_term = t;
+                    self.active_doc = None;
+                }
+                Some(ChipTarget::Doc(d)) => self.active_doc = Some(d),
+                None => {}
+            }
             self.request_redraw();
         }
     }
@@ -1232,24 +1366,31 @@ impl App {
         let pad = (6.0 * self.scale).round().max(2.0) as usize;
         let text_top = ((bar_h.saturating_sub(ch_px)) / 2) as i32;
 
-        let titles: Vec<String> = self
-            .tabs
-            .iter()
-            .map(|t| {
-                let s = t.root.first_session();
-                match t.root.find(if t.root.find(t.focus).is_some() { t.focus } else { s }) {
-                    Some(p) => {
-                        let g = p.term.lock().unwrap();
-                        g.title()
-                            .map(str::to_string)
-                            .or_else(|| g.current_directory().map(basename))
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or_else(|| "wsl".into())
-                    }
-                    None => "wsl".into(),
+        // Build the combined chip list: terminal tabs, then document tabs.
+        let mut chips: Vec<(String, ChipTarget, bool)> = Vec::new(); // (label, target, active)
+        for (i, t) in self.tabs.iter().enumerate() {
+            let s = t.root.first_session();
+            let label = match t.root.find(if t.root.find(t.focus).is_some() { t.focus } else { s }) {
+                Some(p) => {
+                    let g = p.term.lock().unwrap();
+                    g.title()
+                        .map(str::to_string)
+                        .or_else(|| g.current_directory().map(basename))
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "wsl".into())
                 }
-            })
-            .collect();
+                None => "wsl".into(),
+            };
+            let active = self.active_doc.is_none() && i == self.active_term;
+            chips.push((label, ChipTarget::Term(i), active));
+        }
+        for (j, d) in self.docs.iter().enumerate() {
+            let mut label = d.name.clone();
+            if d.dirty {
+                label.push('*');
+            }
+            chips.push((label, ChipTarget::Doc(j), self.active_doc == Some(j)));
+        }
 
         // Lay out panes for the active tab (also used for mouse hit-testing).
         let sb = self.sidebar_w();
@@ -1260,7 +1401,7 @@ impl App {
             h: (h as usize).saturating_sub(bar_h),
         };
         self.pane_rects.clear();
-        self.tabs[self.active].root.leaf_rects(area, &mut self.pane_rects);
+        self.tabs[self.active_term].root.leaf_rects(area, &mut self.pane_rects);
         let focus = self.focused_session();
         let rects = self.pane_rects.clone();
 
@@ -1279,17 +1420,17 @@ impl App {
         fill_rect(buf, w, h, 0, 0, w as usize, bar_h, chrome);
 
         self.chip_ranges.clear();
-        let active = self.active;
+        self.chip_targets.clear();
         let mut x = pad;
-        for (i, title) in titles.iter().enumerate() {
-            let text: String = title.chars().take(18).collect();
+        for (label, target, active) in &chips {
+            let text: String = label.chars().take(18).collect();
             let chip_w = (text.chars().count() * cw + pad * 2).clamp(40, 240);
             let x0 = x;
             let x1 = (x + chip_w).min(w as usize);
-            if i == active {
+            if *active {
                 fill_rect(buf, w, h, x0, 2, x1 - x0, bar_h.saturating_sub(4), chip_active);
             }
-            let fg = if i == active {
+            let fg = if *active {
                 self.theme.fg
             } else {
                 mix(self.theme.bg, self.theme.fg, 0.55)
@@ -1301,6 +1442,7 @@ impl App {
                 gx += cw;
             }
             self.chip_ranges.push((x0 as f32, x1 as f32));
+            self.chip_targets.push(*target);
             x = x1 + (2.0 * self.scale) as usize;
         }
         let px0 = x;
@@ -1375,14 +1517,14 @@ impl App {
             let _ = toggled_left; // (sidebar button already placed; layout is fixed width)
         }
 
-        // --- content: panes or editor overlay -----------------------------
+        // --- content: panes (terminal tab) or editor (document tab) -------
         let divider = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.18);
         let dim = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.45);
-        if self.doc.is_none() {
+        if self.active_doc.is_none() {
         for (session, rect) in &rects {
             // Snapshot this pane's state, then release its borrow.
             let (term, scroll_off, sel) = {
-                let p = match self.tabs[self.active].root.find(*session) {
+                let p = match self.tabs[self.active_term].root.find(*session) {
                     Some(p) => p,
                     None => continue,
                 };
@@ -1471,8 +1613,8 @@ impl App {
         }
         } // end: panes (no doc)
 
-        // --- editor overlay (replaces the terminal area) ------------------
-        if let Some(doc) = &self.doc {
+        // --- editor (document tab) ----------------------------------------
+        if let Some(doc) = self.active_doc.and_then(|i| self.docs.get(i)) {
             let ax = sb;
             let aw = (w as usize).saturating_sub(sb);
             let ah = (h as usize).saturating_sub(bar_h);
@@ -1484,7 +1626,7 @@ impl App {
             } else if doc.dirty {
                 header.push_str("  *");
             }
-            header.push_str("   (Ctrl+S save, Esc close)");
+            header.push_str("   (Ctrl+S save · Ctrl+Shift+W close tab)");
             fill_rect(buf, w, h, ax, bar_h, aw, ch_px, OPAQUE | mix(self.theme.bg, self.theme.fg, 0.12));
             let mut gx = ax + pad;
             for ch in header.chars().take(aw / cw) {
@@ -1548,24 +1690,50 @@ impl App {
             let line_h = ch_px;
             let visible = (h as usize).saturating_sub(bar_h) / line_h;
             let dir_color = self.theme.ansi[12]; // bright blue
+            let icon_w = cw + cw / 2; // room for a small folder/file glyph
             for (vi, ent) in
                 self.sidebar_entries.iter().skip(self.sidebar_scroll).take(visible).enumerate()
             {
-                let y = (bar_h + vi * line_h) as i32;
-                let mut label = ent.name.clone();
-                if ent.is_dir {
-                    label.push('/');
-                }
+                let y = bar_h + vi * line_h;
                 let color = if ent.is_dir { dir_color } else { self.theme.fg };
-                let mut gx = 4;
-                for ch in label.chars().take(sb / cw) {
+                // icon
+                if ent.is_dir {
+                    draw_folder_icon(buf, w, h, 5, y, ch_px, dir_color);
+                } else {
+                    draw_file_icon(buf, w, h, 5, y, ch_px, mix(self.theme.bg, self.theme.fg, 0.6));
+                }
+                // name (no trailing slash now that there's an icon)
+                let mut gx = 4 + icon_w;
+                for ch in ent.name.chars().take(sb.saturating_sub(gx) / cw) {
                     ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
-                    blit_char(buf, w, h, &self.glyph_cache, ch, gx, y, color);
+                    blit_char(buf, w, h, &self.glyph_cache, ch, gx, y as i32, color);
                     gx += cw;
                 }
             }
             fill_rect(buf, w, h, sb.saturating_sub(DIVIDER), bar_h, DIVIDER,
                 (h as usize).saturating_sub(bar_h), divider);
+        }
+
+        // --- sidebar context menu (popup) ---------------------------------
+        if let Some(menu) = &self.sidebar_menu {
+            let r = menu.rect;
+            let menu_bg = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.16);
+            let border = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.4);
+            fill_rect(buf, w, h, r.x, r.y, r.w, r.h, menu_bg);
+            fill_rect(buf, w, h, r.x, r.y, r.w, 1, border);
+            fill_rect(buf, w, h, r.x, r.y + r.h - 1, r.w, 1, border);
+            fill_rect(buf, w, h, r.x, r.y, 1, r.h, border);
+            fill_rect(buf, w, h, r.x + r.w - 1, r.y, 1, r.h, border);
+            let line_h = ch_px + 4;
+            for (i, item) in menu.items.iter().enumerate() {
+                let iy = (r.y + 2 + i * line_h) as i32;
+                let mut gx = r.x + pad;
+                for ch in item.chars() {
+                    ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
+                    blit_char(buf, w, h, &self.glyph_cache, ch, gx, iy, self.theme.fg);
+                    gx += cw;
+                }
+            }
         }
 
         if let Some(layered) = &mut self.layered {
@@ -1609,7 +1777,7 @@ impl ApplicationHandler<UserEvent> for App {
         let session = mux.open(cols as u16, rows as u16, self.start_dir.as_deref().unwrap_or(""));
         self.registry.lock().unwrap().insert(session, term.clone());
         self.tabs.push(Tab { root: Layout::Leaf(Pane::new(session, term)), focus: session });
-        self.active = 0;
+        self.active_term = 0;
         self.mux = Some(mux);
         eprintln!("[wslterm] window up {cols}x{rows}, first session {session} on {DISTRO}");
 
@@ -1729,7 +1897,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let max = self.sidebar_entries.len().saturating_sub(1) as i32;
                     self.sidebar_scroll = (self.sidebar_scroll as i32 - step).clamp(0, max) as usize;
                     self.request_redraw();
-                } else if let Some(doc) = self.doc.as_mut() {
+                } else if let Some(doc) = self.cur_doc_mut() {
                     let max = doc.lines.len().saturating_sub(1) as i32;
                     doc.scroll = (doc.scroll as i32 - step).clamp(0, max) as usize;
                     self.request_redraw();
@@ -1739,12 +1907,16 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_px = (position.x, position.y);
-                if self.tabs.get(self.active).is_some() && self.focused().selecting {
+                if self.tabs.get(self.active_term).is_some() && self.focused().selecting {
                     self.update_selection();
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
                 (MouseButton::Left, ElementState::Pressed) => {
+                    // A click anywhere dismisses/handles an open context menu first.
+                    if self.menu_click() {
+                        return;
+                    }
                     let (px, py) = self.cursor_px;
                     let size = self.win.as_ref().map(|w| w.inner_size());
                     // 1) Resize from a window edge (borderless window).
@@ -1781,7 +1953,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     } else if self.sidebar_w() > 0 && px < self.sidebar_w() as f64 {
                         self.sidebar_click();
-                    } else if self.doc.is_none() {
+                    } else if self.active_doc.is_none() {
                         self.begin_selection();
                     }
                 }
@@ -1793,12 +1965,36 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 (MouseButton::Middle, ElementState::Pressed) => {
                     if self.cursor_px.1 < self.tab_bar_h() as f64 {
-                        // Close the tab under the middle click.
+                        // Close the tab (terminal or document) under the middle click.
                         if let Some(idx) = self.chip_at(self.cursor_px.0 as f32) {
-                            self.close_whole_tab(idx, event_loop);
+                            match self.chip_targets.get(idx).copied() {
+                                Some(ChipTarget::Term(t)) => self.close_whole_tab(t, event_loop),
+                                Some(ChipTarget::Doc(d)) => {
+                                    if d < self.docs.len() {
+                                        self.docs.remove(d);
+                                    }
+                                    if self.active_doc == Some(d) {
+                                        self.active_doc = None;
+                                    } else if let Some(a) = self.active_doc {
+                                        if a > d {
+                                            self.active_doc = Some(a - 1);
+                                        }
+                                    }
+                                    self.request_redraw();
+                                }
+                                None => {}
+                            }
                         }
                     } else {
                         self.paste(); // X11-style middle-click paste in the terminal
+                    }
+                }
+                (MouseButton::Right, ElementState::Pressed) => {
+                    if self.sidebar_w() > 0
+                        && self.cursor_px.0 < self.sidebar_w() as f64
+                        && self.cursor_px.1 >= self.tab_bar_h() as f64
+                    {
+                        self.open_sidebar_menu();
                     }
                 }
                 _ => {}
@@ -2103,6 +2299,31 @@ fn resize_dir_at(px: f64, py: f64, w: u32, h: u32, scale: f32) -> Option<ResizeD
         (_, _, _, true) => East,
         _ => return None,
     })
+}
+
+/// A small filled folder glyph (for directory rows in the sidebar).
+fn draw_folder_icon(buf: &mut [u32], w: u32, h: u32, x: usize, y: usize, cell_h: usize, rgb: u32) {
+    let c = OPAQUE | (rgb & 0xFF_FFFF);
+    let s = (cell_h as f32 * 0.6) as usize;
+    let iy = y + cell_h.saturating_sub(s) / 2;
+    let tab_h = (s / 4).max(1);
+    fill_rect(buf, w, h, x, iy, s / 2, tab_h, c); // tab
+    fill_rect(buf, w, h, x, iy + tab_h, s, s - tab_h, c); // body
+}
+
+/// A small outlined "page" glyph (for file rows in the sidebar).
+fn draw_file_icon(buf: &mut [u32], w: u32, h: u32, x: usize, y: usize, cell_h: usize, rgb: u32) {
+    let c = OPAQUE | (rgb & 0xFF_FFFF);
+    let s = (cell_h as f32 * 0.6) as usize;
+    let pw = (s * 3 / 4).max(3);
+    let iy = y + cell_h.saturating_sub(s) / 2;
+    let t = 1usize;
+    fill_rect(buf, w, h, x, iy, pw, t, c); // top
+    fill_rect(buf, w, h, x, iy + s - t, pw, t, c); // bottom
+    fill_rect(buf, w, h, x, iy, t, s, c); // left
+    fill_rect(buf, w, h, x + pw - t, iy, t, s, c); // right
+    fill_rect(buf, w, h, x + t + 1, iy + s / 3, pw.saturating_sub(2 * t + 2), t, c); // line
+    fill_rect(buf, w, h, x + t + 1, iy + s / 2, pw.saturating_sub(2 * t + 2), t, c); // line
 }
 
 fn fill_rect(buf: &mut [u32], w: u32, h: u32, x: usize, y: usize, rw: usize, rh: usize, rgb: u32) {
