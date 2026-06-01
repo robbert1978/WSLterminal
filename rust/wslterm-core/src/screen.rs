@@ -333,20 +333,19 @@ impl Screen {
     pub fn scroll_up(&mut self, n: usize) {
         let n = n.min(self.bot - self.top + 1);
         for _ in 0..n {
-            let top = self.top;
+            let (top, bot) = (self.top, self.bot);
             let leaving = std::mem::take(&mut self.buf_mut()[top]);
             // Recycle a row: the line evicted from scrollback (when keeping history),
             // or the leaving line itself.
-            let reuse = if !self.buf_alt && self.top == 0 {
-                self.scrollback.push(leaving).unwrap_or_else(|| Vec::new())
+            let reuse = if !self.buf_alt && top == 0 {
+                self.scrollback.push(leaving).unwrap_or_else(Vec::new)
             } else {
                 leaving
             };
-            let (top, bot) = (self.top, self.bot);
-            for r in top..bot {
-                self.buf_mut().swap(r, r + 1);
-            }
             let cleared = self.clear_line(reuse);
+            // Shift [top+1..=bot] up one (single rotate, not bot-top swaps), then
+            // drop the cleared row in at the bottom.
+            self.buf_mut()[top..=bot].rotate_left(1);
             self.buf_mut()[bot] = cleared;
         }
     }
@@ -365,12 +364,8 @@ impl Screen {
         let n = n.min(self.bot - self.top + 1);
         for _ in 0..n {
             let (top, bot) = (self.top, self.bot);
-            let mut r = bot;
-            while r > top {
-                self.buf_mut().swap(r, r - 1);
-                r -= 1;
-            }
             let bl = self.blank_line();
+            self.buf_mut()[top..=bot].rotate_right(1);
             self.buf_mut()[top] = bl;
         }
     }
@@ -513,12 +508,8 @@ impl Screen {
         let n = n.clamp(1, self.bot - self.cy + 1);
         for _ in 0..n {
             let (cy, bot) = (self.cy, self.bot);
-            let mut r = bot;
-            while r > cy {
-                self.buf_mut().swap(r, r - 1);
-                r -= 1;
-            }
             let bl = self.blank_line();
+            self.buf_mut()[cy..=bot].rotate_right(1);
             self.buf_mut()[cy] = bl;
         }
     }
@@ -530,10 +521,8 @@ impl Screen {
         let n = n.clamp(1, self.bot - self.cy + 1);
         for _ in 0..n {
             let (cy, bot) = (self.cy, self.bot);
-            for r in cy..bot {
-                self.buf_mut().swap(r, r + 1);
-            }
             let bl = self.blank_line();
+            self.buf_mut()[cy..=bot].rotate_left(1);
             self.buf_mut()[bot] = bl;
         }
     }
