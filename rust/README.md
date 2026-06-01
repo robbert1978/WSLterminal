@@ -59,7 +59,12 @@ parity. The win is RAM, GC-free latency, and a smaller binary — not raw speed.
 - [x] `wslterm`: milestone 2 — DPI scaling (font scales with monitor
       scale_factor) + mouse-wheel scrollback (cursor hidden in history, snaps to
       bottom on input/output)
-- [ ] `wslterm`: milestone 2b — faster partial repaint, full keymap, text selection/copy
+- [x] `wslterm`: flood-survival + perf — bounded mux channel, off-thread feed,
+      glyph cache, batched feed, ASCII width fast-path (termbench TermMarkV2
+      662s -> 56s, ~40 MB, no OOM)
+- [x] `wslterm`: text selection + clipboard — drag to select, Ctrl+Shift+C copy,
+      Ctrl+Shift+V / Shift+Insert / middle-click paste (bracketed-paste aware)
+- [ ] `wslterm`: milestone 2b — faster partial repaint, full keymap, word/line select
 - [ ] `wslterm`: milestone 3 — font fallback + color emoji
 - [ ] `wslterm`: milestone 4 — translucency, tabs, panes
 - [ ] sidebar / editor / highlighting (syntect)

@@ -23,7 +23,7 @@ use std::time::Instant;
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WKey, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -40,6 +40,7 @@ const BASE_FONT_PX: f32 = 18.0;
 const DEFAULT_FG: u32 = 0xCC_CCCC; // Campbell foreground
 const DEFAULT_BG: u32 = 0x0C_0C0C; // Campbell background
 const CURSOR_RGB: u32 = 0xCC_CCCC;
+const SELECTION_BG: u32 = 0x26_4F78; // VS Code-ish selection blue
 
 /// Lightweight events from the feed thread to the UI (no payload — the data is
 /// already in the shared Terminal; this just wakes the loop to render/exit).
@@ -109,6 +110,11 @@ struct App {
     scroll_off: usize, // rows scrolled up into scrollback (0 = live bottom)
     grid: Vec<Vec<Cell>>, // reused viewport snapshot
     glyph_cache: HashMap<char, Option<Glyph>>, // rasterized once per char per size
+
+    cursor_px: (f64, f64), // last mouse position (device px)
+    selecting: bool,       // left button held, dragging a selection
+    sel_anchor: Option<(i64, i64)>, // (abs_row, col) where the drag began
+    sel: Option<(i64, i64, i64, i64)>, // normalized (r1,c1,r2,c2), abs rows, inclusive
 }
 
 impl App {
@@ -131,6 +137,10 @@ impl App {
             outbox: Arc::new(Mutex::new(Vec::new())),
             redraw_pending: Arc::new(AtomicBool::new(false)),
             mods: ModifiersState::empty(),
+            cursor_px: (0.0, 0.0),
+            selecting: false,
+            sel_anchor: None,
+            sel: None,
             scroll_off: 0,
             grid: Vec::new(),
             glyph_cache: HashMap::new(),
@@ -168,6 +178,28 @@ impl App {
         if ev.state != ElementState::Pressed {
             return;
         }
+        let ctrl = self.mods.control_key();
+        let shift = self.mods.shift_key();
+
+        // Clipboard shortcuts (don't reach the shell): Ctrl+Shift+C/V, Shift+Ins.
+        if let PhysicalKey::Code(code) = ev.physical_key {
+            match code {
+                KeyCode::KeyC if ctrl && shift => {
+                    self.copy_selection();
+                    return;
+                }
+                KeyCode::KeyV if ctrl && shift => {
+                    self.paste();
+                    return;
+                }
+                KeyCode::Insert if shift => {
+                    self.paste();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // Typing snaps the view back to the live bottom.
         if self.scroll_off != 0 {
             self.scroll_off = 0;
@@ -201,6 +233,73 @@ impl App {
         // Plain printable input: send the layout-resolved text directly.
         if let Some(text) = &ev.text {
             self.send(text.as_bytes());
+        }
+    }
+
+    /// Map the last mouse position to an (absolute row, column) cell. Absolute
+    /// rows count from the oldest scrollback line, matching `Terminal::get_text`.
+    fn cell_at_cursor(&self) -> (i64, i64) {
+        let col = (self.cursor_px.0 / self.cell_w as f64).floor() as i64;
+        let vrow = (self.cursor_px.1 / self.cell_h as f64).floor() as i64;
+        let t = self.term.lock().unwrap();
+        let cols = t.cols() as i64;
+        let top_abs = t.scrollback_count() as i64 - self.scroll_off as i64;
+        let total = t.scrollback_count() as i64 + t.rows() as i64;
+        let abs = (top_abs + vrow).clamp(0, (total - 1).max(0));
+        (abs, col.clamp(0, (cols - 1).max(0)))
+    }
+
+    fn begin_selection(&mut self) {
+        let (r, c) = self.cell_at_cursor();
+        self.sel_anchor = Some((r, c));
+        self.sel = Some((r, c, r, c));
+        self.selecting = true;
+        self.request_redraw();
+    }
+
+    fn update_selection(&mut self) {
+        if let Some((ar, ac)) = self.sel_anchor {
+            let (r, c) = self.cell_at_cursor();
+            // Order anchor and current point in reading order.
+            self.sel = Some(if (r, c) < (ar, ac) {
+                (r, c, ar, ac)
+            } else {
+                (ar, ac, r, c)
+            });
+            self.request_redraw();
+        }
+    }
+
+    fn copy_selection(&self) {
+        if let Some((r1, c1, r2, c2)) = self.sel {
+            let text = self.term.lock().unwrap().get_text(r1, c1, r2, c2);
+            if !text.is_empty() {
+                let _ = clipboard_win::set_clipboard_string(&text);
+            }
+        }
+    }
+
+    fn paste(&self) {
+        let s = match clipboard_win::get_clipboard_string() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let s = s.replace("\r\n", "\r").replace('\n', "\r");
+        let bracketed = self.term.lock().unwrap().bracketed_paste();
+        let mut out = Vec::new();
+        if bracketed {
+            out.extend_from_slice(b"\x1b[200~");
+        }
+        out.extend_from_slice(s.as_bytes());
+        if bracketed {
+            out.extend_from_slice(b"\x1b[201~");
+        }
+        self.send(&out);
+    }
+
+    fn request_redraw(&self) {
+        if let Some(win) = &self.win {
+            win.request_redraw();
         }
     }
 
@@ -252,7 +351,7 @@ impl App {
         buffer.fill(DEFAULT_BG);
 
         // Snapshot the grid under the lock, then rasterize without holding it.
-        let (cols, rows, cx, cy, cursor_on);
+        let (cols, rows, cx, cy, cursor_on, top_abs);
         {
             let t = self.term.lock().unwrap();
             let off = self.scroll_off.min(t.scrollback_count());
@@ -263,7 +362,10 @@ impl App {
             cy = t.cy();
             // Cursor only shows in the live view (not while scrolled into history).
             cursor_on = t.cursor_visible() && off == 0;
+            // Absolute row of the top visible line, for selection hit-testing.
+            top_abs = t.scrollback_count() as i64 - off as i64;
         }
+        let sel = self.sel;
 
         // Pass 1: make sure every visible glyph is rasterized into the cache.
         // (Direct field access keeps `font`/`glyph_cache` as disjoint borrows.)
@@ -302,6 +404,14 @@ impl App {
                         fg = DEFAULT_BG;
                     } else {
                         std::mem::swap(&mut fg, &mut bg);
+                    }
+                }
+                if let Some((r1, c1, r2, c2)) = sel {
+                    let (ar, ac) = (top_abs + r as i64, c as i64);
+                    let after_start = ar > r1 || (ar == r1 && ac >= c1);
+                    let before_end = ar < r2 || (ar == r2 && ac <= c2);
+                    if after_start && before_end {
+                        bg = SELECTION_BG;
                     }
                 }
 
@@ -449,6 +559,9 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Redraw => {
                 self.redraw_pending.store(false, Ordering::Release);
                 self.scroll_off = 0; // new output snaps to the live bottom
+                if !self.selecting {
+                    self.sel = None; // absolute coords shift as content scrolls
+                }
                 // Flush any DSR/DA responses the feed thread produced.
                 let out = std::mem::take(&mut *self.outbox.lock().unwrap());
                 self.send(&out);
@@ -475,6 +588,18 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 self.scroll_by(lines);
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_px = (position.x, position.y);
+                if self.selecting {
+                    self.update_selection();
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => match (button, state) {
+                (MouseButton::Left, ElementState::Pressed) => self.begin_selection(),
+                (MouseButton::Left, ElementState::Released) => self.selecting = false,
+                (MouseButton::Middle, ElementState::Pressed) => self.paste(),
+                _ => {}
+            },
             WindowEvent::Resized(size) => {
                 self.resize_surface(size.width, size.height);
                 if let Some(win) = &self.win {
