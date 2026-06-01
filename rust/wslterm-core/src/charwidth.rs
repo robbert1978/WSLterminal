@@ -2,6 +2,10 @@
 
 /// Display width of a code point: 0 for combining/zero-width, 2 for wide, else 1.
 pub fn width_of(cp: u32) -> u8 {
+    // Printable ASCII is by far the common case; skip the range tables entirely.
+    if (0x20..0x7f).contains(&cp) {
+        return 1;
+    }
     if cp == 0 {
         return 0;
     }

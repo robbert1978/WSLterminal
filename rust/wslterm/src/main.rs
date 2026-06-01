@@ -13,10 +13,12 @@
 //! buffering the whole burst — memory stays bounded. Rendering is decoupled from
 //! parsing, so a slow repaint never inflates the input queue.
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use softbuffer::{Context, Surface};
@@ -46,6 +48,42 @@ enum UserEvent {
     Closed,
 }
 
+/// A glyph rasterized once and cached: 8-bit coverage plus its pixel offset from
+/// the cell's top-left. Blitting these is just memory work — no re-outlining per
+/// frame, which is what made the renderer slow under floods.
+struct Glyph {
+    left: i32,
+    top: i32,
+    w: usize,
+    h: usize,
+    cov: Vec<u8>,
+}
+
+/// Rasterize one char at the given pixel size; `None` if it has no outline (e.g.
+/// space). Coords are relative to the cell origin (pen at baseline y = ascent).
+fn rasterize_glyph(font: &FontVec, px: f32, ch: char) -> Option<Glyph> {
+    let scale = PxScale::from(px);
+    let ascent = font.as_scaled(scale).ascent();
+    let g = font
+        .glyph_id(ch)
+        .with_scale_and_position(scale, ab_glyph::point(0.0, ascent));
+    let outline = font.outline_glyph(g)?;
+    let b = outline.px_bounds();
+    let w = b.width().ceil() as usize;
+    let h = b.height().ceil() as usize;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut cov = vec![0u8; w * h];
+    outline.draw(|gx, gy, c| {
+        let (xi, yi) = (gx as usize, gy as usize);
+        if xi < w && yi < h {
+            cov[yi * w + xi] = (c * 255.0) as u8;
+        }
+    });
+    Some(Glyph { left: b.min.x.floor() as i32, top: b.min.y.floor() as i32, w, h, cov })
+}
+
 struct App {
     proxy: EventLoopProxy<UserEvent>,
     win: Option<Rc<Window>>,
@@ -70,6 +108,7 @@ struct App {
     mods: ModifiersState,
     scroll_off: usize, // rows scrolled up into scrollback (0 = live bottom)
     grid: Vec<Vec<Cell>>, // reused viewport snapshot
+    glyph_cache: HashMap<char, Option<Glyph>>, // rasterized once per char per size
 }
 
 impl App {
@@ -94,6 +133,7 @@ impl App {
             mods: ModifiersState::empty(),
             scroll_off: 0,
             grid: Vec::new(),
+            glyph_cache: HashMap::new(),
         };
         app.recompute_metrics();
         app
@@ -106,6 +146,7 @@ impl App {
         self.ascent = sf.ascent();
         self.cell_h = (sf.ascent() - sf.descent() + sf.line_gap()).ceil().max(1.0) as usize;
         self.cell_w = sf.h_advance(self.font.glyph_id('M')).ceil().max(1.0) as usize;
+        self.glyph_cache.clear(); // cached glyphs are size-specific
     }
 
     fn grid_dims(&self, w: u32, h: u32) -> (usize, usize) {
@@ -224,7 +265,24 @@ impl App {
             cursor_on = t.cursor_visible() && off == 0;
         }
 
-        let scale = PxScale::from(self.font_px);
+        // Pass 1: make sure every visible glyph is rasterized into the cache.
+        // (Direct field access keeps `font`/`glyph_cache` as disjoint borrows.)
+        for r in 0..rows.min(self.grid.len()) {
+            for c in 0..cols.min(self.grid[r].len()) {
+                let rune = self.grid[r][c].rune;
+                if rune < 0x20 {
+                    continue;
+                }
+                let ch = char::from_u32(rune).unwrap_or(' ');
+                if ch != ' ' && !self.glyph_cache.contains_key(&ch) {
+                    let g = rasterize_glyph(&self.font, self.font_px, ch);
+                    self.glyph_cache.insert(ch, g);
+                }
+            }
+        }
+
+        // Pass 2: fill backgrounds and blit cached glyph coverage.
+        let (cw, ch_px) = (self.cell_w, self.cell_h);
         for r in 0..rows.min(self.grid.len()) {
             let row = &self.grid[r];
             for c in 0..cols.min(row.len()) {
@@ -247,28 +305,34 @@ impl App {
                     }
                 }
 
-                let x0 = c * self.cell_w;
-                let y0 = r * self.cell_h;
-                fill_rect(&mut buffer, w, h, x0, y0, self.cell_w, self.cell_h, bg);
+                let x0 = c * cw;
+                let y0 = r * ch_px;
+                fill_rect(&mut buffer, w, h, x0, y0, cw, ch_px, bg);
 
-                let ch = char::from_u32(cell.rune).unwrap_or(' ');
-                if cell.rune >= 0x20 && ch != ' ' {
-                    let baseline = y0 as f32 + self.ascent;
-                    let glyph = self
-                        .font
-                        .glyph_id(ch)
-                        .with_scale_and_position(scale, ab_glyph::point(x0 as f32, baseline));
-                    if let Some(outline) = self.font.outline_glyph(glyph) {
-                        let bounds = outline.px_bounds();
-                        outline.draw(|gx, gy, cov| {
-                            let px = bounds.min.x as i32 + gx as i32;
-                            let py = bounds.min.y as i32 + gy as i32;
-                            if px < 0 || py < 0 || px as u32 >= w || py as u32 >= h {
-                                return;
+                if cell.rune < 0x20 {
+                    continue;
+                }
+                let glyph_ch = char::from_u32(cell.rune).unwrap_or(' ');
+                if let Some(Some(g)) = self.glyph_cache.get(&glyph_ch) {
+                    for gy in 0..g.h {
+                        let py = y0 as i32 + g.top + gy as i32;
+                        if py < 0 || py as u32 >= h {
+                            continue;
+                        }
+                        let base = py as usize * w as usize;
+                        let row_cov = &g.cov[gy * g.w..gy * g.w + g.w];
+                        for gx in 0..g.w {
+                            let cov = row_cov[gx];
+                            if cov == 0 {
+                                continue;
                             }
-                            let idx = py as usize * w as usize + px as usize;
-                            buffer[idx] = blend(buffer[idx], fg, cov);
-                        });
+                            let px = x0 as i32 + g.left + gx as i32;
+                            if px < 0 || px as u32 >= w {
+                                continue;
+                            }
+                            let idx = base + px as usize;
+                            buffer[idx] = blend(buffer[idx], fg, cov as f32 / 255.0);
+                        }
                     }
                 }
             }
@@ -320,28 +384,55 @@ impl ApplicationHandler<UserEvent> for App {
         std::thread::Builder::new()
             .name("wsl-feed".into())
             .spawn(move || {
-                while let Ok(ev) = rx.recv() {
-                    match ev {
-                        MuxEvent::Data { id, bytes } if id == session => {
-                            let mut t = term.lock().unwrap();
-                            t.feed(&bytes);
-                            if !t.respond.is_empty() {
-                                let resp = std::mem::take(&mut t.respond);
-                                drop(t);
-                                outbox.lock().unwrap().extend_from_slice(&resp);
+                let mut acc: u64 = 0;
+                let mut mark = Instant::now();
+                let mut resp_batch: Vec<u8> = Vec::new();
+                // Block for the next frame, then drain ALL queued frames under one
+                // lock before waking the UI. Batching amortizes lock + wake cost
+                // (the per-frame churn that was capping feed throughput) and lets
+                // the parser run near full speed under a flood.
+                while let Ok(first) = rx.recv() {
+                    let mut ev = first;
+                    let mut t = term.lock().unwrap();
+                    loop {
+                        match ev {
+                            MuxEvent::Data { id, bytes } if id == session => {
+                                acc += bytes.len() as u64;
+                                t.feed(&bytes);
+                                if !t.respond.is_empty() {
+                                    resp_batch.append(&mut t.respond);
+                                }
                             }
-                            // Coalesce: only wake if no redraw is already queued.
-                            if !pending.swap(true, Ordering::AcqRel)
-                                && proxy.send_event(UserEvent::Redraw).is_err()
-                            {
+                            MuxEvent::Exit { id, .. } if id == session => {
+                                drop(t);
+                                let _ = proxy.send_event(UserEvent::Closed);
                                 return;
                             }
+                            _ => {}
                         }
-                        MuxEvent::Exit { id, .. } if id == session => {
-                            let _ = proxy.send_event(UserEvent::Closed);
-                            return;
+                        match rx.try_recv() {
+                            Ok(next) => ev = next,
+                            Err(_) => break, // nothing more queued right now
                         }
-                        _ => {}
+                    }
+                    drop(t);
+
+                    if !resp_batch.is_empty() {
+                        outbox.lock().unwrap().append(&mut resp_batch);
+                    }
+                    let dt = mark.elapsed().as_secs_f64();
+                    if dt >= 1.0 {
+                        if acc > 0 {
+                            eprintln!("[feed] {:.1} MB/s", acc as f64 / 1e6 / dt);
+                        }
+                        acc = 0;
+                        mark = Instant::now();
+                    }
+                    // Coalesce: only wake if no redraw is already queued.
+                    if !pending.swap(true, Ordering::AcqRel)
+                        && proxy.send_event(UserEvent::Redraw).is_err()
+                    {
+                        return;
                     }
                 }
                 let _ = proxy.send_event(UserEvent::Closed);
