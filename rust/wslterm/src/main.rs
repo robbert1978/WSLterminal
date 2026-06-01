@@ -25,7 +25,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WKey, KeyCode, ModifiersState, NamedKey, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Icon, Window, WindowId};
 
 use wslterm_core::input::{self, Key, Mods};
 use wslterm_core::{Cell, CellFlags, Terminal};
@@ -408,6 +408,7 @@ struct App {
     // Hit-test caches (device px), recomputed each render.
     chip_ranges: Vec<(f32, f32)>,
     plus_range: (f32, f32),
+    sidebar_btn: (f32, f32), // sidebar toggle button x-range in the tab bar
     pane_rects: Vec<(u32, Rect)>, // active tab's leaf rects
 
     // File sidebar + editor overlay.
@@ -452,6 +453,7 @@ impl App {
             glyph_cache: HashMap::new(),
             chip_ranges: Vec::new(),
             plus_range: (0.0, 0.0),
+            sidebar_btn: (0.0, 0.0),
             pane_rects: Vec::new(),
             sidebar_open: false,
             show_hidden: false,
@@ -1056,7 +1058,9 @@ impl App {
 
     fn tab_bar_click(&mut self) {
         let x = self.cursor_px.0 as f32;
-        if x >= self.plus_range.0 && x < self.plus_range.1 {
+        if x >= self.sidebar_btn.0 && x < self.sidebar_btn.1 {
+            self.toggle_sidebar();
+        } else if x >= self.plus_range.0 && x < self.plus_range.1 {
             self.add_tab();
         } else if let Some(i) = self.chip_at(x) {
             self.active = i;
@@ -1157,6 +1161,35 @@ impl App {
         blit_char(buf, w, h, &self.glyph_cache, '+', px0 + pad, text_top,
             mix(self.theme.bg, self.theme.fg, 0.7));
         self.plus_range = (px0 as f32, px1 as f32);
+
+        // Sidebar toggle button (right edge of the tab bar): a panel-with-divider
+        // icon drawn with rects, highlighted when the sidebar is open.
+        {
+            let bw = bar_h;
+            let bx0 = (w as usize).saturating_sub(bw + pad);
+            if self.sidebar_open {
+                fill_rect(buf, w, h, bx0, 2, bw, bar_h.saturating_sub(4), chip_active);
+            }
+            let fc = if self.sidebar_open {
+                self.theme.selection
+            } else {
+                mix(self.theme.bg, self.theme.fg, 0.7)
+            };
+            let s = (bar_h as f32 * 0.55) as usize;
+            let ix = bx0 + (bw - s) / 2;
+            let iy = (bar_h - s) / 2;
+            let t = (1.5 * self.scale).round().max(1.0) as usize;
+            fill_rect(buf, w, h, ix, iy, s, t, fc); // top
+            fill_rect(buf, w, h, ix, iy + s - t, s, t, fc); // bottom
+            fill_rect(buf, w, h, ix, iy, t, s, fc); // left
+            fill_rect(buf, w, h, ix + s - t, iy, t, s, fc); // right
+            let dvx = ix + s * 35 / 100;
+            fill_rect(buf, w, h, dvx, iy, t, s, fc); // panel divider
+            if self.sidebar_open {
+                fill_rect(buf, w, h, ix + t, iy + t, dvx.saturating_sub(ix + t), s.saturating_sub(2 * t), fc);
+            }
+            self.sidebar_btn = (bx0 as f32, (bx0 + bw) as f32);
+        }
 
         // --- content: panes or editor overlay -----------------------------
         let divider = mix(self.theme.bg, self.theme.fg, 0.18);
@@ -1348,7 +1381,8 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("WSL Terminal (Rust)")
+            .with_title("WSL Terminal")
+            .with_window_icon(load_window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
         let win = Rc::new(event_loop.create_window(attrs).expect("create window"));
         self.scale = win.scale_factor() as f32;
@@ -1698,6 +1732,15 @@ fn set_window_opacity(window: &Window, opacity: f32) {
 
 #[cfg(not(windows))]
 fn set_window_opacity(_window: &Window, _opacity: f32) {}
+
+/// Decode the bundled WSL icon (largest frame) into a winit window icon.
+fn load_window_icon() -> Option<Icon> {
+    const ICON: &[u8] = include_bytes!("../wsl.ico");
+    let dir = ico::IconDir::read(std::io::Cursor::new(ICON)).ok()?;
+    let entry = dir.entries().iter().max_by_key(|e| e.width())?;
+    let img = entry.decode().ok()?;
+    Icon::from_rgba(img.rgba_data().to_vec(), img.width(), img.height()).ok()
+}
 
 fn load_monospace_font(family: &str) -> Option<FontVec> {
     let fam = family.to_ascii_lowercase();
