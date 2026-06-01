@@ -56,7 +56,10 @@ parity. The win is RAM, GC-free latency, and a smaller binary — not raw speed.
       renders the core grid (SGR color, wide glyphs, block cursor) fed by a live
       `wslterm-pty` WSL session; keystrokes encoded via `core::input`. Verified on
       Windows: live zsh prompt renders, ~19 MB RSS (vs ~150 MB on WPF).
-- [ ] `wslterm`: milestone 2 — scrollback view, faster repaint, full keymap
+- [x] `wslterm`: milestone 2 — DPI scaling (font scales with monitor
+      scale_factor) + mouse-wheel scrollback (cursor hidden in history, snaps to
+      bottom on input/output)
+- [ ] `wslterm`: milestone 2b — faster partial repaint, full keymap, text selection/copy
 - [ ] `wslterm`: milestone 3 — font fallback + color emoji
 - [ ] `wslterm`: milestone 4 — translucency, tabs, panes
 - [ ] sidebar / editor / highlighting (syntect)
