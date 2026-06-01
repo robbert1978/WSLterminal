@@ -21,7 +21,7 @@ use std::time::Instant;
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WKey, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Icon, ResizeDirection, Window, WindowId};
 
@@ -67,11 +67,11 @@ struct Glyph {
     cov: Vec<u8>,
 }
 
-/// Rasterize one char at the given pixel size; `None` if it has no outline (e.g.
-/// space). Coords are relative to the cell origin (pen at baseline y = ascent).
-fn rasterize_glyph(font: &FontVec, px: f32, ch: char) -> Option<Glyph> {
+/// Rasterize one char from `font` at pixel size `px`, positioned on the baseline
+/// `ascent` (passed in so fallback glyphs align to the primary font's baseline).
+/// `None` if it has no outline (e.g. space, or a color/bitmap-only emoji glyph).
+fn rasterize_glyph(font: &FontVec, px: f32, ascent: f32, ch: char) -> Option<Glyph> {
     let scale = PxScale::from(px);
-    let ascent = font.as_scaled(scale).ascent();
     let g = font
         .glyph_id(ch)
         .with_scale_and_position(scale, ab_glyph::point(0.0, ascent));
@@ -458,7 +458,14 @@ struct App {
     layered: Option<Layered>,
     fb: Vec<u32>, // ARGB framebuffer (alpha in high byte)
 
+    // Frame pacing: coalesce feed-driven redraws to the monitor refresh so heavy
+    // output (termbench) presents smoothly instead of as fast as the loop spins.
+    want_frame: bool,
+    last_frame: Instant,
+    frame_interval: std::time::Duration,
+
     font: FontVec,
+    fallback: Vec<FontVec>, // for glyphs the primary font lacks (CJK, Cyrillic, symbols)
     font_family: String,
     scale: f32,
     font_pts: f32,
@@ -527,7 +534,11 @@ impl App {
             win: None,
             layered: None,
             fb: Vec::new(),
+            want_frame: false,
+            last_frame: Instant::now(),
+            frame_interval: std::time::Duration::from_millis(16),
             font,
+            fallback: load_fallback_fonts(),
             font_family: cfg.font_family.clone(),
             scale: 1.0,
             font_pts: cfg.font_pts,
@@ -585,7 +596,17 @@ impl App {
         }
         let cwd = self.focused_cwd();
         let dir = if cwd.is_empty() { "/".to_string() } else { cwd };
-        self.sidebar_entries = wslfiles::list(DISTRO, &dir, self.show_hidden);
+        let mut entries = wslfiles::list(DISTRO, &dir, self.show_hidden);
+        // Prepend a ".." parent entry (unless at root), like the C# sidebar.
+        if dir != "/" {
+            let trimmed = dir.trim_end_matches('/');
+            let parent = match trimmed.rsplit_once('/') {
+                Some((p, _)) if !p.is_empty() => p.to_string(),
+                _ => "/".to_string(),
+            };
+            entries.insert(0, wslfiles::Entry { name: "..".into(), linux_path: parent, is_dir: true });
+        }
+        self.sidebar_entries = entries;
         self.sidebar_dir = dir;
         self.sidebar_scroll = 0;
     }
@@ -1421,7 +1442,37 @@ impl App {
 
         self.chip_ranges.clear();
         self.chip_targets.clear();
-        let mut x = pad;
+
+        // Sidebar toggle button on the LEFT (like the C# app): a panel-with-
+        // divider icon, highlighted when the sidebar is open.
+        {
+            let bw = bar_h;
+            if self.sidebar_open {
+                fill_rect(buf, w, h, 0, 2, bw, bar_h.saturating_sub(4), chip_active);
+            }
+            let fc = OPAQUE
+                | if self.sidebar_open {
+                    self.theme.selection
+                } else {
+                    mix(self.theme.bg, self.theme.fg, 0.7)
+                };
+            let s = (bar_h as f32 * 0.55) as usize;
+            let ix = (bw - s) / 2;
+            let iy = (bar_h - s) / 2;
+            let t = (1.5 * self.scale).round().max(1.0) as usize;
+            fill_rect(buf, w, h, ix, iy, s, t, fc);
+            fill_rect(buf, w, h, ix, iy + s - t, s, t, fc);
+            fill_rect(buf, w, h, ix, iy, t, s, fc);
+            fill_rect(buf, w, h, ix + s - t, iy, t, s, fc);
+            let dvx = ix + s * 35 / 100;
+            fill_rect(buf, w, h, dvx, iy, t, s, fc);
+            if self.sidebar_open {
+                fill_rect(buf, w, h, ix + t, iy + t, dvx.saturating_sub(ix + t), s.saturating_sub(2 * t), fc);
+            }
+            self.sidebar_btn = (0.0, bw as f32);
+        }
+
+        let mut x = bar_h + pad; // tab chips start right of the sidebar button
         for (label, target, active) in &chips {
             let text: String = label.chars().take(18).collect();
             let chip_w = (text.chars().count() * cw + pad * 2).clamp(40, 240);
@@ -1437,7 +1488,7 @@ impl App {
             };
             let mut gx = x0 + pad;
             for ch in text.chars() {
-                ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
+                ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
                 blit_char(buf, w, h, &self.glyph_cache, ch, gx, text_top, fg);
                 gx += cw;
             }
@@ -1447,41 +1498,10 @@ impl App {
         }
         let px0 = x;
         let px1 = (x + cw + pad * 2).min(w as usize);
-        ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, '+');
+        ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, '+');
         blit_char(buf, w, h, &self.glyph_cache, '+', px0 + pad, text_top,
             mix(self.theme.bg, self.theme.fg, 0.7));
         self.plus_range = (px0 as f32, px1 as f32);
-
-        // Sidebar toggle button (right edge of the tab bar): a panel-with-divider
-        // icon drawn with rects, highlighted when the sidebar is open.
-        {
-            let bw = bar_h;
-            // Left of the 3 window-control buttons (min/max/close).
-            let bx0 = (w as usize).saturating_sub(bw * 4);
-            if self.sidebar_open {
-                fill_rect(buf, w, h, bx0, 2, bw, bar_h.saturating_sub(4), chip_active);
-            }
-            let fc = OPAQUE
-                | if self.sidebar_open {
-                    self.theme.selection
-                } else {
-                    mix(self.theme.bg, self.theme.fg, 0.7)
-                };
-            let s = (bar_h as f32 * 0.55) as usize;
-            let ix = bx0 + (bw - s) / 2;
-            let iy = (bar_h - s) / 2;
-            let t = (1.5 * self.scale).round().max(1.0) as usize;
-            fill_rect(buf, w, h, ix, iy, s, t, fc); // top
-            fill_rect(buf, w, h, ix, iy + s - t, s, t, fc); // bottom
-            fill_rect(buf, w, h, ix, iy, t, s, fc); // left
-            fill_rect(buf, w, h, ix + s - t, iy, t, s, fc); // right
-            let dvx = ix + s * 35 / 100;
-            fill_rect(buf, w, h, dvx, iy, t, s, fc); // panel divider
-            if self.sidebar_open {
-                fill_rect(buf, w, h, ix + t, iy + t, dvx.saturating_sub(ix + t), s.saturating_sub(2 * t), fc);
-            }
-            self.sidebar_btn = (bx0 as f32, (bx0 + bw) as f32);
-        }
 
         // Window controls (right edge): minimize, maximize, close.
         {
@@ -1505,7 +1525,7 @@ impl App {
             fill_rect(buf, w, h, mx + sq - t, my, t, sq, OPAQUE | fg);
             // close: an X (drawn as a filled box tinted red on the glyph)
             let cxx = close_x + bw / 2;
-            ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, 'x');
+            ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, 'x');
             blit_char(buf, w, h, &self.glyph_cache, 'x', cxx - cw / 2, text_top, 0xE0_6C75);
             self.win_btns = [
                 (min_x as f32, (min_x + bw) as f32),
@@ -1550,7 +1570,7 @@ impl App {
                     let rune = self.grid[r][c].rune;
                     if rune >= 0x20 {
                         if let Some(ch) = char::from_u32(rune) {
-                            ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
+                            ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
                         }
                     }
                 }
@@ -1630,7 +1650,7 @@ impl App {
             fill_rect(buf, w, h, ax, bar_h, aw, ch_px, OPAQUE | mix(self.theme.bg, self.theme.fg, 0.12));
             let mut gx = ax + pad;
             for ch in header.chars().take(aw / cw) {
-                ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
+                ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
                 blit_char(buf, w, h, &self.glyph_cache, ch, gx, bar_h as i32, self.theme.fg);
                 gx += cw;
             }
@@ -1650,7 +1670,7 @@ impl App {
                 let num = format!("{:>w$} ", li + 1, w = gutter - 1);
                 let mut gx = ax;
                 for ch in num.chars() {
-                    ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
+                    ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
                     blit_char(buf, w, h, &self.glyph_cache, ch, gx, y, dim);
                     gx += cw;
                 }
@@ -1670,7 +1690,7 @@ impl App {
                         break;
                     }
                     let color = colors.get(i).copied().unwrap_or(self.theme.fg);
-                    ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
+                    ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
                     blit_char(buf, w, h, &self.glyph_cache, ch, gx, y, color);
                     gx += cw;
                 }
@@ -1705,7 +1725,7 @@ impl App {
                 // name (no trailing slash now that there's an icon)
                 let mut gx = 4 + icon_w;
                 for ch in ent.name.chars().take(sb.saturating_sub(gx) / cw) {
-                    ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
+                    ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
                     blit_char(buf, w, h, &self.glyph_cache, ch, gx, y as i32, color);
                     gx += cw;
                 }
@@ -1729,7 +1749,7 @@ impl App {
                 let iy = (r.y + 2 + i * line_h) as i32;
                 let mut gx = r.x + pad;
                 for ch in item.chars() {
-                    ensure_glyph(&self.font, &mut self.glyph_cache, self.font_px, ch);
+                    ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
                     blit_char(buf, w, h, &self.glyph_cache, ch, gx, iy, self.theme.fg);
                     gx += cw;
                 }
@@ -1739,6 +1759,8 @@ impl App {
         if let Some(layered) = &mut self.layered {
             layered.present(&self.fb, w, h);
         }
+        self.last_frame = Instant::now();
+        self.want_frame = false;
     }
 }
 
@@ -1758,6 +1780,13 @@ impl ApplicationHandler<UserEvent> for App {
         let win = Rc::new(event_loop.create_window(attrs).expect("create window"));
         self.scale = win.scale_factor() as f32;
         self.recompute_metrics();
+        // Pace presents to the monitor refresh (fallback 60 Hz).
+        self.frame_interval = win
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            .filter(|&mhz| mhz > 0)
+            .map(|mhz| std::time::Duration::from_secs_f64(1000.0 / mhz as f64))
+            .unwrap_or(std::time::Duration::from_millis(16));
 
         if let Some(hwnd) = hwnd_of(&win) {
             self.layered = Some(Layered::new(hwnd));
@@ -1865,7 +1894,8 @@ impl ApplicationHandler<UserEvent> for App {
                         self.refresh_sidebar();
                     }
                 }
-                self.request_redraw();
+                // Pace the actual present to the monitor refresh (about_to_wait).
+                self.want_frame = true;
             }
             UserEvent::SessionExit(id) => {
                 self.close_session(id, true, event_loop);
@@ -1874,6 +1904,24 @@ impl ApplicationHandler<UserEvent> for App {
                 eprintln!("[wslterm] mux ended");
                 event_loop.exit();
             }
+        }
+    }
+
+    /// Frame pacing: when output is pending, present at most once per monitor
+    /// refresh — repaint when the interval elapses, otherwise sleep until then.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.want_frame {
+            let target = self.last_frame + self.frame_interval;
+            if Instant::now() >= target {
+                if let Some(win) = &self.win {
+                    win.request_redraw();
+                }
+                event_loop.set_control_flow(ControlFlow::Wait);
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(target));
+            }
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 
@@ -2076,12 +2124,51 @@ fn mix(a: u32, b: u32, t: f32) -> u32 {
     (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
-/// Rasterize `ch` into the cache if not already present (free fn so it borrows
-/// only `font`/`cache`, not all of `self`, while the surface buffer is alive).
-fn ensure_glyph(font: &FontVec, cache: &mut HashMap<char, Option<Glyph>>, px: f32, ch: char) {
-    if ch != ' ' && !ch.is_control() && !cache.contains_key(&ch) {
-        cache.insert(ch, rasterize_glyph(font, px, ch));
+/// Rasterize `ch` into the cache if not already present, using the primary font
+/// or the first fallback font that has the glyph (so CJK/Cyrillic/symbol glyphs
+/// missing from the primary still render). All glyphs share the primary baseline.
+fn ensure_glyph(
+    primary: &FontVec,
+    fallback: &[FontVec],
+    cache: &mut HashMap<char, Option<Glyph>>,
+    px: f32,
+    ch: char,
+) {
+    if ch == ' ' || ch.is_control() || cache.contains_key(&ch) {
+        return;
     }
+    let ascent = primary.as_scaled(PxScale::from(px)).ascent();
+    let font = if primary.glyph_id(ch).0 != 0 {
+        primary
+    } else {
+        fallback.iter().find(|f| f.glyph_id(ch).0 != 0).unwrap_or(primary)
+    };
+    cache.insert(ch, rasterize_glyph(font, px, ascent, ch));
+}
+
+/// Load fallback fonts for glyphs the primary monospace font lacks. Color emoji
+/// (CBDT/COLR) still won't render in color — that needs a color-glyph renderer.
+fn load_fallback_fonts() -> Vec<FontVec> {
+    let mut v = Vec::new();
+    let candidates: &[(&str, bool)] = &[
+        (r"C:\Windows\Fonts\segoeui.ttf", false),  // Latin/Cyrillic/Greek/diacritics
+        (r"C:\Windows\Fonts\seguisym.ttf", false), // symbols, arrows, misc
+        (r"C:\Windows\Fonts\msgothic.ttc", true),  // CJK incl. (half-width) katakana
+        (r"C:\Windows\Fonts\seguiemj.ttf", false), // emoji (monochrome outline at best)
+    ];
+    for &(path, ttc) in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            let font = if ttc {
+                FontVec::try_from_vec_and_index(bytes, 0)
+            } else {
+                FontVec::try_from_vec(bytes)
+            };
+            if let Ok(f) = font {
+                v.push(f);
+            }
+        }
+    }
+    v
 }
 
 /// Blit a cached glyph with its top-left cell at (x, cell_top) in color `fg`.
