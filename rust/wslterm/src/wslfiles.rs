@@ -50,22 +50,7 @@ pub fn list(distro: &str, linux_dir: &str, show_hidden: bool) -> Vec<Entry> {
     dirs
 }
 
-/// Read a file's bytes, capped at `max` (default 2 MiB). `None` on error.
-pub fn read_bytes(distro: &str, linux_path: &str, max: usize) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(to_unc(distro, linux_path)).ok()?;
-    if bytes.len() > max {
-        Some(bytes[..max].to_vec())
-    } else {
-        Some(bytes)
-    }
-}
-
 /// Overwrite a WSL file with UTF-8 text (in place; keeps inode/permissions).
 pub fn write_text(distro: &str, linux_path: &str, text: &str) -> bool {
     std::fs::write(to_unc(distro, linux_path), text.as_bytes()).is_ok()
-}
-
-/// True if the first chunk looks binary (contains a NUL).
-pub fn looks_binary(bytes: &[u8]) -> bool {
-    bytes.iter().take(8000).any(|&b| b == 0)
 }

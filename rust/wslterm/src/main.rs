@@ -346,48 +346,6 @@ fn hl_theme() -> &'static syntect::highlighting::Theme {
 }
 
 impl Doc {
-    fn from_text(name: &str, text: &str, bytes_for_binary_check: &[u8]) -> Doc {
-        let readonly = wslfiles::looks_binary(bytes_for_binary_check);
-        let lines: Vec<Vec<char>> = if text.is_empty() {
-            vec![Vec::new()]
-        } else {
-            text.split('\n').map(|l| l.trim_end_matches('\r').chars().collect()).collect()
-        };
-        Doc {
-            path: String::new(),
-            name: name.to_string(),
-            lines,
-            cy: 0,
-            cx: 0,
-            scroll: 0,
-            dirty: false,
-            readonly,
-            win_path: None,
-            is_settings: false,
-            hl: Vec::new(),
-        }
-    }
-
-    fn open(distro: &str, linux_path: &str, name: &str) -> Doc {
-        let bytes = wslfiles::read_bytes(distro, linux_path, 2 * 1024 * 1024).unwrap_or_default();
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        let mut d = Doc::from_text(name, &text, &bytes);
-        d.path = linux_path.to_string();
-        d.rehighlight();
-        d
-    }
-
-    /// Open a Windows-side file (used for settings.json) for editing.
-    fn open_windows(path: std::path::PathBuf, name: &str, is_settings: bool) -> Doc {
-        let bytes = std::fs::read(&path).unwrap_or_default();
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        let mut d = Doc::from_text(name, &text, &bytes);
-        d.win_path = Some(path);
-        d.is_settings = is_settings;
-        d.rehighlight();
-        d
-    }
-
     /// Recompute per-line syntax-highlight runs (by file extension). Skipped for
     /// very large files to keep editing snappy.
     fn rehighlight(&mut self) {
@@ -527,6 +485,8 @@ struct App {
     ascent: f32,
     theme: Theme,
     opacity: f32,
+    editor: String, // command to open files (in a new terminal tab)
+    settings_session: Option<u32>, // the edit.exe tab editing settings.json; reload on its exit
     background: BackgroundImage,
 
     mux: Option<WslMux>,
@@ -612,6 +572,8 @@ impl App {
             ascent: 0.0,
             theme: cfg.theme,
             opacity: parse_opacity_env().unwrap_or(cfg.opacity),
+            editor: cfg.editor,
+            settings_session: None,
             background: BackgroundImage::load(cfg.background),
             mux: None,
             registry: Arc::new(Mutex::new(HashMap::new())),
@@ -733,8 +695,9 @@ impl App {
         self.list_sidebar_dir(dir);
     }
 
-    /// Open settings.json in the editor (Ctrl+,). Creates it with current values
-    /// if missing; saving (Ctrl+S) reloads + applies live.
+    /// Edit settings.json (Ctrl+,) with Windows `edit.exe` in a new terminal tab
+    /// (via WSL interop). Creates the file with current values if missing; settings
+    /// are reloaded + applied when the editor tab closes (see `close_session`).
     fn open_settings(&mut self) {
         let path = match Settings::path() {
             Some(p) => p,
@@ -746,7 +709,16 @@ impl App {
             }
             let _ = std::fs::write(&path, self.settings_json());
         }
-        self.open_doc(Doc::open_windows(path, "settings.json", true));
+        // Open the session in the file's dir (as a /mnt path) so interop hands
+        // edit.exe the translated Windows cwd; it then opens the relative filename.
+        let dir = path
+            .parent()
+            .map(|p| bootstrap::windows_to_wsl_path(&p.to_string_lossy()))
+            .unwrap_or_default();
+        let file = path.file_name().and_then(|f| f.to_str()).unwrap_or("settings.json");
+        let esc = file.replace('\'', "'\\''");
+        let cmd = format!("'/mnt/c/WINDOWS/system32/edit.exe' '{esc}'");
+        self.settings_session = self.open_editor_tab(&dir, &cmd);
     }
 
     /// Serialize the current appearance to the settings.json schema.
@@ -761,7 +733,7 @@ impl App {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         format!(
-            "{{\n  \"FontFamily\": {},\n  \"FontSize\": {},\n  \"Background\": {},\n  \"Foreground\": {},\n  \"Cursor\": {},\n  \"Selection\": {},\n  \"Opacity\": {},\n  \"BackgroundImage\": {},\n  \"BackgroundImageOpacity\": {},\n  \"BackgroundImageFit\": {},\n  \"Ansi\": [{}]\n}}\n",
+            "{{\n  \"FontFamily\": {},\n  \"FontSize\": {},\n  \"Background\": {},\n  \"Foreground\": {},\n  \"Cursor\": {},\n  \"Selection\": {},\n  \"Opacity\": {},\n  \"Editor\": {},\n  \"BackgroundImage\": {},\n  \"BackgroundImageOpacity\": {},\n  \"BackgroundImageFit\": {},\n  \"Ansi\": [{}]\n}}\n",
             js(&self.font_family),
             self.font_pts_base,
             hx(self.theme.bg),
@@ -769,6 +741,7 @@ impl App {
             hx(self.theme.cursor),
             hx(self.theme.selection),
             (self.opacity * 100.0).round() as u32,
+            js(&self.editor),
             js(&bg_path),
             (bg.opacity * 100.0).round() as u32,
             js(bg.fit.as_str()),
@@ -781,6 +754,7 @@ impl App {
         let cfg = Settings::load();
         self.theme = cfg.theme;
         self.opacity = cfg.opacity;
+        self.editor = cfg.editor;
         self.background = BackgroundImage::load(cfg.background);
         self.font_pts = cfg.font_pts;
         self.font_pts_base = cfg.font_pts;
@@ -834,16 +808,17 @@ impl App {
             Some(i) => i,
             None => return,
         };
-        let (is_dir, lp, name) = {
+        let (is_dir, lp) = {
             let e = &self.sidebar_entries[idx];
-            (e.is_dir, e.linux_path.clone(), e.name.clone())
+            (e.is_dir, e.linux_path.clone())
         };
         if is_dir {
             // Browse into the folder in the panel only — do NOT cd the shell.
             // The panel follows the shell's cwd only on a manual `cd`.
             self.list_sidebar_dir(lp);
         } else {
-            self.open_doc(Doc::open(DISTRO, &lp, &name));
+            // Open the file in the configured editor in a new terminal tab.
+            self.open_in_editor(&lp);
         }
         self.request_redraw();
     }
@@ -894,8 +869,8 @@ impl App {
             Some(s) => *s,
             None => return true,
         };
-        let (is_dir, lp, name) = match self.sidebar_entries.get(menu.entry) {
-            Some(e) => (e.is_dir, e.linux_path.clone(), e.name.clone()),
+        let (is_dir, lp) = match self.sidebar_entries.get(menu.entry) {
+            Some(e) => (e.is_dir, e.linux_path.clone()),
             None => return true,
         };
         match item {
@@ -904,7 +879,7 @@ impl App {
                 if is_dir {
                     self.list_sidebar_dir(lp); // browse in the panel; don't cd the shell
                 } else {
-                    self.open_doc(Doc::open(DISTRO, &lp, &name));
+                    self.open_in_editor(&lp); // open in the configured editor (new tab)
                 }
             }
             "Insert path at prompt" => {
@@ -1046,12 +1021,6 @@ impl App {
             None => None,
         }
     }
-    /// Open a document as a foreground tab.
-    fn open_doc(&mut self, doc: Doc) {
-        self.docs.push(doc);
-        self.active_doc = Some(self.docs.len() - 1);
-        self.request_redraw();
-    }
     /// Close the active document tab (back to the terminal view).
     fn close_active_doc(&mut self) {
         if let Some(i) = self.active_doc.take() {
@@ -1121,6 +1090,42 @@ impl App {
         self.request_redraw();
     }
 
+    /// Open a new terminal tab whose session immediately `exec`s `exec_cmd` (in
+    /// `cwd`). `exec` replaces the shell, so quitting the program ends the session
+    /// and the tab closes itself. Returns the session id.
+    fn open_editor_tab(&mut self, cwd: &str, exec_cmd: &str) -> Option<u32> {
+        let (cols, rows) = match &self.win {
+            Some(w) => {
+                let s = w.inner_size();
+                self.grid_dims(s.width, s.height)
+            }
+            None => (80, 24),
+        };
+        let (session, term) = self.open_session(cols, rows, cwd)?;
+        let cmd = format!("exec {exec_cmd}\r");
+        if let Some(mux) = &self.mux {
+            mux.send_data(session, cmd.as_bytes());
+        }
+        self.tabs.push(Tab { root: Layout::Leaf(Pane::new(session, term)), focus: session });
+        self.active_term = self.tabs.len() - 1;
+        self.active_doc = None;
+        self.reflow();
+        self.request_redraw();
+        Some(session)
+    }
+
+    /// Open `linux_path` in the configured editor in a new terminal tab (in the
+    /// file's directory).
+    fn open_in_editor(&mut self, linux_path: &str) {
+        let dir = match linux_path.rsplit_once('/') {
+            Some((p, _)) if !p.is_empty() => p.to_string(),
+            _ => String::new(),
+        };
+        let esc = linux_path.replace('\'', "'\\''");
+        let editor = self.editor.clone();
+        self.open_editor_tab(&dir, &format!("{editor} '{esc}'"));
+    }
+
     /// Split the focused pane (side_by_side = columns, else rows).
     fn split_focused(&mut self, side_by_side: bool) {
         let target = self.focused_session();
@@ -1146,6 +1151,11 @@ impl App {
     /// Close a session's pane (collapsing its split); `exited` skips re-closing
     /// the PTY. Closes the tab when its last pane goes, and exits on the last tab.
     fn close_session(&mut self, session: u32, exited: bool, event_loop: &ActiveEventLoop) {
+        // The settings editor (edit.exe) tab closed -> reload + apply settings.
+        if self.settings_session == Some(session) {
+            self.settings_session = None;
+            self.apply_settings();
+        }
         let ti = match self.tabs.iter().position(|t| t.root.find(session).is_some()) {
             Some(i) => i,
             None => return,

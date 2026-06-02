@@ -14,6 +14,7 @@ pub struct Settings {
     pub font_family: String,
     pub font_pts: f32,
     pub opacity: f32, // 0.0..=1.0
+    pub editor: String, // command run (in a new terminal tab) to open files
     pub background: BackgroundConfig,
     pub theme: Theme,
 }
@@ -61,6 +62,7 @@ struct Raw {
     cursor: String,
     selection: String,
     opacity: u32,
+    editor: String,
     background_image: Option<String>,
     background_image_opacity: u32,
     background_image_fit: String,
@@ -77,6 +79,7 @@ impl Default for Raw {
             cursor: "#FFFFFF".into(),
             selection: "#264F78".into(),
             opacity: 100,
+            editor: "nano".into(),
             background_image: None,
             background_image_opacity: 35,
             background_image_fit: "cover".into(),
@@ -119,6 +122,7 @@ impl From<Raw> for Settings {
             font_family: r.font_family,
             font_pts: if r.font_size > 0.0 { r.font_size } else { 12.0 },
             opacity: (r.opacity.clamp(10, 100) as f32) / 100.0,
+            editor: if r.editor.trim().is_empty() { "nano".into() } else { r.editor },
             background: BackgroundConfig {
                 path: r
                     .background_image
