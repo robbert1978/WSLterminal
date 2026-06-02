@@ -50,12 +50,32 @@ pub fn resolve_helper() -> Option<PathBuf> {
     resolve_artifact("wslpty", "WSLPTY_BIN")
 }
 
+/// Default vsock port `wslptyd` binds. VM-global (one utility VM for all distros)
+/// and deliberately not 22 (ssh).
+pub const VSOCK_PORT: u32 = 5523;
+
 /// Shell snippet that stages the multiplexed server into a fixed `/tmp/wslptyd`
-/// and execs it. `rm -f` before `cp` avoids ETXTBSY from a stale daemon. Ports
-/// `BuildServerCommand`.
+/// and execs it over stdin/stdout (the wslg pipe path). `rm -f` before `cp`
+/// avoids ETXTBSY from a stale daemon. Ports `BuildServerCommand`.
 pub fn build_server_command(server_win_path: &Path) -> String {
     let src = windows_to_wsl_path(&server_win_path.to_string_lossy());
     format!("d=/tmp/wslptyd; rm -f \"$d\" 2>/dev/null; cp '{src}' \"$d\" 2>/dev/null; chmod +x \"$d\"; exec \"$d\"")
+}
+
+/// Shell snippet that stages the server and starts it DETACHED, listening on
+/// vsock `port`. Unlike the pipe command it returns immediately (`setsid` + `&`
+/// keep the daemon alive after the login shell exits), so the host then connects
+/// over AF_HYPERV. A second invocation while a daemon is up just loses the bind
+/// race (EADDRINUSE) and exits without disturbing the owner.
+pub fn build_vsock_command(server_win_path: &Path, port: u32) -> String {
+    let src = windows_to_wsl_path(&server_win_path.to_string_lossy());
+    // The trailing `sleep` keeps the launching shell alive just long enough for
+    // the setsid'd daemon to reparent to init — otherwise WSL tears the daemon
+    // down together with the shell's session the instant the shell exits.
+    format!(
+        "d=/tmp/wslptyd; rm -f \"$d\" 2>/dev/null; cp '{src}' \"$d\" 2>/dev/null; chmod +x \"$d\"; \
+         setsid \"$d\" --vsock {port} </dev/null >/dev/null 2>&1 & sleep 0.5"
+    )
 }
 
 /// Single-session helper launch command (used by diagnostics). Ports
@@ -92,6 +112,16 @@ mod tests {
         assert!(cmd.contains("/mnt/c/proj/artifacts/wslptyd"));
         assert!(cmd.trim_end().ends_with("exec \"$d\""));
         assert!(!cmd.contains("wslptyd.$$")); // singleton: no PID suffix
+    }
+
+    #[test]
+    fn vsock_command_detaches_and_passes_port() {
+        let cmd = build_vsock_command(&PathBuf::from(r"C:\proj\artifacts\wslptyd"), 5523);
+        assert!(cmd.contains("d=/tmp/wslptyd;"));
+        assert!(cmd.contains("setsid \"$d\" --vsock 5523"));
+        assert!(cmd.contains("</dev/null >/dev/null 2>&1 &")); // detached
+        assert!(cmd.trim_end().ends_with("sleep 0.5")); // let the daemon reparent
+        assert!(!cmd.contains("exec \"$d\"")); // must NOT block on the daemon
     }
 
     #[test]

@@ -34,6 +34,12 @@
 #include <termios.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <sys/socket.h>
+#include <linux/vm_sockets.h>
+
+#ifndef AF_VSOCK
+#define AF_VSOCK 40
+#endif
 
 #define MAX_SESS 256
 
@@ -45,6 +51,15 @@ typedef struct {
 } Sess;
 
 static Sess g_sess[MAX_SESS];
+
+/* Transport fds for the active session loop: stdin/stdout (the wslg pipe path)
+ * or the accepted vsock connection in --vsock mode. */
+static int g_in = 0, g_out = 1;
+/* The vsock listening socket (owner only), closed/cleaned up on shutdown. */
+static volatile sig_atomic_t g_listen_fd = -1;
+static const char *STAGE_PATH = "/tmp/wslptyd";
+/* Live per-connection children; the listener auto-exits when it reaches 0. */
+static volatile sig_atomic_t g_active = 0;
 
 static ssize_t writen(int fd, const void *buf, size_t n) {
     const char *p = (const char *)buf;
@@ -64,8 +79,8 @@ static void send_frame(uint32_t id, uint8_t type, const void *payload, uint32_t 
     memcpy(hdr, &id, 4);
     hdr[4] = type;
     memcpy(hdr + 5, &len, 4);
-    writen(1, hdr, 9);
-    if (len) writen(1, payload, len);
+    writen(g_out, hdr, 9);
+    if (len) writen(g_out, payload, len);
 }
 
 static void send_exit(uint32_t id, uint32_t code) { send_frame(id, 6, &code, 4); }
@@ -113,7 +128,13 @@ static void open_sess(uint32_t id, uint16_t cols, uint16_t rows,
     if (pid < 0) { send_exit(id, 127); return; }
 
     if (pid == 0) {
-        if (cwd && *cwd) { if (chdir(cwd) != 0) { /* ignore */ } }
+        /* Requested dir, else default to $HOME (~) — not the daemon's cwd. */
+        if (cwd && *cwd) {
+            if (chdir(cwd) != 0) { /* ignore */ }
+        } else {
+            const char *home = getenv("HOME");
+            if (home && *home) { if (chdir(home) != 0) { /* ignore */ } }
+        }
         const char *shell = (shell_req && *shell_req) ? shell_req : getenv("SHELL");
         if (!shell || !*shell) shell = "/bin/bash";
         const char *base = strrchr(shell, '/');
@@ -191,15 +212,13 @@ static void feed_stdin(const unsigned char *data, size_t n) {
     if (off) { memmove(g_buf, g_buf + off, g_len - off); g_len -= off; }
 }
 
-int main(void) {
-    if (!getenv("TERM")) setenv("TERM", "xterm-256color", 1);
-    signal(SIGPIPE, SIG_IGN);
-    for (int i = 0; i < MAX_SESS; i++) { g_sess[i].active = 0; g_sess[i].master = -1; g_sess[i].pid = -1; }
+/* ---- per-connection session loop (g_in/g_out are the transport fds) ---- */
 
+static void run_session_loop(void) {
     char buf[65536];
     struct pollfd fds[1 + MAX_SESS];
     Sess *pmap[1 + MAX_SESS];
-    int infd = 0;
+    int infd = g_in;
 
     for (;;) {
         int nf = 0;
@@ -208,7 +227,7 @@ int main(void) {
             if (!g_sess[i].active) continue;
             fds[nf].fd = g_sess[i].master; fds[nf].events = POLLIN; fds[nf].revents = 0; pmap[nf] = &g_sess[i]; nf++;
         }
-        if (nf == 0) break;                            /* stdin closed and no sessions */
+        if (nf == 0) break;                            /* host gone and no sessions */
 
         int r = poll(fds, nf, -1);
         if (r < 0) { if (errno == EINTR) continue; break; }
@@ -216,7 +235,7 @@ int main(void) {
         int host_gone = 0;
         for (int k = 0; k < nf; k++) {
             if (!fds[k].revents) continue;
-            if (pmap[k] == NULL) {                     /* stdin (control channel) */
+            if (pmap[k] == NULL) {                     /* host -> control channel */
                 if (fds[k].revents & POLLIN) {
                     ssize_t kk = read(infd, buf, sizeof buf);
                     if (kk > 0) feed_stdin((unsigned char *)buf, (size_t)kk);
@@ -233,12 +252,105 @@ int main(void) {
             }
         }
 
-        if (host_gone) {                               /* Windows disconnected: tear down */
+        if (host_gone) {                               /* host disconnected: tear down */
             for (int i = 0; i < MAX_SESS; i++) if (g_sess[i].active) end_sess(&g_sess[i], 1);
             break;
         }
     }
 
     free(g_buf);
+    g_buf = NULL; g_len = g_cap = 0;
+}
+
+/* ---- vsock server: one forked session loop per accepted client ---------- */
+
+static void cleanup_and_exit(void) {
+    if (g_listen_fd >= 0) close(g_listen_fd);
+    unlink(STAGE_PATH);                                 /* owner cleans up the staged binary */
+    _exit(0);
+}
+
+static void on_term(int sig) {
+    (void)sig;
+    cleanup_and_exit();
+}
+
+/* Reap connection children; when the last one is gone there are no windows left
+ * to serve, so the listener exits (auto-shutdown — nothing lingers). */
+static void on_chld(int sig) {
+    (void)sig;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+        if (g_active > 0) g_active--;
+    }
+    if (g_active == 0) cleanup_and_exit();
+}
+
+static int vsock_serve(int port) {
+    int ls = socket(AF_VSOCK, SOCK_STREAM, 0);
+    if (ls < 0) return 1;
+
+    struct sockaddr_vm sa;
+    memset(&sa, 0, sizeof sa);
+    sa.svm_family = AF_VSOCK;
+    sa.svm_cid = VMADDR_CID_ANY;
+    sa.svm_port = (unsigned)port;
+    if (bind(ls, (struct sockaddr *)&sa, sizeof sa) < 0) {
+        int e = errno;
+        close(ls);
+        /* EADDRINUSE: another wslptyd already owns the port -> yield quietly and
+         * do NOT remove the staged binary (the owner is running from it). */
+        return (e == EADDRINUSE) ? 0 : 1;
+    }
+    if (listen(ls, 16) < 0) { close(ls); return 1; }
+
+    g_listen_fd = ls;
+    signal(SIGCHLD, on_chld);                           /* reap + auto-exit when idle */
+    signal(SIGTERM, on_term);                           /* shutdown: close + rm staged bin */
+    signal(SIGINT, on_term);
+
+    for (;;) {
+        int c = accept(ls, NULL, NULL);
+        if (c < 0) { if (errno == EINTR) continue; break; }
+        fcntl(c, F_SETFD, FD_CLOEXEC);                  /* don't leak the socket into shells */
+        g_active++;                                     /* count before fork (SIGCHLD race) */
+        pid_t pid = fork();
+        if (pid == 0) {                                 /* connection child: own session loop */
+            close(ls);
+            g_listen_fd = -1;
+            signal(SIGCHLD, SIG_DFL);                   /* so end_sess()'s waitpid works */
+            signal(SIGTERM, SIG_DFL);
+            signal(SIGINT, SIG_DFL);
+            g_in = c;
+            g_out = c;
+            run_session_loop();
+            _exit(0);
+        }
+        if (pid < 0) g_active--;                        /* fork failed */
+        close(c);                                       /* parent keeps only the listener */
+    }
+
+    close(ls);
+    unlink(STAGE_PATH);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (!getenv("TERM")) setenv("TERM", "xterm-256color", 1);
+    signal(SIGPIPE, SIG_IGN);
+    for (int i = 0; i < MAX_SESS; i++) { g_sess[i].active = 0; g_sess[i].master = -1; g_sess[i].pid = -1; }
+
+    int port = -1;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--vsock") && i + 1 < argc) port = atoi(argv[++i]);
+    }
+    if (port > 0)
+      return vsock_serve(port);
+
+    setsid();
+
+    /* Legacy: a single connection over stdin/stdout (the wslg pipe path). */
+    g_in = 0;
+    g_out = 1;
+    run_session_loop();
     return 0;
 }

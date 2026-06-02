@@ -21,8 +21,9 @@ pub const T_EXIT: u8 = 6;
 pub const MAX_FRAME: u32 = 64 * 1024 * 1024;
 
 /// Write one frame to `w`. Header + payload in two writes, then flush — matching
-/// the C# `WriteFrame`.
-pub fn write_frame<W: Write>(w: &mut W, id: u32, ty: u8, payload: &[u8]) -> io::Result<()> {
+/// the C# `WriteFrame`. Takes a trait object so the same mux works over the wslg
+/// pipe (`ChildStdin`) or a vsock socket.
+pub fn write_frame(w: &mut dyn Write, id: u32, ty: u8, payload: &[u8]) -> io::Result<()> {
     let mut hdr = [0u8; 9];
     hdr[0..4].copy_from_slice(&id.to_le_bytes());
     hdr[4] = ty;
@@ -62,7 +63,7 @@ pub struct Frame {
     pub payload: Vec<u8>,
 }
 
-fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
+fn read_full(r: &mut dyn Read, buf: &mut [u8]) -> io::Result<bool> {
     let mut got = 0;
     while got < buf.len() {
         match r.read(&mut buf[got..]) {
@@ -78,7 +79,7 @@ fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
 /// Read one frame from `r`, reusing `scratch` as the growable payload buffer (it
 /// is *not* reallocated per frame — mirrors the v1.0.3 reader-buffer fix). On a
 /// DATA/EXIT etc. the payload slice is `scratch[..len]`. Returns `Ok(None)` at EOF.
-pub fn read_frame<R: Read>(r: &mut R, scratch: &mut Vec<u8>) -> io::Result<Option<(u32, u8, usize)>> {
+pub fn read_frame(r: &mut dyn Read, scratch: &mut Vec<u8>) -> io::Result<Option<(u32, u8, usize)>> {
     let mut hdr = [0u8; 9];
     if !read_full(r, &mut hdr)? {
         return Ok(None);

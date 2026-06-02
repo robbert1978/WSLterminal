@@ -2042,12 +2042,8 @@ impl ApplicationHandler<UserEvent> for App {
         let size = win.inner_size();
         let (cols, rows) = self.grid_dims(size.width, size.height);
 
-        // Bring up the live WSL server.
-        let server = bootstrap::resolve_server()
-            .expect("wslptyd not found (build native/ and place under artifacts/)");
-        let command = bootstrap::build_server_command(&server);
-        let proc = WslProcess::launch(DISTRO, &command).expect("launch wslg.exe");
-        let (mux, rx) = WslMux::start(proc);
+        // Bring up the live WSL server (vsock daemon, else wslg pipe).
+        let (mux, rx) = bring_up_mux(DISTRO);
 
         // First tab (in --cd directory if given).
         let term = Arc::new(Mutex::new(Terminal::new(cols, rows)));
@@ -2547,6 +2543,41 @@ fn parse_opacity_env() -> Option<f32> {
     let v = std::env::var("WSLTERM_OPACITY").ok()?.trim().parse::<f32>().ok()?;
     let v = if v > 1.0 { v / 100.0 } else { v };
     Some(v.clamp(0.4, 1.0))
+}
+
+/// Bring up the WSL backend. Prefer a direct **vsock** connection to a running
+/// `wslptyd`; if none is listening, start it detached (once, via `wslg`) and
+/// retry briefly (covers VM boot + the daemon's bind race); finally fall back to
+/// the legacy `wslg` stdin/stdout pipe if vsock is unavailable.
+fn bring_up_mux(distro: &str) -> (WslMux, std::sync::mpsc::Receiver<MuxEvent>) {
+    let server = bootstrap::resolve_server()
+        .expect("wslptyd not found (build native/ and place under artifacts/)");
+    let port = bootstrap::VSOCK_PORT;
+
+    // 1) Already-running daemon? Connect instantly — no process spawn.
+    if let Ok(mux) = wslterm_pty::vsock::start_mux(port) {
+        eprintln!("[wslterm] connected to wslptyd over vsock:{port}");
+        return mux;
+    }
+    // 2) Not up: start it (fire-and-forget), then poll the connect for a while —
+    //    long enough to cover a cold WSL VM boot plus the daemon's bind.
+    eprintln!("[wslterm] vsock connect failed; bootstrapping wslptyd on vsock:{port}");
+    let cmd = bootstrap::build_vsock_command(&server, port);
+    if wslterm_pty::process::spawn_bootstrap(distro, &cmd).is_ok() {
+        let deadline = Instant::now() + std::time::Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if let Ok(mux) = wslterm_pty::vsock::start_mux(port) {
+                eprintln!("[wslterm] connected to wslptyd over vsock:{port} (after bootstrap)");
+                return mux;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+    }
+    // 3) Fall back to the legacy wslg pipe transport.
+    eprintln!("[wslterm] vsock unavailable; falling back to the wslg pipe");
+    let command = bootstrap::build_server_command(&server);
+    let proc = WslProcess::launch(distro, &command).expect("launch wslg.exe");
+    WslMux::from_process(proc)
 }
 
 /// Raw Win32 HWND (as isize) for the window, if available.

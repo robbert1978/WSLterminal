@@ -4,7 +4,7 @@
 //! writes are serialized under a mutex.
 
 use std::collections::HashSet;
-use std::process::ChildStdin;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -30,7 +30,7 @@ pub enum MuxEvent {
 }
 
 struct Shared {
-    stdin: Mutex<ChildStdin>,
+    stdin: Mutex<Box<dyn Write + Send>>,
     dead: AtomicBool,
     live: Mutex<HashSet<u32>>,
 }
@@ -41,7 +41,7 @@ impl Shared {
             return;
         }
         let mut guard = self.stdin.lock().unwrap();
-        if protocol::write_frame(&mut *guard, id, ty, payload).is_err() {
+        if protocol::write_frame(&mut **guard, id, ty, payload).is_err() {
             self.dead.store(true, Ordering::Release);
         }
     }
@@ -51,34 +51,56 @@ pub struct WslMux {
     shared: Arc<Shared>,
     next_id: AtomicU32,
     reader: Option<JoinHandle<()>>,
-    proc: Arc<Mutex<WslProcess>>,
+    /// Called once on drop to tear the transport down: kill the wslg.exe child
+    /// (pipe mode) or shut down the vsock socket (which unblocks the reader).
+    teardown: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl WslMux {
-    /// Start a mux over a launched server process. Returns the mux and the
-    /// receiver the owner polls for `MuxEvent`s.
-    pub fn start(proc: WslProcess) -> (WslMux, Receiver<MuxEvent>) {
-        let mut proc = proc;
-        let (stdin, stdout) = proc.take_stdio();
+    /// Start a mux over any transport: a reader, a writer, and a `teardown`
+    /// closure run once on drop. The frame protocol is transport-agnostic, so the
+    /// same mux drives the wslg pipe or a vsock socket.
+    pub fn start(
+        reader: Box<dyn Read + Send>,
+        writer: Box<dyn Write + Send>,
+        teardown: Box<dyn FnMut() + Send>,
+    ) -> (WslMux, Receiver<MuxEvent>) {
         let shared = Arc::new(Shared {
-            stdin: Mutex::new(stdin),
+            stdin: Mutex::new(writer),
             dead: AtomicBool::new(false),
             live: Mutex::new(HashSet::new()),
         });
         let (tx, rx) = std::sync::mpsc::sync_channel(MUX_CHANNEL_BOUND);
         let reader_shared = shared.clone();
-        let reader = std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("wsl-mux-reader".into())
-            .spawn(move || reader_loop(stdout, reader_shared, tx))
+            .spawn(move || reader_loop(reader, reader_shared, tx))
             .expect("spawn reader");
         (
             WslMux {
                 shared,
                 next_id: AtomicU32::new(0),
-                reader: Some(reader),
-                proc: Arc::new(Mutex::new(proc)),
+                reader: Some(handle),
+                teardown: Some(teardown),
             },
             rx,
+        )
+    }
+
+    /// Mux over a launched `wslg.exe` process (the pipe transport). Dropping the
+    /// mux kills the child.
+    pub fn from_process(mut proc: WslProcess) -> (WslMux, Receiver<MuxEvent>) {
+        let (stdin, stdout) = proc.take_stdio();
+        let proc = Arc::new(Mutex::new(proc));
+        let p2 = proc.clone();
+        Self::start(
+            Box::new(stdout),
+            Box::new(stdin),
+            Box::new(move || {
+                if let Ok(mut p) = p2.lock() {
+                    p.kill();
+                }
+            }),
         )
     }
 
@@ -114,10 +136,11 @@ impl WslMux {
 
 impl Drop for WslMux {
     fn drop(&mut self) {
-        // Closing stdin makes the server EOF and exit, unblocking the reader.
+        // Tear down the transport (kill the child / shutdown the socket); that
+        // unblocks the reader thread's read so the join below returns.
         self.shared.dead.store(true, Ordering::Release);
-        if let Ok(mut p) = self.proc.lock() {
-            p.kill();
+        if let Some(mut teardown) = self.teardown.take() {
+            teardown();
         }
         if let Some(h) = self.reader.take() {
             let _ = h.join();
@@ -125,10 +148,10 @@ impl Drop for WslMux {
     }
 }
 
-fn reader_loop<R: std::io::Read>(mut stdout: R, shared: Arc<Shared>, tx: SyncSender<MuxEvent>) {
+fn reader_loop(mut stdout: Box<dyn Read + Send>, shared: Arc<Shared>, tx: SyncSender<MuxEvent>) {
     let mut scratch = vec![0u8; 65536];
     loop {
-        match protocol::read_frame(&mut stdout, &mut scratch) {
+        match protocol::read_frame(&mut *stdout, &mut scratch) {
             Ok(Some((id, ty, len))) => match ty {
                 T_DATA => {
                     if tx.send(MuxEvent::Data { id, bytes: scratch[..len].to_vec() }).is_err() {

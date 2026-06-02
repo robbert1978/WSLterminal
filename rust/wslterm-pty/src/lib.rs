@@ -11,6 +11,8 @@ pub mod bootstrap;
 pub mod mux;
 pub mod process;
 pub mod protocol;
+#[cfg(windows)]
+pub mod vsock;
 
 pub use mux::{MuxEvent, WslMux};
 pub use process::WslProcess;

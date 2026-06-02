@@ -7,4 +7,12 @@ license.workspace = true
 
 [dependencies]
 
+[target.'cfg(windows)'.dependencies]
+# vsock transport: AF_HYPERV winsock client + WSL VMID lookup via the registry.
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_Registry",
+] }
+
 [lib]

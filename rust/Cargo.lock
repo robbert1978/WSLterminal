@@ -2038,6 +2038,9 @@ version = "0.1.0"
 [[package]]
 name = "wslterm-pty"
 version = "0.1.0"
+dependencies = [
+ "windows-sys 0.52.0",
+]
 
 [[package]]
 name = "x11-dl"
