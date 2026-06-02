@@ -1,270 +1,119 @@
 # WSL Terminal
 
-A Windows terminal app that runs a WSL shell on a **genuine Linux PTY**, launched
-**headlessly** — no `conhost`/ConPTY, no Windows Terminal window, and not the
-cooked stdio you get from a plain piped `wsl.exe`.
+A fast, native Windows terminal for WSL, written in Rust. It runs a **real Linux
+PTY** in your WSL distro and renders it on the GPU with true per-pixel
+transparency and color emoji.
 
-```
-Windows (C# / .NET 9, WPF, one GUI process)           WSL2 distro (Linux)
-+--------------------------------+                    +------------------------------+
-| Window 1   TerminalView + VT   |                    | wslptyd   (one server)       |
-| Window 2   TerminalView + VT   | multiplexed        |   session 1: forkpty /dev/pts|
-| Window N   TerminalView + VT   | frames over ONE    |   session 2: forkpty /dev/pts|
-| WslMux -> CreateProcess        | wslg.exe pipe ==>  |   ...login shell on each pty |
-| wslg.exe   (GUI subsystem)     |                    +------------------------------+
-+--------------------------------+
+## About
 
-   N windows/tabs/panes = 1 wslg.exe + 1 server (+ N shells);  GUI subsystem => no console window
-```
+WSL Terminal opens a genuine `forkpty()` Linux terminal (not a `wsl.exe`/conhost
+stdio bridge) and draws it in a borderless, translucent Windows window. It
+supports tabs, split panes, a file sidebar, scrollback, and opens files in your
+editor of choice.
 
-## Why this design
+Requirements: Windows 10/11 with WSL2 and the **Ubuntu** distro. (The target
+distro is currently the compile-time constant `DISTRO` in `rust/wslterm/src/main.rs`.)
 
-* **Headless `wslg.exe` (GUI subsystem).** Talking to a WSL2 distro goes through
-  the `wsl.exe` machinery either way — even `wslapi.dll`'s `WslLaunch` just shells
-  out to `wsl.exe` (verified by inspecting the child's command line), and it does
-  so *without* `CREATE_NO_WINDOW`, so on Win11 (where Windows Terminal is the
-  default terminal) it pops a WT window. We instead launch
-  **`C:\Program Files\WSL\wslg.exe`** — the GUI-subsystem launcher Microsoft ships
-  next to `wsl.exe` — with redirected pipe handles. Because it's a GUI-subsystem
-  binary, Windows never allocates a console for it, so no console/terminal window
-  ever appears (a console-subsystem `wsl.exe` flashes one even with
-  `CREATE_NO_WINDOW`). It takes the same arguments and relays stdio identically;
-  we fall back to `System32\wsl.exe` (with `CREATE_NO_WINDOW`) if `wslg.exe` is
-  absent, and `$WSL_LAUNCHER` overrides the choice. The app itself is also a
-  **GUI-subsystem** binary, so launching it doesn't allocate a console either.
-* **One PTY server, many sessions.** `native/wslptyd.c` runs once per distro and
-  multiplexes every terminal over a single `wslg.exe` + pipe connection. Opening N
-  windows costs 1 `wslg.exe` + 1 server (+ the N shells), instead of
-  N×(launcher + helper). Each `OPEN` does a real `forkpty()` → its own `/dev/pts/N`
-  login shell, so every session is a genuine TTY (job control, line discipline,
-  `SIGWINCH`, echo). A plain piped `wsl.exe <cmd>` reports `tty: not a tty`; through
-  this path the shell reports `/dev/pts/N`. (A single-session helper, `wslpty.c`,
-  is still used by the console diagnostic modes.)
-* **Single instance.** The app is single-instance (per-user named pipe): the first
-  launch is the host that owns the server; later launches forward their
-  (distro, cwd) to the host and exit. So *every* window — whether from Ctrl+Shift+N
-  or relaunching the exe — lives in one process and shares one `wslptyd` per distro.
-* **Multiplex protocol.** Length-prefixed frames `[u32 session][u8 type][u32 len][payload]`:
-  `OPEN`(cols,rows,cwd,shell), `DATA`, `RESIZE`, `SIGNAL`, `CLOSE` (host→server)
-  and `DATA`, `EXIT` (server→host). The single-session helper uses a simpler
-  unframed-session variant:
+### Architecture
 
-  | type | payload | action |
-  |------|---------|--------|
-  | `0x00` DATA   | `u32le len`, bytes | write to the PTY master |
-  | `0x01` RESIZE | `u16le cols`, `u16le rows` | `TIOCSWINSZ` (+ `SIGWINCH`) |
-  | `0x02` SIGNAL | `u8 signo` | `kill(child, signo)` |
+A Rust workspace under `rust/` plus two small C helpers under `native/`:
 
-  The PTY's output streams back on stdout as raw VT bytes, which the Windows
-  side parses and renders.
+| crate / dir | role |
+|---|---|
+| `wslterm-core` | Portable VT engine — ANSI/VT parser, screen grid, scrollback. No OS deps; unit-tested. |
+| `wslterm-pty` | Windows ↔ WSL transport — the vsock client, the `wslptyd` multiplex protocol, and bootstrap. |
+| `wslterm` | The GUI binary (`wslterm.exe`) — `winit` window, GPU renderer, tabs/panes/sidebar, settings. |
+| `native/wslptyd.c` | In-VM PTY **server**: `forkpty()`s one PTY per session and multiplexes many over one connection. |
+| `native/wslpty.c` | Single-session helper (used by diagnostics). |
 
-## Layout
+**Backend / transport.** The app talks to `wslptyd` running **inside** the WSL2
+VM over a **Hyper-V/vsock** socket (port `5523`). One daemon is shared by every
+window, so opening a window is just a socket connect — no process spawn. The
+daemon **auto-starts** on first use (staged to `/tmp/wslptyd` and launched
+detached via `wsl.exe`) and **auto-exits** when the last window closes. If vsock
+is unavailable it falls back to launching `wslptyd` over a `wslg.exe`
+stdin/stdout pipe. The wire protocol is length-prefixed frames
+(`[u32 session][u8 type][u32 len][payload]`) carrying open/data/resize/signal/
+close/exit.
 
-```
-native/wslptyd.c       multiplexed PTY server (one server, many /dev/pts sessions)
-native/wslpty.c        single-session helper (used by the console diagnostic modes)
-native/build.sh        builds both inside WSL -> artifacts/
-src/WslTerminal/
-  Native.cs            P/Invoke: CreatePipe / CreateProcess (headless) / console attach
-  WslProcess.cs        headless wsl.exe launch (CREATE_NO_WINDOW) -> raw stdio streams
-  WslMux.cs            multiplexes N PTY sessions over one wslptyd; per-distro manager
-  WslSession.cs        single-session framing over WslProcess (console modes)
-  ConsoleHelper.cs     attaches a parent console for the diagnostic modes (GUI-subsystem build)
-  WslBootstrap.cs      stages wslptyd/wslpty into /tmp and builds the launch commands
-  Vt/                  VT emulator: Theme, Cell, Screen, VtParser, Terminal (+ text extraction)
-  Ui/TerminalView.cs   WPF GlyphRun renderer + keyboard/mouse/selection/resize/zoom
-  Ui/EmojiRenderer.cs  Direct2D/DirectWrite color-emoji rasterizer (cached bitmaps)
-  Ui/InputEncoder.cs   keys -> xterm/VT byte sequences
-  Ui/MainWindow.cs     window: tab strip + chrome; manages tabs, panes, sidebar, settings
-  Ui/TerminalTab.cs    one tab = a pane tree (Root/Active), or a file-viewer document
-  Ui/Pane.cs           pane tree: Pane (Terminal+TerminalView+MuxSession) | SplitNode
-  Ui/FileSidebar.cs    left file browser (follows the shell cwd via OSC 7)
-  Ui/FilePreview.cs    builds a viewer/editor control (syntax highlight / image)
-  Ui/FileDocument.cs   open document: editable text, dirty tracking, save to WSL
-  Ui/WslFiles.cs       list/read/write WSL files from Windows (\\wsl.localhost)
-  Highlighting/*.xshd  extra syntax definitions (shell, yaml, rust, go, ts, ...)
-  Ui/SettingsWindow.cs appearance dialog (font / size / scheme / colors)
-  Settings.cs          persisted appearance (JSON in %APPDATA%\WslTerminal)
-  Schemes.cs           built-in color schemes
-  wsl.ico              app/window icon (official WSL icon)
-  Program.cs           STA entry point and modes
-```
+**Rendering.** Glyphs are drawn with **Direct2D/DirectWrite** into a
+premultiplied-alpha **DirectComposition** swapchain that DWM composites against
+the desktop — giving true see-through transparency and color emoji. If Direct3D
+is unavailable it falls back to a CPU rasterizer (`ab_glyph`) presented via
+`UpdateLayeredWindow`.
 
-## Build
+**Editing.** Opening a file (sidebar click / right-click → Open) launches your
+configured `Editor` (default `nano`) in a new terminal tab via
+`exec <Editor> '<file>'`, so quitting the editor closes the tab. `Ctrl+,` edits
+`settings.json` with Windows `edit.exe`; settings reload when you close it.
 
-```powershell
-./build.ps1            # builds wslpty in WSL, then the .NET app
+## Arguments
+
+`wslterm.exe` takes a single command-line argument:
+
+| argument | default | meaning |
+|---|---|---|
+| `--cd <wsl-dir>` | *(none — first tab starts in your home `~`)* | WSL directory the first tab opens in. Used internally by **Open in new window** / `Ctrl+Shift+N` to spawn a window in a folder. |
+
+Advanced overrides via environment variables:
+
+| env var | default | meaning |
+|---|---|---|
+| `WSLTERM_OPACITY` | *(unset — uses `Opacity` from settings)* | Override the terminal background opacity (`0.0`–`1.0`, or `0`–`100`). |
+| `WSL_LAUNCHER` | `%ProgramFiles%\WSL\wslg.exe`, else `System32\wsl.exe` | Launcher used for the pipe fallback. |
+| `WSLPTYD_BIN` | *(unset — searches `artifacts/wslptyd` near the exe)* | Explicit path to the `wslptyd` binary. |
+| `WSLPTY_BIN` | *(unset — searches `artifacts/wslpty` near the exe)* | Explicit path to the `wslpty` helper. |
+
+## Configs
+
+Settings live in **`%APPDATA%\WslTerminal\settings.json`** (created on first
+`Ctrl+,`). Keys are PascalCase; any missing key uses its default. Colors are
+`"#RRGGBB"`. Edit with `Ctrl+,` (opens `edit.exe`) — changes apply when you close
+the editor.
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `FontFamily` | string | `"Cascadia Mono"` | Monospace family. Resolved by scanning the Windows font folders; falls back to Consolas / Cascadia if not found. |
+| `FontSize` | number (points) | `12` | Font size in points. |
+| `Background` | `#RRGGBB` | `"#0C0C0C"` | Terminal background color. |
+| `Foreground` | `#RRGGBB` | `"#CCCCCC"` | Default text color. |
+| `Cursor` | `#RRGGBB` | `"#FFFFFF"` | Cursor color. |
+| `Selection` | `#RRGGBB` | `"#264F78"` | Selection highlight color. |
+| `Opacity` | int `10`–`100` | `100` | Terminal background translucency, percent (`100` = opaque). |
+| `Editor` | string (shell cmd) | `"nano"` | Command run in a new tab to open files (`exec <Editor> '<file>'`). May include args, e.g. `"nvim"`, `"micro"`, `"code --wait"`. |
+| `BackgroundImage` | string path \| null | `null` | Image drawn behind the terminal (Windows path). |
+| `BackgroundImageOpacity` | int `0`–`100` | `35` | Background image opacity, percent. |
+| `BackgroundImageFit` | string | `"cover"` | `cover` \| `contain` \| `stretch` (or `fill`) \| `tile` \| `center`. |
+| `Ansi` | array of 16 `#RRGGBB` | Campbell | The 16 ANSI colors (0–7 normal, 8–15 bright). |
+
+Default `Ansi` (Campbell) palette:
+
+```json
+["#0C0C0C","#C50F1F","#13A10E","#C19C00","#0037DA","#881798","#3A96DD","#CCCCCC",
+ "#767676","#E74856","#16C60C","#F9F1A5","#3B78FF","#B4009E","#61D6D6","#F2F2F2"]
 ```
 
-Requires: WSL2 with a C toolchain (`gcc`/`cc`, `pty.h`, `libutil`) and the
-.NET 9 SDK with the Windows Desktop runtime. The first build restores one NuGet
-package (`Vortice.Direct2D1`, for color-emoji rasterization), so it needs network
-access once.
+Example `settings.json`:
 
-### Standalone single-file build
-
-```powershell
-dotnet publish src\WslTerminal\WslTerminal.csproj -c Release -r win-x64 --self-contained
+```json
+{
+  "FontFamily": "Cascadia Mono",
+  "FontSize": 12,
+  "Background": "#0C0C0C",
+  "Foreground": "#CCCCCC",
+  "Cursor": "#FFFFFF",
+  "Selection": "#264F78",
+  "Opacity": 90,
+  "Editor": "nano",
+  "BackgroundImage": null,
+  "BackgroundImageOpacity": 35,
+  "BackgroundImageFit": "cover",
+  "Ansi": ["#0C0C0C","#C50F1F","#13A10E","#C19C00","#0037DA","#881798","#3A96DD","#CCCCCC",
+           "#767676","#E74856","#16C60C","#F9F1A5","#3B78FF","#B4009E","#61D6D6","#F2F2F2"]
+}
 ```
 
-This emits a single, self-contained **`WslTerminal.exe`** (.NET runtime + WPF +
-all dependency DLLs bundled and compressed inside the exe — no .NET install
-needed to run it) under `…\net9.0-windows\win-x64\publish\`. Drop the two Linux
-helpers next to it so the app can stage them into the distro:
+---
 
-```
-publish\WslTerminal.exe
-publish\artifacts\wslpty
-publish\artifacts\wslptyd
-```
-
-(WPF can't be trimmed, so the exe is ~130 MB on disk; that's the runtime, not the
-app.) The helpers come from `artifacts\` after `build.ps1` / `native/build.sh`.
-
-## Run
-
-```powershell
-# the terminal app
-src\WslTerminal\bin\Release\net9.0-windows\WslTerminal.exe [--distro Ubuntu] [--cd /linux/path]
-```
-
-The app is a GUI-subsystem binary (so launching it never pops a console window).
-The diagnostic modes below print to a console; since PowerShell's `&` doesn't
-block on a GUI exe, capture them with
-`Start-Process WslTerminal.exe -ArgumentList '--selftest' -Wait -RedirectStandardOutput out.txt`:
-
-```
---selftest     # drives `tty; exit` through the path -> /dev/pts/N
---probe        # contrast case (no helper -> "not a tty")
---vttest       # headless VT-emulator unit checks
---rendertest   # headless GlyphRun render check (offscreen bitmap)
---settingstest # verify the appearance dialog opens
---tabtest      # open a window, add/close tabs, assert the tab count tracks
---splittest    # split the active pane right/down, close one; assert pane count
---sidebartest  # file sidebar: list, open a file tab, toggle hidden + font size
---hltest       # assert file-type -> syntax-highlighting mappings (incl. shell)
---muxtest      # open two PTY sessions over one server; assert distinct /dev/pts
---emojitest    # render emoji/kaomoji/CJK and assert fallback + combining work
---benchtest    # headless VT parse+grid throughput (termbench-style workloads)
---pipetest     # end-to-end input throughput through the real WSL pipe (no render)
---interactive  # minimal console relay (no GUI)
-```
-
-## Features
-
-* **Tabs and split panes** — multiple terminals per window; each tab is a tree of
-  panes you can split right/down (draggable splitters), and each pane is its own
-  session on the shared server. Plus one PTY **server** per distro
-  multiplexing all windows over a single wsl.exe; the app is single-instance, so
-  relaunching it reuses the same host + server.
-* **File sidebar** (Ctrl+Shift+E) — a left panel that **follows the active shell's
-  working directory** (OSC 7). Double-click a folder to enter it, a file to open
-  it in a **viewer/editor tab**; right-click for Open / "Insert path at prompt"
-  (files) or "Open in new window" (folders). Hidden dot-files are off by default
-  (Ctrl+Shift+H toggles). Drag the right divider to resize the panel when long
-  filenames need more room. The panel font defaults to the terminal's size and is
-  adjustable (Ctrl +/−/0 when focused). The panel is opaque even when the window
-  is translucent.
-* **File viewer/editor** — opened files become tabs with **syntax highlighting**
-  (~35 languages: the AvalonEdit built-ins plus bundled shell/YAML/Rust/Go/
-  TypeScript/TOML/INI/Dockerfile/Ruby/Lua definitions; unknown text → plain), or
-  a rendered image. Text is **editable** — **Ctrl+S** saves back to the WSL file;
-  a ● marks unsaved changes and closing prompts to save. Images, binaries, and
-  over-cap (>2 MB) files are read-only.
-* Real `/dev/pts/N` shell via `forkpty` (full job control, resize, echo).
-* Mouse text **selection** (drag, double-click word, triple-click line) with
-  copy (Ctrl+Shift+C or right-click) and paste.
-* VT/ANSI emulator: SGR (16/256/truecolor), cursor/erase/scroll-region ops,
-  insert/delete, alternate screen, scrollback, DEC line-drawing, OSC titles,
-  bracketed paste, device-status replies, UTF-8 incl. wide chars.
-* Unicode rendering with **font fallback** (CJK, Thai, symbols) and **combining
-  marks** for characters the primary font lacks (via `FormattedText`), plus
-  **color emoji** rasterized with **Direct2D + DirectWrite** (WPF can't render
-  color fonts) and cached per grapheme.
-* GPU-friendly `GlyphRun` rendering with fixed monospace advances (no ligature
-  drift), bold/italic, underline/strike, reverse, block cursor.
-* Keyboard: arrows (normal/application), Home/End/PgUp/PgDn/Insert/Delete,
-  F1–F12, Ctrl/Alt/Shift modifiers, meta-prefix, Ctrl-letter control codes.
-* Mouse-wheel scrollback, paste (Ctrl+Shift+V / Shift+Insert), live window
-  resize → `SIGWINCH`.
-* Configurable font (family + size), color scheme, and bg/fg/cursor colors
-  (Ctrl+, dialog; Ctrl +/-/0 and Ctrl+wheel to zoom), persisted to JSON.
-* Ctrl+Shift+N opens a new window in the shell's current directory (OSC 7).
-
-## Performance
-
-Input draining (VT parse + grid update) runs on the reader thread, decoupled
-from rendering (a `DispatcherTimer` paced at the **monitor's refresh rate** —
-60/120/144 Hz, via `GetDeviceCaps(VREFRESH)` — renders the latest grid only when
-it changed), so render speed never gates throughput and idle costs nothing.
-Rendering is also **dirty-row cached**: each row's vector drawing is retained and
-rebuilt only when that row's content or selection changes (the cursor is a cheap
-live overlay), so a partial update — typing, a refreshing status line — re-lays-out
-one row, not the whole viewport. The dirty gate plus the row cache keep each
-repaint cheap, so matching a high refresh rate stays light even with translucency
-(which is composited the more expensive way — see Appearance). The scrollback is a ring buffer (O(1) push, with
-row-array recycling) and the parser bulk-processes printable runs. On
-termbench-style workloads the parse+grid stage matches or beats Windows
-Terminal; the end-to-end rate (~0.036 GB/s on ManyLine) is on par with WT and
-bounded by the shared WSL relay transport, not the terminal. Measure with
-`--benchtest` (parse+grid) and `--pipetest` (full input chain).
-
-## Keys
-
-| key / action | does |
-|-----|--------|
-| Ctrl+Shift+T / the + button | new tab (in the active tab's directory) |
-| Alt+Shift+= / Alt+Shift+− | split the active pane right / down (same directory) |
-| Ctrl+Shift+W | close the active pane (last pane closes the tab) |
-| tab ✕ / middle-click tab | close the whole tab (all its panes) |
-| Ctrl+Tab / Ctrl+Shift+Tab / click a tab | next / previous / select tab |
-| click a pane / drag a splitter | focus that pane / resize the split |
-| drag / double-click / triple-click | select chars / word / line |
-| Ctrl+Shift+C, or right-click (with selection) | copy selection |
-| Ctrl+Shift+V / Shift+Insert / right-click (no selection) | paste |
-| Ctrl+Shift+N | new window in the shell's current directory |
-| Ctrl+Shift+E / the 🗀 button | toggle the file sidebar |
-| Ctrl+Shift+H | toggle hidden (dot) files in the sidebar |
-| drag sidebar right divider | resize the file sidebar |
-| double-click file / folder (sidebar) | open file in a tab / enter folder |
-| Ctrl+S (in a file tab) | save edits back to the WSL file |
-| Ctrl+, | open the appearance settings dialog |
-| Ctrl+= / Ctrl+- / Ctrl+0 | increase / decrease / reset font size |
-| Ctrl+mouse wheel | zoom font size |
-| Shift+PageUp / PageDown, mouse wheel | scroll the scrollback |
-
-## Appearance / settings
-
-Press **Ctrl+,** for a conhost-style dialog to change the font family, size, a
-named color scheme (Campbell, One Half Dark, Solarized Dark, Tango Dark), and
-the background/foreground/cursor colors. Changes apply live and persist to
-`%APPDATA%\WslTerminal\settings.json`.
-
-Settings keys (the JSON is also editable directly):
-
-| key | meaning |
-|-----|---------|
-| `FontFamily`, `FontSize` | font face and size **in points** (like Windows Terminal/conhost) |
-| `Background`, `Foreground`, `Cursor`, `Selection` | `#RRGGBB` colors |
-| `Ansi` | the 16 ANSI colors (`black…white`, then `bright*`) |
-| `Opacity` | window opacity %, 10–100 (100 = opaque) |
-| `BackgroundImage` | optional terminal-pane background image path (Rust build) |
-| `BackgroundImageOpacity` | background image opacity %, 0–100 (Rust build) |
-| `BackgroundImageFit` | `cover`, `contain`, `stretch`, `tile`, or `center` (Rust build) |
-
-`Opacity` < 100 makes the window translucent — the real desktop shows through the
-background (plain see-through, no blur), via WPF's `AllowsTransparency` (a
-per-pixel-alpha layered window). That is the only WPF mechanism that reliably
-composites the window's alpha against the *actual desktop*; the cheaper DWM routes
-(acrylic system backdrop, the window-composition accent, or an extended frame)
-only yield a tint or a blur on this platform, not true see-through, so they aren't
-used. The layered window carries some extra GPU cost — the price of real per-pixel
-transparency in WPF. Translucency needs a borderless window, so in that mode the
-app draws a small custom title bar (drag + minimize/maximize/close) with resize
-borders; at `100` it uses the normal native frame (and no layered-window cost).
-The Rust build also supports a plain bitmap `BackgroundImage` behind terminal
-cells. WT's acrylic/blur effects are not supported.
-
-**New window in the same directory** (Ctrl+Shift+N) works because the shell
-reports its working directory via OSC 7; the new window is launched with
-`--cd <that path>`.
+Build: `./build.ps1` (compiles the Linux helpers inside WSL, then the Rust GUI).
+Run `wslterm.exe` with the `artifacts/` folder beside it.
