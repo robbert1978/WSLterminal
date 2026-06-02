@@ -514,6 +514,7 @@ struct App {
     pane_rects: Vec<(u32, Rect)>, // active tab's leaf rects
     scrollbars: Vec<ScrollBar>,   // active tab's per-pane scrollbar geometry
     scrollbar_drag: Option<(u32, f64)>, // (session, grab offset within thumb, px)
+    sb_hover: Option<u32>, // session whose scrollbar the cursor is over (hover-expands the bar)
 
     // Mouse reporting: when a focused app enables DEC mouse tracking, button/
     // motion/wheel events are encoded and sent to the PTY instead of driving
@@ -605,6 +606,7 @@ impl App {
             pane_rects: Vec::new(),
             scrollbars: Vec::new(),
             scrollbar_drag: None,
+            sb_hover: None,
             mouse_held: None,
             mouse_session: None,
             mouse_cell: (-1, -1),
@@ -997,7 +999,8 @@ impl App {
     /// Grid dimensions for the terminal area (below the tab bar, right of sidebar).
     fn grid_dims(&self, w: u32, h: u32) -> (usize, usize) {
         let area = self.terminal_area(w, h);
-        let cols = (area.w / self.cell_w).max(1);
+        let (text_w, ..) = sb_layout(area, w as usize, self.scale, self.cell_w);
+        let cols = (text_w / self.cell_w).max(1);
         let rows = (area.h / self.cell_h).max(1);
         (cols, rows)
     }
@@ -1056,11 +1059,14 @@ impl App {
     fn terminal_area(&self, w: u32, h: u32) -> Rect {
         let bar = self.tab_bar_h();
         let sb = self.sidebar_w();
+        // Reserve a few px at the very bottom so the last row isn't flush against
+        // the window edge — easier to read, especially when maximized/fullscreen.
+        let bottom_pad = (4.0 * self.scale).round().max(3.0) as usize;
         Rect {
             x: sb,
             y: bar,
             w: (w as usize).saturating_sub(sb),
-            h: (h as usize).saturating_sub(bar),
+            h: (h as usize).saturating_sub(bar).saturating_sub(bottom_pad),
         }
     }
 
@@ -1755,7 +1761,8 @@ impl App {
             let mut rects = Vec::new();
             self.tabs[ti].root.leaf_rects(area, &mut rects);
             for (session, rect) in rects {
-                let cols = (rect.w / cw).max(1);
+                let (text_w, ..) = sb_layout(rect, w as usize, self.scale, cw);
+                let cols = (text_w / cw).max(1);
                 let rows = (rect.h / ch_px).max(1);
                 if let Some(p) = self.tabs[ti].root.find(session) {
                     p.term.lock().unwrap().resize(cols, rows);
@@ -1829,13 +1836,9 @@ impl App {
         }
 
         // Lay out panes for the active tab (also used for mouse hit-testing).
+        // terminal_area reserves the sidebar (left) and a small bottom margin.
         let sb = self.sidebar_w();
-        let area = Rect {
-            x: sb,
-            y: bar_h,
-            w: (w as usize).saturating_sub(sb),
-            h: (h as usize).saturating_sub(bar_h),
-        };
+        let area = self.terminal_area(w, h);
         self.pane_rects.clear();
         self.scrollbars.clear();
         self.tabs[self.active_term].root.leaf_rects(area, &mut self.pane_rects);
@@ -2064,11 +2067,12 @@ impl App {
                 }
             }
 
-            // Divider lines on the right/bottom edge of non-full panes.
-            if rect.x + rect.w < w as usize {
+            // Divider lines between split panes (compared against the pane AREA,
+            // not the window — the reserved bottom margin must not draw a divider).
+            if rect.x + rect.w < area.x + area.w {
                 fill_rect(buf, w, h, rect.x + rect.w, rect.y, DIVIDER, rect.h, divider);
             }
-            if rect.y + rect.h < h as usize {
+            if rect.y + rect.h < area.y + area.h {
                 fill_rect(buf, w, h, rect.x, rect.y + rect.h, rect.w, DIVIDER, divider);
             }
             // Focused pane: thin accent line along its top edge.
@@ -2077,18 +2081,20 @@ impl App {
                     OPAQUE | self.theme.selection);
             }
 
-            // Scrollbar on the pane's right edge when there's scrollback history
-            // (primary screen only — alt-screen apps own the whole grid). The
-            // thumb height reflects the visible fraction; scroll == 0 (live) puts
-            // it at the bottom. Overlaid (no reserved width); opaque so it reads
-            // over the translucent terminal background.
-            let sb_w = (4.0 * self.scale).round().max(4.0) as usize;
-            let div = if rect.x + rect.w < w as usize { DIVIDER } else { 0 };
+            // Scrollbar in the strip reserved at the pane's right edge (see
+            // sb_layout — text never draws under it). Primary screen only;
+            // alt-screen apps own the whole grid. It hover-expands: a slim resting
+            // bar grows to fill the reserved strip (≈ Windows Terminal's width)
+            // while the cursor is over it or dragging. The grab zone is always the
+            // full strip, so it's easy to catch even when drawn slim. A gutter is
+            // left beyond the bar (the resize margin at the window's right edge,
+            // else the divider), so the very edge still resizes the window.
+            let (text_w, band_x, bar_right, wide_w) = sb_layout(*rect, w as usize, self.scale, cw);
+            let thin_w = (5.0 * self.scale).round().max(4.0) as usize;
             // Draw only when there's history, on the primary screen, and the pane
-            // is actually wide enough to hold the bar (else track_x would underflow
-            // to the window's left edge and corrupt hit-testing in tiny splits).
-            if !alt && sb_count > 0 && rect.h > 0 && rect.w > sb_w + div {
-                let track_x = (rect.x + rect.w) - (sb_w + div);
+            // is actually wide enough to have reserved a real strip (else text_w
+            // was clamped and there's no room for the bar).
+            if !alt && sb_count > 0 && rect.h > 0 && text_w + wide_w < rect.w {
                 let total = sb_count + rows;
                 let min_thumb = ch_px.max(16);
                 let thumb_h = ((rect.h * rows) / total.max(1)).clamp(min_thumb.min(rect.h), rect.h);
@@ -2096,14 +2102,25 @@ impl App {
                 let from_top = sb_count.saturating_sub(scroll); // 0 = oldest .. sb_count = live
                 let thumb_y = rect.y + (travel * from_top) / sb_count.max(1);
                 let dragging = self.scrollbar_drag.map(|(s, _)| s == *session).unwrap_or(false);
+                // Expanded while dragging or while the cursor is within the band.
+                let (cx, cy) = self.cursor_px;
+                let hovering = cx >= band_x as f64
+                    && cx < bar_right as f64
+                    && cy >= rect.y as f64
+                    && cy < (rect.y + rect.h) as f64;
+                let draw_w = if dragging || hovering { wide_w } else { thin_w };
+                let draw_x = bar_right - draw_w; // right-anchored: slim bar hugs the band's edge
                 let track_col = (150u32 << 24) | mix(self.theme.bg, self.theme.fg, 0.14);
                 let thumb_col =
                     OPAQUE | mix(self.theme.bg, self.theme.fg, if dragging { 0.62 } else { 0.42 });
-                fill_rect(buf, w, h, track_x, rect.y, sb_w, rect.h, track_col);
-                fill_rect(buf, w, h, track_x, thumb_y, sb_w, thumb_h, thumb_col);
+                fill_rect(buf, w, h, draw_x, rect.y, draw_w, rect.h, track_col);
+                fill_rect(buf, w, h, draw_x, thumb_y, draw_w, thumb_h, thumb_col);
+                // Hit zone is the full wide band (not the drawn width), so the slim
+                // resting bar is still easy to catch; it ends at the resize gutter,
+                // so the very edge still resizes the window.
                 self.scrollbars.push(ScrollBar {
                     session: *session,
-                    track: Rect { x: track_x, y: rect.y, w: sb_w, h: rect.h },
+                    track: Rect { x: band_x, y: rect.y, w: wide_w, h: rect.h },
                     thumb_y,
                     thumb_h,
                     max_off: sb_count,
@@ -2505,6 +2522,12 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 self.update_resize_cursor();
+                // Hover-expand: redraw when the cursor enters or leaves a scrollbar.
+                let hov = self.scrollbar_hit(self.cursor_px.0, self.cursor_px.1).map(|s| s.session);
+                if hov != self.sb_hover {
+                    self.sb_hover = hov;
+                    self.request_redraw();
+                }
                 // Forward motion to a mouse-tracking app before any local selection.
                 if self.active_doc.is_none() && self.report_mouse_motion() {
                     return;
@@ -2589,12 +2612,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 (MouseButton::Left, ElementState::Released) => {
                     self.sidebar_resizing = false;
-                    self.scrollbar_drag = None;
+                    let was_dragging = self.scrollbar_drag.take().is_some();
                     if !self.report_mouse_release(0) {
                         let s = self.focused_session();
                         if let Some(p) = self.pane_mut(s) {
                             p.selecting = false;
                         }
+                    }
+                    if was_dragging {
+                        // Re-evaluate hover so the bar shrinks if the drag ended off it.
+                        self.sb_hover =
+                            self.scrollbar_hit(self.cursor_px.0, self.cursor_px.1).map(|s| s.session);
+                        self.request_redraw();
                     }
                 }
                 (MouseButton::Middle, ElementState::Pressed) => {
@@ -3021,6 +3050,24 @@ fn function_number(code: KeyCode) -> Option<u8> {
         KeyCode::F12 => 12,
         _ => return None,
     })
+}
+
+/// Scrollbar layout for a pane: `(text_w, band_x, bar_right, bar_w)`. Text is
+/// laid out in `[rect.x, rect.x + text_w)`; the scrollbar band occupies the
+/// reserved strip `[band_x, bar_right]` to its right, so the bar never draws over
+/// text. The reservation is constant w.r.t. scrollback (so columns don't reflow
+/// when history appears) and leaves a gutter beyond the bar — the resize margin
+/// at the window's right edge, else the inter-pane divider. `win_w` is the window
+/// width (to detect the resizable right edge).
+fn sb_layout(rect: Rect, win_w: usize, scale: f32, cell_w: usize) -> (usize, usize, usize, usize) {
+    let bar_w = (14.0 * scale).round().max(12.0) as usize;
+    let at_edge = rect.x + rect.w >= win_w;
+    let gutter = if at_edge { (8.0 * scale).round().max(5.0) as usize } else { DIVIDER };
+    let reserve = bar_w + gutter;
+    let text_w = rect.w.saturating_sub(reserve).max(cell_w);
+    let band_x = rect.x + text_w;
+    let bar_right = (band_x + bar_w).min(rect.x + rect.w);
+    (text_w, band_x, bar_right, bar_w)
 }
 
 /// If the cursor is within the resize border of a (borderless) window edge,
