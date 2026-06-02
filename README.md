@@ -64,6 +64,33 @@ Advanced overrides via environment variables:
 | `WSLPTYD_BIN` | *(unset — searches `artifacts/wslptyd` near the exe)* | Explicit path to the `wslptyd` binary. |
 | `WSLPTY_BIN` | *(unset — searches `artifacts/wslpty` near the exe)* | Explicit path to the `wslpty` helper. |
 
+## Key shortcuts
+
+| shortcut | action |
+|---|---|
+| `Ctrl+Shift+C` | Copy the selection |
+| `Ctrl+Shift+V` / `Shift+Insert` | Paste |
+| `Ctrl+Shift+T` | New tab |
+| `Ctrl+Shift+N` | New window (in the current directory) |
+| `Ctrl+Shift+W` | Close the focused pane / tab |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
+| `Alt+Shift+=` | Split the focused pane left/right (columns) |
+| `Alt+Shift+-` | Split the focused pane top/bottom (rows) |
+| `Ctrl+Shift+E` | Toggle the file sidebar |
+| `Ctrl+Shift+H` | Toggle hidden files in the sidebar |
+| `Ctrl+=` / `Ctrl+-` | Increase / decrease font size |
+| `Ctrl+0` | Reset font size |
+| `Shift+PageUp` / `Shift+PageDown` | Scroll the scrollback up / down one screen |
+| `Ctrl+,` | Edit `settings.json` (opens `edit.exe`; applies on close) |
+| `F11` | Toggle maximize |
+
+**Mouse:** the wheel scrolls the scrollback (`Ctrl+wheel` zooms the font); drag to
+select text and double-click to select a word; drag the scrollbar thumb (or click
+the track) to scroll. In the sidebar, click a folder to browse into it and a file
+to open it in your editor; right-click an entry for **Open in new window** /
+**Open**. Middle-click a tab to close it. Drag the window edges to resize and the
+tab bar to move the window.
+
 ## Configs
 
 Settings live in **`%APPDATA%\WslTerminal\settings.json`** (created on first
