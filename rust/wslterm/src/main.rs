@@ -32,7 +32,7 @@ use winit::window::{CursorIcon, Icon, ResizeDirection, Window, WindowId};
 
 use wslterm_core::color;
 use wslterm_core::input::{self, Key, Mods};
-use wslterm_core::{Cell, CellFlags, Terminal};
+use wslterm_core::{Cell, CellFlags, MouseTracking, Terminal};
 use wslterm_pty::bootstrap;
 use wslterm_pty::mux::MuxEvent;
 use wslterm_pty::{WslMux, WslProcess};
@@ -515,6 +515,15 @@ struct App {
     scrollbars: Vec<ScrollBar>,   // active tab's per-pane scrollbar geometry
     scrollbar_drag: Option<(u32, f64)>, // (session, grab offset within thumb, px)
 
+    // Mouse reporting: when a focused app enables DEC mouse tracking, button/
+    // motion/wheel events are encoded and sent to the PTY instead of driving
+    // local selection/scroll. `mouse_held` is the button (0/1/2) currently down
+    // in a report, `mouse_session` the pane it was pressed in (so drags keep
+    // reporting there), and `mouse_cell` the last reported cell (motion throttle).
+    mouse_held: Option<u8>,
+    mouse_session: Option<u32>,
+    mouse_cell: (i64, i64),
+
     // File sidebar.
     sidebar_open: bool,
     sidebar_width: usize,
@@ -596,6 +605,9 @@ impl App {
             pane_rects: Vec::new(),
             scrollbars: Vec::new(),
             scrollbar_drag: None,
+            mouse_held: None,
+            mouse_session: None,
+            mouse_cell: (-1, -1),
             sidebar_open: false,
             sidebar_width: 0,
             sidebar_resizing: false,
@@ -1437,6 +1449,166 @@ impl App {
         let total = t.scrollback_count() as i64 + t.rows() as i64;
         let abs = (top_abs + vrow).clamp(0, (total - 1).max(0));
         (abs, col.clamp(0, (cols - 1).max(0)))
+    }
+
+    // ---- mouse reporting (DEC mouse tracking) --------------------------
+    /// The mouse mode + SGR-encoding flag a pane's app has enabled.
+    fn mouse_mode(&self, session: u32) -> (MouseTracking, bool) {
+        self.pane(session)
+            .map(|p| {
+                let t = p.term.lock().unwrap();
+                (t.mouse(), t.mouse_sgr())
+            })
+            .unwrap_or((MouseTracking::None, false))
+    }
+
+    /// xterm modifier bits for a mouse report: shift 4 / alt 8 / ctrl 16.
+    fn mouse_mod_bits(&self) -> u32 {
+        let mut m = 0;
+        if self.mods.shift_key() {
+            m += 4;
+        }
+        if self.mods.alt_key() {
+            m += 8;
+        }
+        if self.mods.control_key() {
+            m += 16;
+        }
+        m
+    }
+
+    /// 0-based viewport (col, row) of the cursor within `rect`, clamped to the
+    /// pane's grid — what a mouse report needs (not absolute scrollback rows).
+    fn mouse_cell_at(&self, session: u32, rect: Rect) -> (i64, i64) {
+        let col = ((self.cursor_px.0 - rect.x as f64) / self.cell_w as f64).floor() as i64;
+        let row = ((self.cursor_px.1 - rect.y as f64) / self.cell_h as f64).floor() as i64;
+        let (cols, rows) = match self.pane(session) {
+            Some(p) => {
+                let t = p.term.lock().unwrap();
+                (t.cols() as i64, t.rows() as i64)
+            }
+            None => return (0, 0),
+        };
+        (col.clamp(0, (cols - 1).max(0)), row.clamp(0, (rows - 1).max(0)))
+    }
+
+    /// Encode one mouse report (SGR 1006 or legacy X10/normal) and send it to the
+    /// PTY. `cb` is the button code with motion (32) / wheel (64) bits and the
+    /// modifier bits already folded in (but not the legacy +32 char offset, nor
+    /// the X10 release low-bits). `col`/`row` are 0-based viewport cells.
+    fn send_mouse(&self, session: u32, sgr: bool, cb: u32, col: i64, row: i64, release: bool) {
+        let x = col.max(0) + 1;
+        let y = row.max(0) + 1;
+        let bytes: Vec<u8> = if sgr {
+            let term = if release { 'm' } else { 'M' };
+            format!("\x1b[<{cb};{x};{y}{term}").into_bytes()
+        } else {
+            // ESC [ M  Cb Cx Cy, each a byte = value + 32. A release reports the
+            // generic "button 3" in the low two bits; legacy coords cap at 223.
+            let b = if release { (cb & !0b11) | 3 } else { cb };
+            let enc = |v: i64| (32 + v).clamp(32, 255) as u8;
+            vec![0x1b, b'[', b'M', (32 + b).min(255) as u8, enc(x), enc(y)]
+        };
+        if let Some(mux) = &self.mux {
+            mux.send_data(session, &bytes);
+        }
+    }
+
+    /// Report a button press (0=left/1=middle/2=right) to a tracking app under
+    /// the cursor. Holding Shift forces local selection (xterm convention).
+    /// Returns true if the event was reported (caller skips local handling).
+    fn report_mouse_press(&mut self, btn: u8) -> bool {
+        let session = match self.pane_at_cursor() {
+            Some(s) => s,
+            None => return false,
+        };
+        let (mode, sgr) = self.mouse_mode(session);
+        if mode == MouseTracking::None || self.mods.shift_key() {
+            return false;
+        }
+        self.tabs[self.active_term].focus = session; // a click still focuses the pane
+        if let Some(rect) = self.rect_of(session) {
+            let (col, row) = self.mouse_cell_at(session, rect);
+            let cb = btn as u32 + self.mouse_mod_bits();
+            self.send_mouse(session, sgr, cb, col, row, false);
+            self.mouse_held = Some(btn);
+            self.mouse_session = Some(session);
+            self.mouse_cell = (col, row);
+        }
+        true
+    }
+
+    /// Report a button release matching a prior press. Returns true if consumed.
+    fn report_mouse_release(&mut self, btn: u8) -> bool {
+        let session = match self.mouse_session {
+            Some(s) => s,
+            None => return false,
+        };
+        let (mode, sgr) = self.mouse_mode(session);
+        // X10 (mode 9) and press-only apps never get a release report; still
+        // consume it so no stray selection lingers.
+        if matches!(mode, MouseTracking::Normal | MouseTracking::ButtonEvent | MouseTracking::AnyEvent)
+        {
+            if let Some(rect) = self.rect_of(session) {
+                let (col, row) = self.mouse_cell_at(session, rect);
+                let cb = btn as u32 + self.mouse_mod_bits();
+                self.send_mouse(session, sgr, cb, col, row, true);
+            }
+        }
+        self.mouse_held = None;
+        self.mouse_session = None;
+        true
+    }
+
+    /// Report pointer motion if the app wants it: AnyEvent (1003) reports every
+    /// move; ButtonEvent (1002) only while a button is down. Throttled to one
+    /// report per cell. Returns true if consumed.
+    fn report_mouse_motion(&mut self) -> bool {
+        let session = match self.pane_at_cursor() {
+            Some(s) => s,
+            None => return false,
+        };
+        let (mode, sgr) = self.mouse_mode(session);
+        let want = match mode {
+            MouseTracking::AnyEvent => true,
+            MouseTracking::ButtonEvent => self.mouse_held.is_some(),
+            _ => false,
+        };
+        if !want || self.mods.shift_key() {
+            return false;
+        }
+        if let Some(rect) = self.rect_of(session) {
+            let (col, row) = self.mouse_cell_at(session, rect);
+            if (col, row) == self.mouse_cell {
+                return true; // same cell — already reported
+            }
+            self.mouse_cell = (col, row);
+            // Motion sets bit 32; a held button keeps its number, else "button 3".
+            let cb = self.mouse_held.unwrap_or(3) as u32 + 32 + self.mouse_mod_bits();
+            self.send_mouse(session, sgr, cb, col, row, false);
+        }
+        true
+    }
+
+    /// Report a wheel notch (`up`) to a tracking app under the cursor as button
+    /// 64 (up) / 65 (down). Returns true if consumed.
+    fn report_mouse_wheel(&mut self, up: bool, notches: u32) -> bool {
+        let session = match self.pane_at_cursor() {
+            Some(s) => s,
+            None => return false,
+        };
+        let (mode, sgr) = self.mouse_mode(session);
+        if mode == MouseTracking::None || self.mods.shift_key() {
+            return false;
+        }
+        if let Some(rect) = self.rect_of(session) {
+            let (col, row) = self.mouse_cell_at(session, rect);
+            let cb = (if up { 64 } else { 65 }) + self.mouse_mod_bits();
+            for _ in 0..notches.max(1) {
+                self.send_mouse(session, sgr, cb, col, row, false);
+            }
+        }
+        true
     }
 
     fn begin_selection(&mut self) {
@@ -2308,6 +2480,8 @@ impl ApplicationHandler<UserEvent> for App {
                     let max = doc.lines.len().saturating_sub(1) as i32;
                     doc.scroll = (doc.scroll as i32 - step).clamp(0, max) as usize;
                     self.request_redraw();
+                } else if self.report_mouse_wheel(y > 0.0, (y.round().abs() as u32).max(1)) {
+                    // forwarded to a mouse-tracking app (zellij, vim, …)
                 } else {
                     self.scroll_by(step);
                 }
@@ -2331,6 +2505,10 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 self.update_resize_cursor();
+                // Forward motion to a mouse-tracking app before any local selection.
+                if self.active_doc.is_none() && self.report_mouse_motion() {
+                    return;
+                }
                 if self.active_doc.is_none()
                     && self.tabs.get(self.active_term).is_some()
                     && self.focused().selecting
@@ -2388,8 +2566,11 @@ impl ApplicationHandler<UserEvent> for App {
                         self.sidebar_click();
                     } else if self.active_doc.is_none() {
                         // A press on a pane's scrollbar starts a thumb drag or
-                        // pages the view; otherwise it begins a text selection.
-                        if let Some(sb) = self.scrollbar_hit(px, py) {
+                        // pages the view; otherwise it begins a text selection —
+                        // unless a mouse-tracking app wants the click forwarded.
+                        if self.report_mouse_press(0) {
+                            self.request_redraw();
+                        } else if let Some(sb) = self.scrollbar_hit(px, py) {
                             self.tabs[self.active_term].focus = sb.session;
                             if sb.thumb_contains(py) {
                                 self.scrollbar_drag = Some((sb.session, py - sb.thumb_y as f64));
@@ -2409,9 +2590,11 @@ impl ApplicationHandler<UserEvent> for App {
                 (MouseButton::Left, ElementState::Released) => {
                     self.sidebar_resizing = false;
                     self.scrollbar_drag = None;
-                    let s = self.focused_session();
-                    if let Some(p) = self.pane_mut(s) {
-                        p.selecting = false;
+                    if !self.report_mouse_release(0) {
+                        let s = self.focused_session();
+                        if let Some(p) = self.pane_mut(s) {
+                            p.selecting = false;
+                        }
                     }
                 }
                 (MouseButton::Middle, ElementState::Pressed) => {
@@ -2436,17 +2619,25 @@ impl ApplicationHandler<UserEvent> for App {
                                 None => {}
                             }
                         }
-                    } else {
+                    } else if !self.report_mouse_press(1) {
                         self.paste(); // X11-style middle-click paste in the terminal
                     }
                 }
+                (MouseButton::Middle, ElementState::Released) => {
+                    self.report_mouse_release(1);
+                }
                 (MouseButton::Right, ElementState::Pressed) => {
-                    if self.sidebar_w() > 0
+                    let in_sidebar = self.sidebar_w() > 0
                         && self.cursor_px.0 < self.sidebar_w() as f64 - self.sidebar_resize_handle_w()
-                        && self.cursor_px.1 >= self.tab_bar_h() as f64
-                    {
+                        && self.cursor_px.1 >= self.tab_bar_h() as f64;
+                    if in_sidebar {
                         self.open_sidebar_menu();
+                    } else {
+                        self.report_mouse_press(2);
                     }
+                }
+                (MouseButton::Right, ElementState::Released) => {
+                    self.report_mouse_release(2);
                 }
                 _ => {}
             },

@@ -4,7 +4,7 @@
 
 use crate::cell::Cell;
 use crate::parser::{ParserSinks, VtParser};
-use crate::screen::Screen;
+use crate::screen::{MouseTracking, Screen};
 
 pub struct Terminal {
     screen: Screen,
@@ -81,6 +81,15 @@ impl Terminal {
     }
     pub fn bracketed_paste(&self) -> bool {
         self.screen.bracketed_paste
+    }
+    /// Which mouse-tracking mode the app has enabled (None = the GUI keeps the
+    /// mouse for local selection/scroll; otherwise events are reported to the PTY).
+    pub fn mouse(&self) -> MouseTracking {
+        self.screen.mouse
+    }
+    /// True when the app requested SGR (1006) mouse-report encoding.
+    pub fn mouse_sgr(&self) -> bool {
+        self.screen.mouse_sgr
     }
 
     /// Snapshot the visible viewport into a rows×cols grid for rendering.
