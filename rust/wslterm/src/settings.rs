@@ -1,9 +1,12 @@
 //! User settings, loaded from `%APPDATA%\WslTerminal\settings.json` — the same
 //! file and schema the C# app uses (colors are "#RRGGBB"; FontSize in points;
-//! Opacity a 10..100 percent). Missing keys fall back to the Campbell defaults.
+//! Opacity a 10..100 percent). Rust-only background-image keys are optional, so
+//! old settings files keep their existing behavior.
 
 use serde::Deserialize;
 use wslterm_core::color;
+
+use crate::background::{BackgroundConfig, BackgroundFit};
 
 /// Resolved appearance.
 #[derive(Clone)]
@@ -11,6 +14,7 @@ pub struct Settings {
     pub font_family: String,
     pub font_pts: f32,
     pub opacity: f32, // 0.0..=1.0
+    pub background: BackgroundConfig,
     pub theme: Theme,
 }
 
@@ -57,6 +61,9 @@ struct Raw {
     cursor: String,
     selection: String,
     opacity: u32,
+    background_image: Option<String>,
+    background_image_opacity: u32,
+    background_image_fit: String,
     ansi: Vec<String>,
 }
 
@@ -70,6 +77,9 @@ impl Default for Raw {
             cursor: "#FFFFFF".into(),
             selection: "#264F78".into(),
             opacity: 100,
+            background_image: None,
+            background_image_opacity: 35,
+            background_image_fit: "cover".into(),
             ansi: CAMPBELL.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -109,6 +119,16 @@ impl From<Raw> for Settings {
             font_family: r.font_family,
             font_pts: if r.font_size > 0.0 { r.font_size } else { 12.0 },
             opacity: (r.opacity.clamp(10, 100) as f32) / 100.0,
+            background: BackgroundConfig {
+                path: r
+                    .background_image
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from),
+                opacity: (r.background_image_opacity.min(100) as f32) / 100.0,
+                fit: BackgroundFit::parse(&r.background_image_fit),
+            },
             theme: Theme {
                 bg: hex(&r.background, 0x0C_0C0C),
                 fg: hex(&r.foreground, 0xCC_CCCC),

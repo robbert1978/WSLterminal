@@ -30,16 +30,19 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key as WKey, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Icon, ResizeDirection, Window, WindowId};
 
+use wslterm_core::color;
 use wslterm_core::input::{self, Key, Mods};
 use wslterm_core::{Cell, CellFlags, Terminal};
 use wslterm_pty::bootstrap;
 use wslterm_pty::mux::MuxEvent;
 use wslterm_pty::{WslMux, WslProcess};
 
+mod background;
 mod gpu;
 mod layered;
 mod settings;
 mod wslfiles;
+use background::BackgroundImage;
 use gpu::{Gpu, GlyphDraw};
 use layered::{work_area, Layered};
 use settings::{Settings, Theme};
@@ -173,6 +176,8 @@ enum Layout {
 }
 
 const DIVIDER: usize = 1; // px between split panes
+const SIDEBAR_MIN_W: usize = 160;
+const SIDEBAR_DEFAULT_COLS: usize = 24;
 
 impl Layout {
     /// Assign each leaf a pixel rect within `area` (depth-first, left/top first).
@@ -522,6 +527,7 @@ struct App {
     ascent: f32,
     theme: Theme,
     opacity: f32,
+    background: BackgroundImage,
 
     mux: Option<WslMux>,
     registry: Registry,
@@ -551,6 +557,8 @@ struct App {
 
     // File sidebar.
     sidebar_open: bool,
+    sidebar_width: usize,
+    sidebar_resizing: bool,
     show_hidden: bool,
     sidebar_dir: String, // directory currently shown (may be browsed, != shell cwd)
     last_sidebar_cwd: String, // last shell cwd we followed; only re-follow when it changes
@@ -604,6 +612,7 @@ impl App {
             ascent: 0.0,
             theme: cfg.theme,
             opacity: parse_opacity_env().unwrap_or(cfg.opacity),
+            background: BackgroundImage::load(cfg.background),
             mux: None,
             registry: Arc::new(Mutex::new(HashMap::new())),
             outbox: Arc::new(Mutex::new(Vec::new())),
@@ -626,6 +635,8 @@ impl App {
             scrollbars: Vec::new(),
             scrollbar_drag: None,
             sidebar_open: false,
+            sidebar_width: 0,
+            sidebar_resizing: false,
             show_hidden: false,
             sidebar_dir: String::new(),
             last_sidebar_cwd: String::new(),
@@ -640,10 +651,52 @@ impl App {
     /// Sidebar width in device px (0 when closed).
     fn sidebar_w(&self) -> usize {
         if self.sidebar_open {
-            (self.cell_w * 24).clamp(160, 420)
+            let w = if self.sidebar_width == 0 {
+                self.default_sidebar_w()
+            } else {
+                self.sidebar_width
+            };
+            self.clamp_sidebar_w(w)
         } else {
             0
         }
+    }
+
+    fn default_sidebar_w(&self) -> usize {
+        (self.cell_w * SIDEBAR_DEFAULT_COLS).clamp(SIDEBAR_MIN_W, 420)
+    }
+
+    fn max_sidebar_w(&self) -> usize {
+        let reserve = (self.cell_w * 20).max(240);
+        self.win
+            .as_ref()
+            .map(|w| (w.inner_size().width as usize).saturating_sub(reserve).max(1))
+            .unwrap_or(840)
+    }
+
+    fn clamp_sidebar_w(&self, w: usize) -> usize {
+        let max = self.max_sidebar_w();
+        let min = SIDEBAR_MIN_W.min(max);
+        w.clamp(min, max)
+    }
+
+    fn sidebar_resize_handle_w(&self) -> f64 {
+        (6.0 * self.scale as f64).round().max(4.0)
+    }
+
+    fn sidebar_resize_hit(&self, px: f64, py: f64) -> bool {
+        let sb = self.sidebar_w();
+        if sb == 0 || py < self.tab_bar_h() as f64 {
+            return false;
+        }
+        let h = self.sidebar_resize_handle_w();
+        px >= sb as f64 - h && px < sb as f64 + h
+    }
+
+    fn resize_sidebar_to_cursor(&mut self) {
+        self.sidebar_width = self.clamp_sidebar_w(self.cursor_px.0.round().max(0.0) as usize);
+        self.reflow();
+        self.request_redraw();
     }
 
     /// List an explicit directory into the sidebar (browsing). This does NOT
@@ -698,17 +751,27 @@ impl App {
 
     /// Serialize the current appearance to the settings.json schema.
     fn settings_json(&self) -> String {
+        let js = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
         let hx = |c: u32| format!("\"#{:06X}\"", c & 0xFF_FFFF);
         let ansi: Vec<String> = self.theme.ansi.iter().map(|c| hx(*c)).collect();
+        let bg = self.background.config();
+        let bg_path = bg
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         format!(
-            "{{\n  \"FontFamily\": \"{}\",\n  \"FontSize\": {},\n  \"Background\": {},\n  \"Foreground\": {},\n  \"Cursor\": {},\n  \"Selection\": {},\n  \"Opacity\": {},\n  \"Ansi\": [{}]\n}}\n",
-            self.font_family,
+            "{{\n  \"FontFamily\": {},\n  \"FontSize\": {},\n  \"Background\": {},\n  \"Foreground\": {},\n  \"Cursor\": {},\n  \"Selection\": {},\n  \"Opacity\": {},\n  \"BackgroundImage\": {},\n  \"BackgroundImageOpacity\": {},\n  \"BackgroundImageFit\": {},\n  \"Ansi\": [{}]\n}}\n",
+            js(&self.font_family),
             self.font_pts_base,
             hx(self.theme.bg),
             hx(self.theme.fg),
             hx(self.theme.cursor),
             hx(self.theme.selection),
             (self.opacity * 100.0).round() as u32,
+            js(&bg_path),
+            (bg.opacity * 100.0).round() as u32,
+            js(bg.fit.as_str()),
             ansi.join(", ")
         )
     }
@@ -718,6 +781,7 @@ impl App {
         let cfg = Settings::load();
         self.theme = cfg.theme;
         self.opacity = cfg.opacity;
+        self.background = BackgroundImage::load(cfg.background);
         self.font_pts = cfg.font_pts;
         self.font_pts_base = cfg.font_pts;
         if cfg.font_family != self.font_family {
@@ -736,6 +800,9 @@ impl App {
     fn toggle_sidebar(&mut self) {
         self.sidebar_open = !self.sidebar_open;
         if self.sidebar_open {
+            if self.sidebar_width == 0 {
+                self.sidebar_width = self.default_sidebar_w();
+            }
             // Open at the shell's current directory and sync the follow baseline.
             let cwd = self.focused_cwd();
             self.last_sidebar_cwd = cwd.clone();
@@ -1484,12 +1551,16 @@ impl App {
             None => return,
         };
         let s = win.inner_size();
-        let icon = match resize_dir_at(self.cursor_px.0, self.cursor_px.1, s.width, s.height, self.scale) {
-            Some(ResizeDirection::North | ResizeDirection::South) => CursorIcon::NsResize,
-            Some(ResizeDirection::East | ResizeDirection::West) => CursorIcon::EwResize,
-            Some(ResizeDirection::NorthEast | ResizeDirection::SouthWest) => CursorIcon::NeswResize,
-            Some(ResizeDirection::NorthWest | ResizeDirection::SouthEast) => CursorIcon::NwseResize,
-            None => CursorIcon::Default,
+        let icon = if self.sidebar_resizing || self.sidebar_resize_hit(self.cursor_px.0, self.cursor_px.1) {
+            CursorIcon::EwResize
+        } else {
+            match resize_dir_at(self.cursor_px.0, self.cursor_px.1, s.width, s.height, self.scale) {
+                Some(ResizeDirection::North | ResizeDirection::South) => CursorIcon::NsResize,
+                Some(ResizeDirection::East | ResizeDirection::West) => CursorIcon::EwResize,
+                Some(ResizeDirection::NorthEast | ResizeDirection::SouthWest) => CursorIcon::NeswResize,
+                Some(ResizeDirection::NorthWest | ResizeDirection::SouthEast) => CursorIcon::NwseResize,
+                None => CursorIcon::Default,
+            }
         };
         win.set_cursor(icon);
     }
@@ -1598,6 +1669,7 @@ impl App {
         self.term_glyphs.clear(); // GPU path collects pane glyphs here this frame
         let buf: &mut [u32] = &mut self.fb;
         let op = (self.opacity.clamp(0.0, 1.0) * 255.0).round() as u32; // pane bg alpha
+        let has_background = self.background.is_active();
 
         // --- tab bar -------------------------------------------------------
         let chrome = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.10);
@@ -1710,6 +1782,10 @@ impl App {
         let dim = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.45);
         if self.active_doc.is_none() {
         for (session, rect) in &rects {
+            if has_background {
+                fill_rect(buf, w, h, rect.x, rect.y, rect.w, rect.h, (op << 24) | self.theme.bg);
+                self.background.paint_rect(buf, w, h, rect.x, rect.y, rect.w, rect.h);
+            }
             // Snapshot this pane's state, then release its borrow.
             let (term, scroll_off, sel) = {
                 let p = match self.tabs[self.active_term].root.find(*session) {
@@ -1760,6 +1836,7 @@ impl App {
                     let is_cursor = cursor_on && r == cy && c == cx;
                     let reverse = cell.flags.contains(CellFlags::REVERSE) ^ is_cursor;
                     let bold = cell.flags.contains(CellFlags::BOLD);
+                    let default_bg = cell.bg == color::DEFAULT;
                     let mut fg = self.theme.resolve(cell.fg, self.theme.fg, bold);
                     let mut bg = self.theme.resolve(cell.bg, self.theme.bg, false);
                     if reverse {
@@ -1770,12 +1847,14 @@ impl App {
                             std::mem::swap(&mut fg, &mut bg);
                         }
                     }
+                    let mut selected = false;
                     if let Some((r1, c1, r2, c2)) = sel {
                         let (ar, ac) = (top_abs + r as i64, c as i64);
                         let after = ar > r1 || (ar == r1 && ac >= c1);
                         let before = ar < r2 || (ar == r2 && ac <= c2);
                         if after && before {
                             bg = self.theme.selection;
+                            selected = true;
                         }
                     }
                     let x0 = rect.x + c * cw;
@@ -1783,7 +1862,9 @@ impl App {
                     // Terminal background uses the configured opacity; the cursor
                     // cell stays opaque so the block reads clearly.
                     let a = if is_cursor || reverse { 255 } else { op };
-                    fill_rect(buf, w, h, x0, y0, cw, ch_px, (a << 24) | bg);
+                    if !has_background || !default_bg || is_cursor || reverse || selected {
+                        fill_rect(buf, w, h, x0, y0, cw, ch_px, (a << 24) | bg);
+                    }
                     if cell.rune >= 0x20 {
                         if let Some(ch) = char::from_u32(cell.rune) {
                             if self.gpu_text {
@@ -1946,8 +2027,9 @@ impl App {
                     gx += cw;
                 }
             }
+            let grip = if self.sidebar_resizing { OPAQUE | self.theme.selection } else { divider };
             fill_rect(buf, w, h, sb.saturating_sub(DIVIDER), bar_h, DIVIDER,
-                (h as usize).saturating_sub(bar_h), divider);
+                (h as usize).saturating_sub(bar_h), grip);
         }
 
         // --- sidebar context menu (popup) ---------------------------------
@@ -2222,6 +2304,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_px = (position.x, position.y);
+                if self.sidebar_resizing {
+                    self.resize_sidebar_to_cursor();
+                    self.update_resize_cursor();
+                    return;
+                }
                 // Dragging a scrollbar thumb maps cursor-y straight to scroll_off.
                 if let Some((session, grab)) = self.scrollbar_drag {
                     if let Some(sb) = self.scrollbars.iter().find(|s| s.session == session).copied() {
@@ -2258,6 +2345,12 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                     }
+                    if self.sidebar_resize_hit(px, py) {
+                        self.sidebar_resizing = true;
+                        self.resize_sidebar_to_cursor();
+                        self.update_resize_cursor();
+                        return;
+                    }
                     if py < self.tab_bar_h() as f64 {
                         let x = px as f32;
                         // 2) Window controls.
@@ -2279,7 +2372,9 @@ impl ApplicationHandler<UserEvent> for App {
                             // 3) Empty tab-bar area drags the window.
                             let _ = win.drag_window();
                         }
-                    } else if self.sidebar_w() > 0 && px < self.sidebar_w() as f64 {
+                    } else if self.sidebar_w() > 0
+                        && px < self.sidebar_w() as f64 - self.sidebar_resize_handle_w()
+                    {
                         self.sidebar_click();
                     } else if self.active_doc.is_none() {
                         // A press on a pane's scrollbar starts a thumb drag or
@@ -2302,6 +2397,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 (MouseButton::Left, ElementState::Released) => {
+                    self.sidebar_resizing = false;
                     self.scrollbar_drag = None;
                     let s = self.focused_session();
                     if let Some(p) = self.pane_mut(s) {
@@ -2336,7 +2432,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 (MouseButton::Right, ElementState::Pressed) => {
                     if self.sidebar_w() > 0
-                        && self.cursor_px.0 < self.sidebar_w() as f64
+                        && self.cursor_px.0 < self.sidebar_w() as f64 - self.sidebar_resize_handle_w()
                         && self.cursor_px.1 >= self.tab_bar_h() as f64
                     {
                         self.open_sidebar_menu();
