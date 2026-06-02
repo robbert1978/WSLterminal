@@ -124,6 +124,7 @@ mod imp {
         cell_w: f32,
         cell_h: f32,
         target_bitmap: Option<ID2D1Bitmap1>,
+        src_bitmap: Option<ID2D1Bitmap1>, // persistent CPU->GPU upload bitmap (reused per frame)
         premul: Vec<u8>,
         w: u32,
         h: u32,
@@ -181,6 +182,7 @@ mod imp {
                     cell_w: 1.0,
                     cell_h: 1.0,
                     target_bitmap: None,
+                    src_bitmap: None,
                     premul: Vec::new(),
                     w: 0,
                     h: 0,
@@ -289,6 +291,7 @@ mod imp {
             unsafe {
                 self.dc.SetTarget(None);
                 self.target_bitmap = None;
+                self.src_bitmap = None;
                 self.swapchain.ResizeBuffers(
                     0,
                     w,
@@ -308,6 +311,26 @@ mod imp {
                     ..Default::default()
                 };
                 self.target_bitmap = Some(self.dc.CreateBitmapFromDxgiSurface(&back, Some(&props))?);
+
+                // Persistent upload bitmap for the CPU framebuffer: created once per
+                // size, refilled via CopyFromMemory each frame. Allocating a fresh
+                // GPU texture per frame (the old CreateBitmap-in-present) scaled with
+                // window area and caused the fullscreen lag.
+                let sprops = D2D1_BITMAP_PROPERTIES1 {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                    },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                    ..Default::default()
+                };
+                self.src_bitmap = Some(self.dc.CreateBitmap(
+                    D2D_SIZE_U { width: w, height: h },
+                    None,
+                    0,
+                    &sprops,
+                )?);
             }
             self.w = w;
             self.h = h;
@@ -348,31 +371,19 @@ mod imp {
                 self.dc.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
 
                 // Layer 1: the CPU framebuffer (chrome, backgrounds, cursor, sel).
-                let size = D2D_SIZE_U { width: w, height: h };
-                let props = D2D1_BITMAP_PROPERTIES1 {
-                    pixelFormat: D2D1_PIXEL_FORMAT {
-                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                    },
-                    dpiX: 96.0,
-                    dpiY: 96.0,
-                    ..Default::default()
-                };
-                let src = self.dc.CreateBitmap(
-                    size,
-                    Some(self.premul.as_ptr() as *const core::ffi::c_void),
-                    w * 4,
-                    &props,
-                )?;
-                let rect = D2D_RECT_F { left: 0.0, top: 0.0, right: w as f32, bottom: h as f32 };
-                self.dc.DrawBitmap(
-                    &src,
-                    Some(&rect),
-                    1.0,
-                    D2D1_INTERPOLATION_MODE_LINEAR,
-                    None,
-                    None,
-                );
+                // Refill the persistent upload bitmap (no per-frame GPU alloc) and blit.
+                if let Some(src) = &self.src_bitmap {
+                    src.CopyFromMemory(None, self.premul.as_ptr() as *const core::ffi::c_void, w * 4)?;
+                    let rect = D2D_RECT_F { left: 0.0, top: 0.0, right: w as f32, bottom: h as f32 };
+                    self.dc.DrawBitmap(
+                        src,
+                        Some(&rect),
+                        1.0,
+                        D2D1_INTERPOLATION_MODE_LINEAR,
+                        None,
+                        None,
+                    );
+                }
 
                 // Layer 2: terminal glyphs (system fallback + color emoji).
                 if let Some(brush) = self.brush.clone() {
