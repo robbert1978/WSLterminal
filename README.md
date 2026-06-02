@@ -161,7 +161,8 @@ block on a GUI exe, capture them with
   working directory** (OSC 7). Double-click a folder to enter it, a file to open
   it in a **viewer/editor tab**; right-click for Open / "Insert path at prompt"
   (files) or "Open in new window" (folders). Hidden dot-files are off by default
-  (Ctrl+Shift+H toggles). The panel font defaults to the terminal's size and is
+  (Ctrl+Shift+H toggles). Drag the right divider to resize the panel when long
+  filenames need more room. The panel font defaults to the terminal's size and is
   adjustable (Ctrl +/−/0 when focused). The panel is opaque even when the window
   is translucent.
 * **File viewer/editor** — opened files become tabs with **syntax highlighting**
@@ -224,6 +225,7 @@ bounded by the shared WSL relay transport, not the terminal. Measure with
 | Ctrl+Shift+N | new window in the shell's current directory |
 | Ctrl+Shift+E / the 🗀 button | toggle the file sidebar |
 | Ctrl+Shift+H | toggle hidden (dot) files in the sidebar |
+| drag sidebar right divider | resize the file sidebar |
 | double-click file / folder (sidebar) | open file in a tab / enter folder |
 | Ctrl+S (in a file tab) | save edits back to the WSL file |
 | Ctrl+, | open the appearance settings dialog |
@@ -246,6 +248,9 @@ Settings keys (the JSON is also editable directly):
 | `Background`, `Foreground`, `Cursor`, `Selection` | `#RRGGBB` colors |
 | `Ansi` | the 16 ANSI colors (`black…white`, then `bright*`) |
 | `Opacity` | window opacity %, 10–100 (100 = opaque) |
+| `BackgroundImage` | optional terminal-pane background image path (Rust build) |
+| `BackgroundImageOpacity` | background image opacity %, 0–100 (Rust build) |
+| `BackgroundImageFit` | `cover`, `contain`, `stretch`, `tile`, or `center` (Rust build) |
 
 `Opacity` < 100 makes the window translucent — the real desktop shows through the
 background (plain see-through, no blur), via WPF's `AllowsTransparency` (a
@@ -257,7 +262,8 @@ used. The layered window carries some extra GPU cost — the price of real per-p
 transparency in WPF. Translucency needs a borderless window, so in that mode the
 app draws a small custom title bar (drag + minimize/maximize/close) with resize
 borders; at `100` it uses the normal native frame (and no layered-window cost).
-(WT's acrylic/blur and `backgroundImage` aren't supported — this is plain opacity.)
+The Rust build also supports a plain bitmap `BackgroundImage` behind terminal
+cells. WT's acrylic/blur effects are not supported.
 
 **New window in the same directory** (Ctrl+Shift+N) works because the shell
 reports its working directory via OSC 7; the new window is launched with
