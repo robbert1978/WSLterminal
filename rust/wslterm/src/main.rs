@@ -512,6 +512,7 @@ struct App {
     font: FontVec,
     fallback: Vec<FontVec>, // for glyphs the primary font lacks (CJK, Cyrillic, symbols)
     font_family: String,
+    font_path: Option<std::path::PathBuf>, // resolved font file (shared by CPU + GPU text)
     scale: f32,
     font_pts: f32,
     font_pts_base: f32,
@@ -551,7 +552,8 @@ struct App {
     // File sidebar.
     sidebar_open: bool,
     show_hidden: bool,
-    sidebar_dir: String,
+    sidebar_dir: String, // directory currently shown (may be browsed, != shell cwd)
+    last_sidebar_cwd: String, // last shell cwd we followed; only re-follow when it changes
     sidebar_entries: Vec<wslfiles::Entry>,
     sidebar_scroll: usize,
     sidebar_menu: Option<SidebarMenu>, // right-click context menu
@@ -591,6 +593,7 @@ impl App {
             restore_rect: None,
             font,
             fallback: load_fallback_fonts(),
+            font_path: font_file_path(&cfg.font_family),
             font_family: cfg.font_family.clone(),
             scale: 1.0,
             font_pts: cfg.font_pts,
@@ -625,6 +628,7 @@ impl App {
             sidebar_open: false,
             show_hidden: false,
             sidebar_dir: String::new(),
+            last_sidebar_cwd: String::new(),
             sidebar_entries: Vec::new(),
             sidebar_scroll: 0,
             sidebar_menu: None,
@@ -642,14 +646,14 @@ impl App {
         }
     }
 
-    /// Re-list the sidebar from the focused pane's cwd (called on cwd change /
-    /// toggle). No-op when the sidebar is closed.
-    fn refresh_sidebar(&mut self) {
+    /// List an explicit directory into the sidebar (browsing). This does NOT
+    /// touch the shell's working directory — the panel is an independent file
+    /// browser. No-op when the sidebar is closed.
+    fn list_sidebar_dir(&mut self, dir: String) {
         if !self.sidebar_open {
             return;
         }
-        let cwd = self.focused_cwd();
-        let dir = if cwd.is_empty() { "/".to_string() } else { cwd };
+        let dir = if dir.is_empty() { "/".to_string() } else { dir };
         let mut entries = wslfiles::list(DISTRO, &dir, self.show_hidden);
         // Prepend a ".." parent entry (unless at root), like the C# sidebar.
         if dir != "/" {
@@ -663,6 +667,17 @@ impl App {
         self.sidebar_entries = entries;
         self.sidebar_dir = dir;
         self.sidebar_scroll = 0;
+    }
+
+    /// Re-list the directory the sidebar is currently showing (e.g. after
+    /// toggling hidden files). Falls back to the shell cwd if nothing is shown.
+    fn refresh_sidebar(&mut self) {
+        let dir = if self.sidebar_dir.is_empty() {
+            self.focused_cwd()
+        } else {
+            self.sidebar_dir.clone()
+        };
+        self.list_sidebar_dir(dir);
     }
 
     /// Open settings.json in the editor (Ctrl+,). Creates it with current values
@@ -709,6 +724,7 @@ impl App {
             if let Some(f) = load_monospace_font(&cfg.font_family) {
                 self.font = f;
             }
+            self.font_path = font_file_path(&cfg.font_family);
             self.font_family = cfg.font_family;
         }
         self.recompute_metrics();
@@ -719,15 +735,19 @@ impl App {
 
     fn toggle_sidebar(&mut self) {
         self.sidebar_open = !self.sidebar_open;
-        self.refresh_sidebar();
+        if self.sidebar_open {
+            // Open at the shell's current directory and sync the follow baseline.
+            let cwd = self.focused_cwd();
+            self.last_sidebar_cwd = cwd.clone();
+            self.list_sidebar_dir(cwd);
+        }
         self.reflow(); // terminal area width changed
         self.request_redraw();
     }
 
     fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
-        self.sidebar_dir.clear(); // force re-list
-        self.refresh_sidebar();
+        self.refresh_sidebar(); // re-list the directory currently shown
         self.request_redraw();
     }
 
@@ -752,8 +772,9 @@ impl App {
             (e.is_dir, e.linux_path.clone(), e.name.clone())
         };
         if is_dir {
-            let cmd = format!(" cd '{}'\r", lp.replace('\'', "'\\''"));
-            self.send(cmd.as_bytes());
+            // Browse into the folder in the panel only — do NOT cd the shell.
+            // The panel follows the shell's cwd only on a manual `cd`.
+            self.list_sidebar_dir(lp);
         } else {
             self.open_doc(Doc::open(DISTRO, &lp, &name));
         }
@@ -814,8 +835,7 @@ impl App {
             "Open in new window" => spawn_window(Some(lp)),
             "Open" => {
                 if is_dir {
-                    let cmd = format!(" cd '{}'\r", lp.replace('\'', "'\\''"));
-                    self.send(cmd.as_bytes());
+                    self.list_sidebar_dir(lp); // browse in the panel; don't cd the shell
                 } else {
                     self.open_doc(Doc::open(DISTRO, &lp, &name));
                 }
@@ -1425,7 +1445,13 @@ impl App {
     /// (no-op on the CPU/layered path).
     fn sync_gpu_font(&mut self) {
         if let Some(g) = &mut self.gpu {
-            g.set_font(&self.font_family, self.font_px, self.cell_w as f32, self.cell_h as f32);
+            g.set_font(
+                &self.font_family,
+                self.font_px,
+                self.cell_w as f32,
+                self.cell_h as f32,
+                self.font_path.as_deref(),
+            );
         }
     }
 
@@ -1994,7 +2020,13 @@ impl ApplicationHandler<UserEvent> for App {
             if use_gpu {
                 match Gpu::new(hwnd) {
                     Ok(mut g) => {
-                        g.set_font(&self.font_family, self.font_px, self.cell_w as f32, self.cell_h as f32);
+                        g.set_font(
+                            &self.font_family,
+                            self.font_px,
+                            self.cell_w as f32,
+                            self.cell_h as f32,
+                            self.font_path.as_deref(),
+                        );
                         self.gpu = Some(g);
                         self.gpu_text = true;
                     }
@@ -2123,12 +2155,14 @@ impl ApplicationHandler<UserEvent> for App {
                         mux.send_data(id, &bytes);
                     }
                 }
-                // Follow the shell's cwd in the sidebar.
+                // Follow the shell's cwd in the sidebar, but only when it actually
+                // changes (a manual `cd`). Clicking a folder browses the panel
+                // independently, so we must not snap it back to the cwd here.
                 if self.sidebar_open {
                     let cwd = self.focused_cwd();
-                    let dir = if cwd.is_empty() { "/".into() } else { cwd };
-                    if dir != self.sidebar_dir {
-                        self.refresh_sidebar();
+                    if cwd != self.last_sidebar_cwd {
+                        self.last_sidebar_cwd = cwd.clone();
+                        self.list_sidebar_dir(cwd);
                     }
                 }
                 // Pace the actual present to the monitor refresh (about_to_wait).
@@ -2533,25 +2567,29 @@ fn load_window_icon() -> Option<Icon> {
     Icon::from_rgba(img.rgba_data().to_vec(), img.width(), img.height()).ok()
 }
 
+const FALLBACK_FONT_PATHS: [&str; 4] = [
+    r"C:\Windows\Fonts\consola.ttf",
+    r"C:\Windows\Fonts\CascadiaMono.ttf",
+    r"C:\Windows\Fonts\CascadiaCode.ttf",
+    r"C:\Windows\Fonts\lucon.ttf",
+];
+
 fn load_monospace_font(family: &str) -> Option<FontVec> {
-    // 1. Resolve the configured family by scanning the font directories.
-    if let Some(f) = find_family_font(family) {
-        return Some(f);
+    let path = font_file_path(family)?;
+    let bytes = std::fs::read(&path).ok()?;
+    FontVec::try_from_vec(bytes).ok()
+}
+
+/// Resolve the configured family to a concrete font file (the same file both the
+/// CPU renderer and the GPU/DirectWrite renderer load, so they stay identical).
+fn font_file_path(family: &str) -> Option<std::path::PathBuf> {
+    if let Some(p) = find_family_font_path(family) {
+        return Some(p);
     }
-    // 2. Fall back to common monospace fonts by filename.
-    for path in [
-        r"C:\Windows\Fonts\consola.ttf",
-        r"C:\Windows\Fonts\CascadiaMono.ttf",
-        r"C:\Windows\Fonts\CascadiaCode.ttf",
-        r"C:\Windows\Fonts\lucon.ttf",
-    ] {
-        if let Ok(bytes) = std::fs::read(path) {
-            if let Ok(font) = FontVec::try_from_vec(bytes) {
-                return Some(font);
-            }
-        }
-    }
-    None
+    FALLBACK_FONT_PATHS
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists())
 }
 
 /// Lowercase + keep only alphanumerics, for loose font-name matching.
@@ -2562,8 +2600,8 @@ fn squash(s: &str) -> String {
 /// Find a font file whose name matches `family` by scanning the per-user and
 /// system font folders, preferring the Regular weight. Pure filename matching —
 /// no font-table parsing — which covers Nerd Fonts and the like (their filenames
-/// embed the family name).
-fn find_family_font(family: &str) -> Option<FontVec> {
+/// embed the family name). Returns the validated, loadable file path.
+fn find_family_font_path(family: &str) -> Option<std::path::PathBuf> {
     let key = squash(family);
     if key.len() < 3 {
         return None;
@@ -2606,8 +2644,8 @@ fn find_family_font(family: &str) -> Option<FontVec> {
     });
     for p in candidates {
         if let Ok(bytes) = std::fs::read(&p) {
-            if let Ok(font) = FontVec::try_from_vec(bytes) {
-                return Some(font);
+            if FontVec::try_from_vec(bytes).is_ok() {
+                return Some(p); // validated loadable; return the path
             }
         }
     }

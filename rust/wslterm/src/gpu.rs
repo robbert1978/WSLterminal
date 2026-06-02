@@ -54,10 +54,13 @@ mod imp {
         DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
     };
     use windows::Win32::Graphics::DirectWrite::{
-        DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
-        DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_WORD_WRAPPING_NO_WRAP,
+        DWriteCreateFactory, IDWriteFactory, IDWriteFactory3, IDWriteFactory5,
+        IDWriteFontCollection, IDWriteFontCollection1, IDWriteFontFile, IDWriteFontSet,
+        IDWriteFontSetBuilder, IDWriteFontSetBuilder1, IDWriteLocalizedStrings, IDWriteTextFormat,
+        IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
+        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_WORD_WRAPPING_NO_WRAP,
     };
+    use std::path::Path;
     use windows::Win32::Graphics::Dxgi::Common::{
         DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
     };
@@ -115,6 +118,7 @@ mod imp {
         _visual: IDCompositionVisual,
         dwrite: IDWriteFactory,
         text_format: Option<IDWriteTextFormat>,
+        custom_collection: Option<IDWriteFontCollection>, // kept alive for text_format
         layouts: HashMap<char, IDWriteTextLayout>,
         brush: Option<ID2D1SolidColorBrush>,
         cell_w: f32,
@@ -171,6 +175,7 @@ mod imp {
                     _visual: visual,
                     dwrite,
                     text_format: None,
+                    custom_collection: None,
                     layouts: HashMap::new(),
                     brush: None,
                     cell_w: 1.0,
@@ -183,18 +188,60 @@ mod imp {
             }
         }
 
+        /// Load a single font file into a private DirectWrite font collection and
+        /// return (its family name, the collection). This makes the terminal use
+        /// the *exact* file the CPU sidebar loaded, instead of relying on DWrite's
+        /// system-collection name lookup (which can land on the wrong face/fallback
+        /// for Nerd Fonts whose typographic family differs from the GDI name).
+        fn load_font_file(&self, path: &Path) -> Option<(Vec<u16>, IDWriteFontCollection)> {
+            unsafe {
+                let path_w = to_wide(&path.to_string_lossy());
+                let file: IDWriteFontFile =
+                    self.dwrite.CreateFontFileReference(PCWSTR(path_w.as_ptr()), None).ok()?;
+                let f3: IDWriteFactory3 = self.dwrite.cast().ok()?;
+                let builder0: IDWriteFontSetBuilder = f3.CreateFontSetBuilder().ok()?;
+                let builder: IDWriteFontSetBuilder1 = builder0.cast().ok()?;
+                builder.AddFontFile(&file).ok()?;
+                let set: IDWriteFontSet = builder.CreateFontSet().ok()?;
+                let f5: IDWriteFactory5 = self.dwrite.cast().ok()?;
+                let coll1: IDWriteFontCollection1 = f5.CreateFontCollectionFromFontSet(&set).ok()?;
+                let family = coll1.GetFontFamily(0).ok()?;
+                let names: IDWriteLocalizedStrings = family.GetFamilyNames().ok()?;
+                let len = names.GetStringLength(0).ok()? as usize;
+                let mut name = vec![0u16; len + 1];
+                names.GetString(0, &mut name).ok()?;
+                let base: IDWriteFontCollection = coll1.cast().ok()?;
+                Some((name, base))
+            }
+        }
+
         /// (Re)build the DirectWrite text format for the given font + cell size,
         /// dropping the cached per-char layouts. Called on init and font change.
-        pub fn set_font(&mut self, family: &str, px: f32, cell_w: f32, cell_h: f32) {
+        /// `path` is the resolved font file (preferred); falls back to a system
+        /// family-name lookup when absent.
+        pub fn set_font(&mut self, family: &str, px: f32, cell_w: f32, cell_h: f32, path: Option<&Path>) {
             self.cell_w = cell_w.max(1.0);
             self.cell_h = cell_h.max(1.0);
             self.layouts.clear();
-            let family_w = to_wide(family);
+            self.custom_collection = None;
+
+            // Prefer loading the exact file; fall back to the system family name.
+            let (name_w, collection) = match path.and_then(|p| self.load_font_file(p)) {
+                Some((n, c)) => {
+                    let nm = String::from_utf16_lossy(&n[..n.len().saturating_sub(1)]);
+                    eprintln!("[wslterm] GPU text font loaded from file -> family '{nm}'");
+                    (n, Some(c))
+                }
+                None => {
+                    eprintln!("[wslterm] GPU text font: system family '{family}' (no file)");
+                    (to_wide(family), None)
+                }
+            };
             let locale = to_wide("en-us");
             let fmt = unsafe {
                 self.dwrite.CreateTextFormat(
-                    PCWSTR(family_w.as_ptr()),
-                    None,
+                    PCWSTR(name_w.as_ptr()),
+                    collection.as_ref(),
                     DWRITE_FONT_WEIGHT_NORMAL,
                     DWRITE_FONT_STYLE_NORMAL,
                     DWRITE_FONT_STRETCH_NORMAL,
@@ -208,6 +255,7 @@ mod imp {
                         let _ = f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
                     }
                     self.text_format = Some(f);
+                    self.custom_collection = collection;
                 }
                 Err(e) => eprintln!("[wslterm] DWrite CreateTextFormat failed: {e:?}"),
             }
@@ -368,7 +416,15 @@ mod stub {
         pub fn new(_hwnd: isize) -> Result<Gpu, ()> {
             Err(())
         }
-        pub fn set_font(&mut self, _family: &str, _px: f32, _cell_w: f32, _cell_h: f32) {}
+        pub fn set_font(
+            &mut self,
+            _family: &str,
+            _px: f32,
+            _cell_w: f32,
+            _cell_h: f32,
+            _path: Option<&std::path::Path>,
+        ) {
+        }
         pub fn present(&mut self, _fb: &[u32], _w: u32, _h: u32, _glyphs: &[GlyphDraw]) {}
     }
 }
