@@ -1903,8 +1903,28 @@ impl App {
             let chip_w = (text.chars().count() * cw + pad * 2).clamp(40, 240);
             let x0 = x;
             let x1 = (x + chip_w).min(chips_right);
+            // Tile geometry (a small top/bottom inset inside the bar).
+            let cy0 = 2usize;
+            let chh = bar_h.saturating_sub(4);
+            let chw = x1.saturating_sub(x0);
             if *active {
-                fill_rect(buf, w, h, x0, 2, x1.saturating_sub(x0), bar_h.saturating_sub(4), chip_active);
+                fill_rect(buf, w, h, x0, cy0, chw, chh, chip_active);
+            }
+            // A visible 1–2px border around every tile so tabs are distinct even
+            // when inactive. The active tab gets the accent color; others a
+            // muted line.
+            {
+                let t = (1.0 * self.scale).round().max(1.0) as usize;
+                let bc = OPAQUE
+                    | if *active {
+                        self.theme.selection
+                    } else {
+                        mix(self.theme.bg, self.theme.fg, 0.30)
+                    };
+                fill_rect(buf, w, h, x0, cy0, chw, t, bc); // top
+                fill_rect(buf, w, h, x0, cy0 + chh.saturating_sub(t), chw, t, bc); // bottom
+                fill_rect(buf, w, h, x0, cy0, t, chh, bc); // left
+                fill_rect(buf, w, h, x0 + chw.saturating_sub(t), cy0, t, chh, bc); // right
             }
             let fg = if *active {
                 self.theme.fg
