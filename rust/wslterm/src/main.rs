@@ -2739,16 +2739,61 @@ fn install_panic_log() {
     }));
 }
 
-/// `--cd <wsl-dir>`: the directory the first tab should start in (used when a
-/// new window is spawned from "Open in new window" / Ctrl+Shift+N).
+/// `--cd <dir>`: the directory the first tab should start in. Accepts either a
+/// Linux path (used when a new window is spawned from "Open in new window" /
+/// Ctrl+Shift+N) or a **Windows** path — so an Explorer context menu can pass
+/// `%V` directly (see `windows_to_wsl_path`). Anything that can't be resolved to
+/// an absolute Linux path is dropped, so the tab falls back to the home (`~`).
 fn parse_cd_arg() -> Option<String> {
     let mut args = std::env::args();
     while let Some(a) = args.next() {
         if a == "--cd" {
-            return args.next().filter(|s| !s.is_empty());
+            return args
+                .next()
+                .filter(|s| !s.is_empty())
+                .map(|s| windows_to_wsl_path(&s))
+                .filter(|s| s.starts_with('/'));
         }
     }
     None
+}
+
+/// Translate a Windows path into its WSL/Linux equivalent so `--cd %V` from an
+/// Explorer context menu works:
+///   - drive paths map under `/mnt`:    `C:\Users` -> `/mnt/c/Users`,
+///     `F:\test` -> `/mnt/f/test`, `C:\` -> `/mnt/c`;
+///   - WSL UNC shares map back to their Linux path:
+///     `\\wsl.localhost\Ubuntu\home\me` (or `\\wsl$\...`) -> `/home/me`.
+/// A path that is already POSIX (starts with `/`) is returned unchanged; an
+/// unrecognized form is returned as-is (the caller then discards it).
+fn windows_to_wsl_path(p: &str) -> String {
+    let s = p.trim();
+    if s.starts_with('/') {
+        return s.to_string(); // already a Linux path (internal spawn)
+    }
+    // WSL UNC share: strip `\\wsl.localhost\<distro>\` (or `\\wsl$\<distro>\`),
+    // leaving the Linux-absolute remainder. Normalize separators to backslashes.
+    let norm = s.replace('/', "\\");
+    for prefix in ["\\\\wsl.localhost\\", "\\\\wsl$\\"] {
+        if let Some(rest) = norm.strip_prefix(prefix) {
+            // rest = "<distro>\<linux path>"; drop the distro component.
+            let after = rest.splitn(2, '\\').nth(1).unwrap_or("");
+            return format!("/{}", after.replace('\\', "/").trim_start_matches('/'));
+        }
+    }
+    // Drive path: `X:\...`, `X:/...`, or bare `X:`.
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[1] == b':' && (b[0] as char).is_ascii_alphabetic() {
+        let drive = (b[0] as char).to_ascii_lowercase();
+        let rest = s[2..].replace('\\', "/");
+        let rest = rest.trim_start_matches('/').trim_end_matches('/');
+        return if rest.is_empty() {
+            format!("/mnt/{drive}")
+        } else {
+            format!("/mnt/{drive}/{rest}")
+        };
+    }
+    s.to_string() // unrecognized — caller discards (falls back to ~)
 }
 
 /// Launch another wslterm window (a detached, windowless child process).
@@ -3160,4 +3205,44 @@ fn blend(dst: u32, fg: u32, cov: f32) -> u32 {
     let g = (fgc * cov + dg * inv) as u32;
     let b = (fb * cov + db * inv) as u32;
     (r << 16) | (g << 8) | b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::windows_to_wsl_path as w;
+
+    #[test]
+    fn drive_paths() {
+        assert_eq!(w(r"C:\Users"), "/mnt/c/Users");
+        assert_eq!(w(r"F:\test"), "/mnt/f/test");
+        assert_eq!(w(r"C:\Users\me\Some Dir"), "/mnt/c/Users/me/Some Dir");
+        assert_eq!(w(r"d:\Games\steam"), "/mnt/d/Games/steam");
+    }
+
+    #[test]
+    fn drive_roots_and_trailing() {
+        assert_eq!(w(r"C:\"), "/mnt/c");
+        assert_eq!(w("C:"), "/mnt/c");
+        assert_eq!(w(r"C:\Users\"), "/mnt/c/Users");
+        assert_eq!(w("C:/Users"), "/mnt/c/Users"); // forward slashes too
+    }
+
+    #[test]
+    fn wsl_unc_shares() {
+        assert_eq!(w(r"\\wsl.localhost\Ubuntu\home\me"), "/home/me");
+        assert_eq!(w(r"\\wsl$\Ubuntu\home\me\proj"), "/home/me/proj");
+        assert_eq!(w(r"\\wsl.localhost\Debian\"), "/");
+    }
+
+    #[test]
+    fn linux_paths_pass_through() {
+        assert_eq!(w("/home/me/proj"), "/home/me/proj"); // internal spawn cwd
+        assert_eq!(w("  /var/log  "), "/var/log");
+    }
+
+    #[test]
+    fn unrecognized_returned_as_is() {
+        // Caller discards anything not starting with '/'.
+        assert!(!w(r"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}").starts_with('/'));
+    }
 }

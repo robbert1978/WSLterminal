@@ -89,7 +89,17 @@ cargo run --release          # prints a per-benchmark summary table
 
 | argument | default | meaning |
 |---|---|---|
-| `--cd <wsl-dir>` | *(none — first tab starts in your home `~`)* | WSL directory the first tab opens in. Used internally by **Open in new window** / `Ctrl+Shift+N` to spawn a window in a folder. |
+| `--cd <dir>` | *(none — first tab starts in your home `~`)* | Directory the first tab opens in. Accepts a Linux path (used internally by **Open in new window** / `Ctrl+Shift+N`) **or a Windows path**, which is translated to WSL: `C:\Users` → `/mnt/c/Users`, `\\wsl.localhost\Ubuntu\home\me` → `/home/me`. A path that can't be resolved falls back to `~`. |
+
+**Explorer integration.** Because `--cd` accepts Windows paths, you can add an
+"Open WSL in here" right-click entry via the bundled **`openinwsl.reg`** (edit
+the `wslterm.exe` path to your install location first). It passes the folder as
+`--cd "%V"`:
+
+```reg
+[HKEY_CLASSES_ROOT\Directory\Background\shell\Open WSL in here\Command]
+@="D:\\WSLterminal\\wslterm.exe --cd \"%V\""
+```
 
 Advanced overrides via environment variables:
 

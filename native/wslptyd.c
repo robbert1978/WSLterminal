@@ -128,10 +128,10 @@ static void open_sess(uint32_t id, uint16_t cols, uint16_t rows,
     if (pid < 0) { send_exit(id, 127); return; }
 
     if (pid == 0) {
-        /* Requested dir, else default to $HOME (~) — not the daemon's cwd. */
-        if (cwd && *cwd) {
-            if (chdir(cwd) != 0) { /* ignore */ }
-        } else {
+        /* Requested dir if it exists; else fall back to $HOME (~) — never the
+         * daemon's cwd. (A translated Windows path may point at an unmounted
+         * drive, so a failed chdir must still land in the home directory.) */
+        if (!cwd || !*cwd || chdir(cwd) != 0) {
             const char *home = getenv("HOME");
             if (home && *home) { if (chdir(home) != 0) { /* ignore */ } }
         }
