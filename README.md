@@ -47,6 +47,42 @@ configured `Editor` (default `nano`) in a new terminal tab via
 `exec <Editor> '<file>'`, so quitting the editor closes the tab. `Ctrl+,` edits
 `settings.json` with Windows `edit.exe`; settings reload when you close it.
 
+## Benchmark
+
+Throughput is measured with [vtebench](https://github.com/alacritty/vtebench):
+it streams large payloads through the PTY and times how fast the terminal drains
+them, so it stresses **PTY read/parse throughput only** (not frame rate or input
+latency). **Lower is better.** The chart compares WSL Terminal against
+[Alacritty](https://github.com/alacritty/alacritty) — a native-Linux,
+GPU-accelerated terminal used here as a fast reference — on the same machine.
+
+![vtebench: WSL Terminal (green) vs Alacritty (purple), milliseconds, lower is better](docs/benchmark.png)
+
+Each pair of boxes is one benchmark (purple = Alacritty, green = WSL Terminal);
+the box is the sample spread and the line its median, in milliseconds.
+
+WSL Terminal reaches the distro over a **vsock transport** (PTY → `wslptyd` →
+vsock → Windows → DirectComposition) rather than running natively in the VM like
+Alacritty — yet it stays competitive:
+
+- **Faster** on uniform-cell throughput and alt-screen scroll — `medium_cells`,
+  `sync_medium_cells`, `scrolling_fullscreen`, and the `scrolling_top*` regions.
+- **On par** on `light_cells`, `unicode`, and the `scrolling_bottom*` regions.
+- **Slower** on `cursor_motion` (CSI cursor addressing), `dense_cells` (every
+  cell changes color/attribute), and primary-screen `scrolling` (each line is
+  pushed to scrollback) — the paths where the extra transport hop and per-cell
+  work cost the most.
+
+The tall `scrolling*`-region bars (~120 ms) are slow for **both** terminals —
+that's inherent to those benchmarks, not the renderer.
+
+Reproduce (run **inside a WSL Terminal tab**, so it is the terminal under test):
+
+```sh
+git clone https://github.com/alacritty/vtebench && cd vtebench
+cargo run --release          # prints a per-benchmark summary table
+```
+
 ## Arguments
 
 `wslterm.exe` takes a single command-line argument:
