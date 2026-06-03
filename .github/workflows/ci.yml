@@ -1,0 +1,84 @@
+name: CI
+
+# Build + test only when the actual source changes on main — docs, the app
+# icon, and other non-code files are excluded so they don't spam runs.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rust/**'
+      - 'native/**'
+      - '.github/workflows/ci.yml'
+      - '!rust/**/*.md'
+      - '!rust/wslterm/wsl.ico'
+  workflow_dispatch:
+
+# A newer push to the same ref cancels the older in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  helpers:
+    name: Linux helpers + core tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build native PTY helpers (wslpty, wslptyd)
+        run: cd native && sh build.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Test the portable VT engine (wslterm-core)
+        run: cargo test -p wslterm-core --manifest-path rust/Cargo.toml
+      - name: Upload helper binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: helpers
+          path: |
+            artifacts/wslpty
+            artifacts/wslptyd
+          if-no-files-found: error
+
+  windows:
+    name: Windows GUI (release)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build wslterm.exe (release)
+        run: cargo build --release -p wslterm --manifest-path rust/Cargo.toml
+      - name: Upload wslterm.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: wslterm-exe
+          path: rust/target/release/wslterm.exe
+          if-no-files-found: error
+
+  package:
+    name: Package runnable bundle
+    needs: [helpers, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download wslterm.exe
+        uses: actions/download-artifact@v4
+        with:
+          name: wslterm-exe
+          path: WslTerminal
+      - name: Download helper binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: helpers
+          path: WslTerminal/artifacts
+      - name: Zip (wslterm.exe next to artifacts\)
+        run: zip -r WslTerminal-rust-win-x64.zip WslTerminal
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: WslTerminal-rust-win-x64
+          path: WslTerminal-rust-win-x64.zip
+          if-no-files-found: error
