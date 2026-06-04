@@ -14,6 +14,8 @@ pub struct Terminal {
     title: Option<String>,
     /// Bytes the emulator owes the PTY (DSR/DA replies). Drain after `feed`.
     pub respond: Vec<u8>,
+    /// Pending OSC 52 clipboard request; drain with `take_clipboard` after `feed`.
+    clipboard: Option<String>,
 }
 
 impl Terminal {
@@ -25,6 +27,7 @@ impl Terminal {
             cwd: None,
             title: None,
             respond: Vec::new(),
+            clipboard: None,
         }
     }
 
@@ -32,6 +35,7 @@ impl Terminal {
         self.sinks.respond.clear();
         self.sinks.title = None;
         self.sinks.cwd = None;
+        self.sinks.clipboard = None;
         self.parser.parse(&mut self.screen, &mut self.sinks, data);
         if !self.sinks.respond.is_empty() {
             self.respond.extend_from_slice(&self.sinks.respond);
@@ -42,6 +46,15 @@ impl Terminal {
         if let Some(c) = self.sinks.cwd.take() {
             self.cwd = Some(c);
         }
+        if let Some(c) = self.sinks.clipboard.take() {
+            self.clipboard = Some(c);
+        }
+    }
+
+    /// Take a pending OSC 52 clipboard request (set by an app like zellij/tmux/vim).
+    /// The owner writes the returned text to the system clipboard.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard.take()
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -134,6 +147,29 @@ mod tests {
         assert_eq!(g[0][0].rune, 'h' as u32);
         assert_eq!(g[0][1].rune, 'e' as u32);
         assert_eq!(g[0][4].rune, 'o' as u32);
+    }
+
+    #[test]
+    fn osc52_sets_clipboard_bel() {
+        let mut t = Terminal::new(20, 4);
+        t.feed(b"\x1b]52;c;aGVsbG8=\x07"); // base64("hello")
+        assert_eq!(t.take_clipboard().as_deref(), Some("hello"));
+        assert_eq!(t.take_clipboard(), None); // one-shot: drained
+    }
+
+    #[test]
+    fn osc52_sets_clipboard_st_and_unicode() {
+        let mut t = Terminal::new(20, 4);
+        // base64("hi ☃") terminated by ST (ESC \), empty target field.
+        t.feed(b"\x1b]52;;aGkg4piD\x1b\\");
+        assert_eq!(t.take_clipboard().as_deref(), Some("hi ☃"));
+    }
+
+    #[test]
+    fn osc52_read_request_ignored() {
+        let mut t = Terminal::new(20, 4);
+        t.feed(b"\x1b]52;c;?\x07"); // a paste/read query — we don't serve it
+        assert_eq!(t.take_clipboard(), None);
     }
 
     #[test]

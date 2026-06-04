@@ -24,6 +24,9 @@ pub struct ParserSinks {
     pub respond: Vec<u8>,
     pub title: Option<String>,
     pub cwd: Option<String>,
+    /// Text an app asked to put on the system clipboard via OSC 52 (e.g. zellij /
+    /// tmux / vim `copy_on_select` / yank). The owner writes it to the OS clipboard.
+    pub clipboard: Option<String>,
 }
 
 pub struct VtParser {
@@ -463,6 +466,19 @@ impl VtParser {
                     sinks.cwd = Some(cwd);
                 }
             }
+            // OSC 52: clipboard. `text` is "<targets>;<base64|?>". A "?" payload is
+            // a read request (we don't serve it); otherwise decode and surface the
+            // text for the owner to put on the system clipboard.
+            "52" => {
+                if let Some(semi) = text.find(';') {
+                    let data = &text[semi + 1..];
+                    if data != "?" {
+                        if let Some(b) = base64_decode(data) {
+                            sinks.clipboard = Some(String::from_utf8_lossy(&b).into_owned());
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -475,6 +491,35 @@ impl VtParser {
             self.osc.clear();
         }
     }
+}
+
+// Decode standard base64 (OSC 52 payload). Ignores '=' padding and any
+// whitespace; returns None on an invalid character.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a' + 26) as u32,
+            b'0'..=b'9' => (c - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    }
+    let mut out = Vec::new();
+    let (mut buf, mut bits) = (0u32, 0u32);
+    for &c in s.as_bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        buf = (buf << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 // OSC 7 reports the working dir as file://HOST/PATH (percent-encoded).

@@ -2368,6 +2368,7 @@ impl ApplicationHandler<UserEvent> for App {
                 while let Ok(first) = rx.recv() {
                     let mut ev = Some(first);
                     let mut resp: Vec<(u32, Vec<u8>)> = Vec::new();
+                    let mut clip: Option<String> = None;
                     while let Some(e) = ev.take() {
                         match e {
                             MuxEvent::Data { id, bytes } => {
@@ -2379,6 +2380,9 @@ impl ApplicationHandler<UserEvent> for App {
                                     if !t.respond.is_empty() {
                                         resp.push((id, std::mem::take(&mut t.respond)));
                                     }
+                                    if let Some(c) = t.take_clipboard() {
+                                        clip = Some(c); // OSC 52 (zellij/tmux/vim copy)
+                                    }
                                 }
                             }
                             MuxEvent::Exit { id, .. } => {
@@ -2389,6 +2393,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     if !resp.is_empty() {
                         outbox.lock().unwrap().extend(resp);
+                    }
+                    // OSC 52: push the latest clipboard request to the OS clipboard
+                    // (the per-terminal lock is already released here).
+                    if let Some(text) = clip {
+                        let _ = clipboard_win::set_clipboard_string(&text);
                     }
                     let dt = mark.elapsed().as_secs_f64();
                     if dt >= 1.0 {
