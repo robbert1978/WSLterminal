@@ -42,7 +42,7 @@ jobs:
           if-no-files-found: error
 
   windows:
-    name: Windows GUI (release)
+    name: Windows tests + GUI build
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +50,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      - name: Test all crates (core, pty, GUI)
+        run: cargo test --workspace --manifest-path rust/Cargo.toml
       - name: Build wslterm.exe (release)
         run: cargo build --release -p wslterm --manifest-path rust/Cargo.toml
       - name: Upload wslterm.exe
