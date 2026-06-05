@@ -124,6 +124,12 @@ impl Terminal {
     pub fn search(&self, needle: &str) -> Vec<(i64, usize, usize)> {
         self.screen.search(needle)
     }
+    /// Shell-integration (OSC 133) prompt marks mapped to current absolute rows:
+    /// `(abs_row, exit)`, oldest first. `exit` is `Some(code)` once the command
+    /// finished (non-zero = failed).
+    pub fn prompt_marks(&self) -> Vec<(i64, Option<i32>)> {
+        self.screen.prompt_marks()
+    }
 
     // direct cursor access (parity with C# Cx/Cy used by tests)
     pub fn cx(&self) -> usize {
@@ -198,6 +204,18 @@ mod tests {
         t.feed(b"(ref http://a.io).");
         let (_, _, u) = t.url_at(0, 8).unwrap();
         assert_eq!(u, "http://a.io"); // trailing ")." dropped
+    }
+
+    #[test]
+    fn osc133_prompt_marks() {
+        let mut t = Terminal::new(20, 4);
+        // Prompt on row 0, command runs, finishes with exit 1; new prompt row 1.
+        t.feed(b"\x1b]133;A\x07$ false\r\n\x1b]133;D;1\x07\x1b]133;A\x07$ ");
+        let m = t.prompt_marks();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0], (0, Some(1))); // first prompt, command failed
+        assert_eq!(m[1].0, 1); // second prompt at row 1
+        assert_eq!(m[1].1, None); // its command hasn't finished
     }
 
     #[test]

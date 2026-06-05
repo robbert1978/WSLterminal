@@ -30,6 +30,10 @@
 - [x] **Searchable scrollback** (`Ctrl+Shift+F`) — case-insensitive, match
       highlight (current match brighter), Enter / Shift+Enter to step
       next / previous (also ↓/↑), Esc to close.
+- [x] **Shell integration** — OSC 7 (cwd) + OSC 133 (prompt/exit marks) via
+      `assets/shell-integration.sh` (bash/zsh): `Ctrl+Shift+Up/Down` jump to
+      prompt, red scrollbar ticks for failed commands. (Auto-install + OSC 133
+      B/C output-selection are follow-ups.)
 
 ## ⬜ Planned (not yet implemented)
 

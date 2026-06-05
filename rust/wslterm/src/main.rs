@@ -1383,6 +1383,15 @@ impl App {
                     self.switch_tab(if shift { -1 } else { 1 });
                     return;
                 }
+                // Jump between shell prompts (needs OSC 133 shell integration).
+                KeyCode::ArrowUp if ctrl && shift => {
+                    self.jump_prompt(-1);
+                    return;
+                }
+                KeyCode::ArrowDown if ctrl && shift => {
+                    self.jump_prompt(1);
+                    return;
+                }
                 KeyCode::Equal | KeyCode::NumpadAdd if ctrl => {
                     self.zoom_font(1.0);
                     return;
@@ -1879,6 +1888,36 @@ impl App {
         }
     }
 
+    /// Jump the focused pane to the previous (`-1`, older) / next (`+1`, newer)
+    /// shell prompt (OSC 133 mark), placing it at the top of the viewport.
+    fn jump_prompt(&mut self, dir: i32) {
+        let s = self.focused_session();
+        let (marks, sbc, off) = match self.pane(s) {
+            Some(p) => {
+                let t = p.term.lock().unwrap();
+                (t.prompt_marks(), t.scrollback_count() as i64, p.scroll_off as i64)
+            }
+            None => return,
+        };
+        if marks.is_empty() {
+            return;
+        }
+        let top_abs = sbc - off; // absolute row currently at the top of the view
+        let rows_it = marks.iter().map(|(r, _)| *r);
+        let target = if dir < 0 {
+            rows_it.filter(|&r| r < top_abs).max()
+        } else {
+            rows_it.filter(|&r| r > top_abs).min()
+        };
+        if let Some(abs) = target {
+            let new_off = (sbc - abs).clamp(0, sbc);
+            if let Some(p) = self.pane_mut(s) {
+                p.scroll_off = new_off as usize;
+            }
+            self.request_redraw();
+        }
+    }
+
     /// Show a resize cursor when hovering a window edge (borderless feedback).
     fn update_resize_cursor(&self) {
         let win = match &self.win {
@@ -2159,6 +2198,7 @@ impl App {
                 (p.term.clone(), p.scroll_off, p.sel)
             };
             let (cols, rows, cx, cy, cursor_on, top_abs, scroll, sb_count, alt);
+            let failed_rows: Vec<i64>;
             {
                 let t = term.lock().unwrap();
                 sb_count = t.scrollback_count();
@@ -2171,6 +2211,13 @@ impl App {
                 cursor_on = t.cursor_visible() && scroll == 0;
                 top_abs = sb_count as i64 - scroll as i64;
                 alt = t.in_alt();
+                // Failed-command rows (OSC 133;D exit != 0) for scrollbar ticks.
+                failed_rows = t
+                    .prompt_marks()
+                    .into_iter()
+                    .filter(|(_, e)| matches!(e, Some(c) if *c != 0))
+                    .map(|(r, _)| r)
+                    .collect();
             }
             let rcols = (rect.w / cw).min(cols);
             let rrows = (rect.h / ch_px).min(rows);
@@ -2322,6 +2369,15 @@ impl App {
                     OPAQUE | mix(self.theme.bg, self.theme.fg, if dragging { 0.62 } else { 0.42 });
                 fill_rect(buf, w, h, draw_x, rect.y, draw_w, rect.h, track_col);
                 fill_rect(buf, w, h, draw_x, thumb_y, draw_w, thumb_h, thumb_col);
+                // Red ticks at failed-command prompts (OSC 133), positioned by
+                // their fraction down the whole buffer.
+                let tick_h = (2.0 * self.scale).round().max(1.0) as usize;
+                for &fr in &failed_rows {
+                    if fr >= 0 && (fr as usize) < total {
+                        let ty = rect.y + (rect.h * fr as usize) / total.max(1);
+                        fill_rect(buf, w, h, draw_x, ty, draw_w, tick_h, OPAQUE | 0xE0_3030);
+                    }
+                }
                 // Hit zone is the full wide band (not the drawn width), so the slim
                 // resting bar is still easy to catch; it ends at the resize gutter,
                 // so the very edge still resizes the window.

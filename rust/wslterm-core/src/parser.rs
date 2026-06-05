@@ -106,7 +106,7 @@ impl VtParser {
             St::EscInt => self.escape_intermediate(b),
             St::Csi => self.csi(s, sinks, b),
             St::CsiInt => self.csi_intermediate(s, sinks, b),
-            St::Osc => self.osc(sinks, b),
+            St::Osc => self.osc(s, sinks, b),
             St::OscEsc => self.osc_esc(s, sinks, b),
             St::Str => self.str_consume(b),
         }
@@ -426,9 +426,9 @@ impl VtParser {
         }
     }
 
-    fn osc(&mut self, sinks: &mut ParserSinks, b: u8) {
+    fn osc(&mut self, scr: &mut Screen, sinks: &mut ParserSinks, b: u8) {
         if b == 0x07 {
-            self.osc_done(sinks);
+            self.osc_done(scr, sinks);
             return;
         }
         if b == 0x1b {
@@ -440,7 +440,7 @@ impl VtParser {
 
     fn osc_esc(&mut self, s: &mut Screen, sinks: &mut ParserSinks, b: u8) {
         if b == b'\\' {
-            self.osc_done(sinks);
+            self.osc_done(s, sinks);
             return;
         }
         self.state = St::Ground;
@@ -448,7 +448,7 @@ impl VtParser {
         self.step(s, sinks, b);
     }
 
-    fn osc_done(&mut self, sinks: &mut ParserSinks) {
+    fn osc_done(&mut self, scr: &mut Screen, sinks: &mut ParserSinks) {
         let bytes = std::mem::take(&mut self.osc);
         self.state = St::Ground;
         // Decode the whole payload as UTF-8 once (lossy: malformed bytes become
@@ -477,6 +477,20 @@ impl VtParser {
                             sinks.clipboard = Some(String::from_utf8_lossy(&b).into_owned());
                         }
                     }
+                }
+            }
+            // OSC 133: shell-integration semantic prompts (FinalTerm/iTerm2).
+            // `text` is "A"|"B"|"C"|"D[;exit]"|… — we use A (prompt start) and
+            // D (command finished, with exit code).
+            "133" => {
+                let mut parts = text.split(';');
+                match parts.next().unwrap_or("") {
+                    "A" => scr.mark_prompt(),
+                    "D" => {
+                        let exit = parts.next().and_then(|x| x.trim().parse::<i32>().ok());
+                        scr.mark_cmd_exit(exit.unwrap_or(0));
+                    }
+                    _ => {} // B (command start) / C (output start): not needed yet
                 }
             }
             _ => {}

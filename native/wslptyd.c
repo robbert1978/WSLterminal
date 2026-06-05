@@ -336,6 +336,9 @@ static int vsock_serve(int port) {
 
 int main(int argc, char **argv) {
     if (!getenv("TERM")) setenv("TERM", "xterm-256color", 1);
+    /* Let shells/apps detect this terminal (e.g. the shell-integration script). */
+    setenv("WSLTERM", "1", 1);
+    setenv("TERM_PROGRAM", "WSLTerminal", 1);
     signal(SIGPIPE, SIG_IGN);
     for (int i = 0; i < MAX_SESS; i++) { g_sess[i].active = 0; g_sess[i].master = -1; g_sess[i].pid = -1; }
 

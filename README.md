@@ -127,15 +127,41 @@ Advanced overrides via environment variables:
 | `Ctrl+=` / `Ctrl+-` | Increase / decrease font size |
 | `Ctrl+0` | Reset font size |
 | `Shift+PageUp` / `Shift+PageDown` | Scroll the scrollback up / down one screen |
+| `Ctrl+Shift+F` | Search the scrollback (Enter / Shift+Enter to step matches, Esc to close) |
+| `Ctrl+Shift+Up` / `Ctrl+Shift+Down` | Jump to the previous / next shell prompt (needs shell integration) |
 | `Ctrl+,` | Edit `settings.json` (opens `edit.exe`; applies on close) |
 | `F11` | Toggle maximize |
 
 **Mouse:** the wheel scrolls the scrollback (`Ctrl+wheel` zooms the font); drag to
 select text and double-click to select a word; drag the scrollbar thumb (or click
-the track) to scroll. In the sidebar, click a folder to browse into it and a file
-to open it in your editor; right-click an entry for **Open in new window** /
+the track) to scroll. **Ctrl+hover** a URL to highlight it and **Ctrl+click** to
+open it in your browser. In the sidebar, click a folder to browse into it and a
+file to open it in your editor; right-click an entry for **Open in new window** /
 **Open**. Middle-click a tab to close it. Drag the window edges to resize and the
 tab bar to move the window.
+
+## Shell integration
+
+Sourcing **`assets/shell-integration.sh`** from your WSL shell teaches it to
+report the working directory (OSC 7) and mark shell prompts and command exit
+status (OSC 133). With it enabled:
+
+- **new tabs/splits open in the focused pane's directory**;
+- **`Ctrl+Shift+Up/Down` jumps between prompts** in the scrollback;
+- **failed commands** get a red tick in the scrollbar.
+
+Copy the script into WSL and source it from `~/.bashrc` (bash) and/or `~/.zshrc`
+(zsh):
+
+```sh
+mkdir -p ~/.config/wslterm
+cp /mnt/c/path/to/assets/shell-integration.sh ~/.config/wslterm/
+echo '[ -f ~/.config/wslterm/shell-integration.sh ] && . ~/.config/wslterm/shell-integration.sh' >> ~/.bashrc
+```
+
+It's a no-op for non-interactive shells, for shells other than bash/zsh, and
+outside WSL Terminal (the terminal sets `WSLTERM=1`), so it's safe to keep in a
+shared dotfile.
 
 ## Configs
 

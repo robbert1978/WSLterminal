@@ -98,6 +98,10 @@ pub struct Screen {
     /// Kept off the cell so `Cell` stays `Copy`. Grows only when combining marks
     /// appear (rare); bounded so an adversarial stream can't grow it without end.
     combo_pool: Vec<String>,
+    /// Shell-integration (OSC 133) prompt marks: `(global_line_id, exit)` where
+    /// the id is `scrolled_total + cy` at the prompt, stable as lines scroll into
+    /// history; `exit` is filled in when the command finishes (OSC 133;D).
+    prompts: Vec<(u64, Option<i32>)>,
 
     last_base_x: isize,
     last_base_y: isize,
@@ -135,6 +139,7 @@ impl Screen {
             scrollback: Scrollback::new(5000),
             scrolled_total: 0,
             combo_pool: Vec::new(),
+            prompts: Vec::new(),
             last_base_x: -1,
             last_base_y: -1,
             auto_wrap: true,
@@ -162,6 +167,54 @@ impl Screen {
     #[inline]
     pub fn in_alt(&self) -> bool {
         self.buf_alt
+    }
+
+    // ---- shell integration (OSC 133) ----------------------------------
+    /// Record a prompt start at the cursor's line (OSC 133;A). Primary screen
+    /// only; ids use the monotonic `scrolled_total` so they survive scrolling.
+    pub fn mark_prompt(&mut self) {
+        if self.buf_alt {
+            return;
+        }
+        let gid = self.scrolled_total + self.cy as u64;
+        // Avoid duplicate marks for the same line (some shells emit A twice).
+        if self.prompts.last().map(|&(g, _)| g) != Some(gid) {
+            self.prompts.push((gid, None));
+        }
+        // Drop evicted marks and cap the history.
+        let oldest = self.scrolled_total.saturating_sub(self.scrollback.count() as u64);
+        self.prompts.retain(|&(g, _)| g >= oldest);
+        if self.prompts.len() > 2000 {
+            let drop = self.prompts.len() - 2000;
+            self.prompts.drain(0..drop);
+        }
+    }
+
+    /// Record the exit status of the command launched from the latest prompt
+    /// (OSC 133;D;<exit>). Primary screen only.
+    pub fn mark_cmd_exit(&mut self, exit: i32) {
+        if self.buf_alt {
+            return;
+        }
+        if let Some(last) = self.prompts.last_mut() {
+            if last.1.is_none() {
+                last.1 = Some(exit);
+            }
+        }
+    }
+
+    /// Prompt marks mapped to current absolute rows: `(abs_row, exit)`, oldest
+    /// first. Evicted/off-grid marks are skipped.
+    pub fn prompt_marks(&self) -> Vec<(i64, Option<i32>)> {
+        let base = self.scrolled_total as i64 - self.scrollback.count() as i64;
+        let limit = (self.scrollback.count() + self.rows) as i64;
+        self.prompts
+            .iter()
+            .filter_map(|&(g, e)| {
+                let abs = g as i64 - base;
+                (abs >= 0 && abs < limit).then_some((abs, e))
+            })
+            .collect()
     }
     #[inline]
     fn buf(&self) -> &Vec<Vec<Cell>> {
@@ -460,7 +513,10 @@ impl Screen {
                     self.fill_row(r, &blank);
                 }
             }
-            3 => self.scrollback.clear(),
+            3 => {
+                self.scrollback.clear();
+                self.prompts.clear();
+            }
             _ => {}
         }
         self.wrap_pending = false;
@@ -588,6 +644,7 @@ impl Screen {
         }
         self.erase_in_display(2);
         self.scrollback.clear();
+        self.prompts.clear();
         self.combo_pool.clear(); // no live cell references a combo after a reset
     }
 
