@@ -2053,6 +2053,15 @@ impl App {
             Some(w) => w.clone(),
             None => return,
         };
+        // All panes/tabs gone (e.g. the connection dropped under load and every
+        // session was torn down) — the app is exiting. Skip this frame so we
+        // don't index an empty `tabs`. Keep `active_term` in range defensively.
+        if self.tabs.is_empty() {
+            return;
+        }
+        if self.active_term >= self.tabs.len() {
+            self.active_term = self.tabs.len() - 1;
+        }
         let size = win.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
         let bar_h = self.tab_bar_h();
