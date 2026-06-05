@@ -11,10 +11,17 @@ out="$here/../artifacts"
 mkdir -p "$out"
 
 CC="${CC:-cc}"
+CFLAGS="${CFLAGS:-}"
 echo "building with $CC ($($CC -dumpmachine))"
 
-"$CC" -static -O2 -Wall -Wextra -std=c11 -o "$out/wslpty"  "$here/wslpty.c"  -lutil
-"$CC" -static -O2 -Wall -Wextra -std=c11 -o "$out/wslptyd" "$here/wslptyd.c" -lutil
+if [ -z "$CFLAGS" ]; then
+    CFLAGS="-static -O3 -Wall -Wextra -std=c11"
+else
+    CFLAGS="${CFLAGS} -static -O3 -Wall -Wextra -std=c11"
+fi
+
+"$CC" $CFLAGS -o "$out/wslpty"  "$here/wslpty.c"  -lutil
+"$CC" $CFLAGS -o "$out/wslptyd" "$here/wslptyd.c" -lutil
 
 echo "built -> $out/wslpty , $out/wslptyd"
 ls -l "$out/wslpty" "$out/wslptyd"
