@@ -298,28 +298,23 @@ fn split_layout(node: Layout, target: u32, side_by_side: bool, newp: &mut Option
     }
 }
 
-/// Nudge the divider of the *nearest* ancestor split that sits on the requested
-/// side of the focused pane, growing it in that direction (Alt+Shift+Arrow).
-/// `want_sbs` picks the orientation (true = columns/left-right, false = rows);
-/// `want_in_a` requires the focused pane to be in the split's first child
-/// (left/top) so the divider is on the desired side; `delta` shifts the ratio.
-/// Returns `(focus_in_subtree, adjusted)`.
-fn resize_split(node: &mut Layout, focus: u32, want_sbs: bool, want_in_a: bool, delta: f32) -> (bool, bool) {
+/// Move the divider of the *nearest* ancestor split of the requested orientation
+/// containing the focused pane, in the arrow direction (Alt+Shift+Arrow). Like
+/// Windows Terminal, the shared border moves regardless of which side the focused
+/// pane is on, so both arrows work for both panes. `want_sbs` picks the
+/// orientation (true = columns/left-right, false = rows); `delta` shifts the
+/// split's ratio (Right/Down = +, Left/Up = −). Returns `(focus_in_subtree, adjusted)`.
+fn resize_split(node: &mut Layout, focus: u32, want_sbs: bool, delta: f32) -> (bool, bool) {
     match node {
         Layout::Empty => (false, false),
         Layout::Leaf(p) => (p.session == focus, false),
         Layout::Split { side_by_side, ratio, a, b } => {
-            let (in_a, adj) = resize_split(a, focus, want_sbs, want_in_a, delta);
-            if in_a {
-                if !adj && *side_by_side == want_sbs && want_in_a {
-                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
-                    return (true, true);
-                }
-                return (true, adj);
-            }
-            let (in_b, adj) = resize_split(b, focus, want_sbs, want_in_a, delta);
-            if in_b {
-                if !adj && *side_by_side == want_sbs && !want_in_a {
+            // Recurse into the child holding the focus only (don't touch the other).
+            let (in_a, adj_a) = resize_split(a, focus, want_sbs, delta);
+            let (in_sub, adj) =
+                if in_a { (true, adj_a) } else { resize_split(b, focus, want_sbs, delta) };
+            if in_sub {
+                if !adj && *side_by_side == want_sbs {
                     *ratio = (*ratio + delta).clamp(0.1, 0.9);
                     return (true, true);
                 }
@@ -1222,16 +1217,16 @@ impl App {
         self.request_redraw();
     }
 
-    /// Resize the focused pane (Windows-Terminal-style Alt+Shift+Arrow): grow it
-    /// toward the arrow by nudging the nearest divider on that side. `want_sbs`
-    /// is the orientation (columns vs rows); `want_in_a` whether the focused pane
-    /// is the first child (left/top) of that split.
-    fn resize_focused(&mut self, want_sbs: bool, want_in_a: bool) {
+    /// Resize the focused pane (Windows-Terminal-style Alt+Shift+Arrow): move the
+    /// nearest divider of the given orientation in the arrow direction (works
+    /// whichever side the focused pane is on). `want_sbs` is the orientation
+    /// (columns vs rows); `positive` is Right/Down (+ratio) vs Left/Up (−ratio).
+    fn resize_focused(&mut self, want_sbs: bool, positive: bool) {
         const STEP: f32 = 0.04;
         let focus = self.focused_session();
-        let delta = if want_in_a { STEP } else { -STEP };
+        let delta = if positive { STEP } else { -STEP };
         let tab = &mut self.tabs[self.active_term];
-        let (_, adjusted) = resize_split(&mut tab.root, focus, want_sbs, want_in_a, delta);
+        let (_, adjusted) = resize_split(&mut tab.root, focus, want_sbs, delta);
         if adjusted {
             self.reflow();
             self.request_redraw();
@@ -2403,10 +2398,14 @@ impl App {
             if rect.y + rect.h < area.y + area.h {
                 fill_rect(buf, w, h, rect.x, rect.y + rect.h, rect.w, DIVIDER, divider);
             }
-            // Focused pane: thin accent line along its top edge.
+            // Focused pane: a thin accent border (like the focused tab) when split.
             if *session == focus && rects.len() > 1 {
-                fill_rect(buf, w, h, rect.x, rect.y, rect.w, (2.0 * self.scale) as usize,
-                    OPAQUE | self.theme.selection);
+                let t = (1.0 * self.scale).round().max(1.0) as usize;
+                let col = OPAQUE | self.theme.selection;
+                fill_rect(buf, w, h, rect.x, rect.y, rect.w, t, col); // top
+                fill_rect(buf, w, h, rect.x, rect.y + rect.h.saturating_sub(t), rect.w, t, col); // bottom
+                fill_rect(buf, w, h, rect.x, rect.y, t, rect.h, col); // left
+                fill_rect(buf, w, h, rect.x + rect.w.saturating_sub(t), rect.y, t, rect.h, col); // right
             }
 
             // Scrollbar in the strip reserved at the pane's right edge (see
