@@ -159,6 +159,15 @@ struct HoverUrl {
     url: String,
 }
 
+/// Scrollback search state (Ctrl+Shift+F): the query, the matches in `session`
+/// (`(abs_row, start_col, end_col)`, top→bottom), and the current match index.
+struct Search {
+    query: String,
+    matches: Vec<(i64, usize, usize)>,
+    current: usize,
+    session: u32,
+}
+
 /// One terminal pane: its session + emulator state + view (scroll/selection).
 struct Pane {
     session: u32,
@@ -527,6 +536,7 @@ struct App {
     scrollbar_drag: Option<(u32, f64)>, // (session, grab offset within thumb, px)
     sb_hover: Option<u32>, // session whose scrollbar the cursor is over (hover-expands the bar)
     hover_url: Option<HoverUrl>, // hyperlink under the cursor while Ctrl is held
+    search: Option<Search>, // scrollback search overlay (Ctrl+Shift+F)
 
     // Mouse reporting: when a focused app enables DEC mouse tracking, button/
     // motion/wheel events are encoded and sent to the PTY instead of driving
@@ -620,6 +630,7 @@ impl App {
             scrollbar_drag: None,
             sb_hover: None,
             hover_url: None,
+            search: None,
             mouse_held: None,
             mouse_session: None,
             mouse_cell: (-1, -1),
@@ -1310,8 +1321,18 @@ impl App {
         let shift = self.mods.shift_key();
         let alt = self.mods.alt_key();
 
+        // While the search overlay is open it captures all key input.
+        if self.search.is_some() {
+            self.search_key(ev, shift);
+            return;
+        }
+
         if let PhysicalKey::Code(code) = ev.physical_key {
             match code {
+                KeyCode::KeyF if ctrl && shift => {
+                    self.open_search();
+                    return;
+                }
                 // Alt+Shift +/- split the focused pane (columns / rows).
                 KeyCode::Equal | KeyCode::NumpadAdd if alt && shift => {
                     self.split_focused(true);
@@ -1755,6 +1776,109 @@ impl App {
         }
     }
 
+    // ---- scrollback search (Ctrl+Shift+F) ------------------------------
+    fn open_search(&mut self) {
+        let session = self.focused_session();
+        self.search = Some(Search { query: String::new(), matches: Vec::new(), current: 0, session });
+        self.request_redraw();
+    }
+
+    /// Route a key to the search overlay (it owns input while open).
+    fn search_key(&mut self, ev: &KeyEvent, shift: bool) {
+        if let PhysicalKey::Code(code) = ev.physical_key {
+            match code {
+                KeyCode::Escape => {
+                    self.search = None;
+                    self.request_redraw();
+                    return;
+                }
+                KeyCode::Enter | KeyCode::NumpadEnter => {
+                    self.search_step(if shift { -1 } else { 1 });
+                    return;
+                }
+                KeyCode::ArrowDown => {
+                    self.search_step(1);
+                    return;
+                }
+                KeyCode::ArrowUp => {
+                    self.search_step(-1);
+                    return;
+                }
+                KeyCode::Backspace => {
+                    if let Some(s) = self.search.as_mut() {
+                        s.query.pop();
+                    }
+                    self.search_run();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // Otherwise, append any typed (non-control) text to the query.
+        if let Some(text) = &ev.text {
+            let t: String = text.chars().filter(|c| !c.is_control()).collect();
+            if !t.is_empty() {
+                if let Some(s) = self.search.as_mut() {
+                    s.query.push_str(&t);
+                }
+                self.search_run();
+            }
+        }
+    }
+
+    /// Re-run the query, point at the newest (bottom-most) match, and scroll to it.
+    fn search_run(&mut self) {
+        let (session, query) = match &self.search {
+            Some(s) => (s.session, s.query.clone()),
+            None => return,
+        };
+        let matches = if query.is_empty() {
+            Vec::new()
+        } else {
+            self.pane(session).map(|p| p.term.lock().unwrap().search(&query)).unwrap_or_default()
+        };
+        if let Some(s) = self.search.as_mut() {
+            s.current = matches.len().saturating_sub(1);
+            s.matches = matches;
+        }
+        self.scroll_to_match();
+        self.request_redraw();
+    }
+
+    /// Move to the next (`+1`, newer) / previous (`-1`, older) match, wrapping.
+    fn search_step(&mut self, dir: i32) {
+        if let Some(s) = self.search.as_mut() {
+            let n = s.matches.len();
+            if n == 0 {
+                return;
+            }
+            s.current = ((s.current.min(n - 1) as i32 + dir).rem_euclid(n as i32)) as usize;
+        }
+        self.scroll_to_match();
+        self.request_redraw();
+    }
+
+    /// Scroll the searched pane so the current match is centered in the viewport.
+    fn scroll_to_match(&mut self) {
+        let (session, abs_row) = match &self.search {
+            Some(s) if !s.matches.is_empty() => {
+                (s.session, s.matches[s.current.min(s.matches.len() - 1)].0)
+            }
+            _ => return,
+        };
+        let (sbc, rows) = match self.pane(session) {
+            Some(p) => {
+                let t = p.term.lock().unwrap();
+                (t.scrollback_count() as i64, t.rows() as i64)
+            }
+            None => return,
+        };
+        let off = (sbc - abs_row + rows / 2).clamp(0, sbc);
+        if let Some(p) = self.pane_mut(session) {
+            p.scroll_off = off as usize;
+        }
+    }
+
     /// Show a resize cursor when hovering a window edge (borderless feedback).
     fn update_resize_cursor(&self) {
         let win = match &self.win {
@@ -2008,6 +2132,18 @@ impl App {
         // --- content: panes (terminal tab) or editor (document tab) -------
         let divider = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.18);
         let dim = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.45);
+        // Scrollback-search highlights for the searched pane: abs_row -> spans.
+        let search_sess = self.search.as_ref().map(|s| s.session);
+        let mut search_hl: HashMap<i64, Vec<(usize, usize, bool)>> = HashMap::new();
+        if let Some(s) = &self.search {
+            for (i, &(row, c0, c1)) in s.matches.iter().enumerate() {
+                search_hl.entry(row).or_default().push((c0, c1, i == s.current));
+            }
+        }
+        // When the search bar is open, terminal glyphs must not draw over it
+        // (the GPU paints glyphs above the chrome framebuffer).
+        let search_bar_top: Option<usize> =
+            self.search.as_ref().map(|_| (h as usize).saturating_sub(ch_px + pad));
         if self.active_doc.is_none() {
         for (session, rect) in &rects {
             if has_background {
@@ -2085,6 +2221,18 @@ impl App {
                             selected = true;
                         }
                     }
+                    // Scrollback-search match highlight (current match brighter).
+                    if search_sess == Some(*session) {
+                        if let Some(spans) = search_hl.get(&(top_abs + r as i64)) {
+                            if let Some(&(.., cur)) =
+                                spans.iter().find(|&&(c0, c1, _)| c >= c0 && c <= c1)
+                            {
+                                bg = if cur { 0xFF_CC00 } else { mix(self.theme.bg, 0xFF_CC00, 0.5) };
+                                fg = 0x1A_1A1A; // dark text for contrast on amber
+                                selected = true; // force the bg to paint over images
+                            }
+                        }
+                    }
                     let x0 = rect.x + c * cw;
                     let y0 = rect.y + r * ch_px;
                     // Terminal background uses the configured opacity; the cursor
@@ -2093,7 +2241,7 @@ impl App {
                     if !has_background || !default_bg || is_cursor || reverse || selected {
                         fill_rect(buf, w, h, x0, y0, cw, ch_px, (a << 24) | bg);
                     }
-                    if cell.rune >= 0x20 {
+                    if cell.rune >= 0x20 && search_bar_top.map_or(true, |t| y0 + ch_px <= t) {
                         if let Some(ch) = char::from_u32(cell.rune) {
                             if self.gpu_text {
                                 self.term_glyphs.push(GlyphDraw {
@@ -2309,6 +2457,51 @@ impl App {
                     blit_char(buf, w, h, &self.glyph_cache, ch, gx, iy, self.theme.fg);
                     gx += cw;
                 }
+            }
+        }
+
+        // --- scrollback search bar (bottom strip overlay) -----------------
+        if let Some((query, total, nth)) = self.search.as_ref().map(|s| {
+            let total = s.matches.len();
+            let nth = if total == 0 { 0 } else { s.current + 1 };
+            (s.query.clone(), total, nth)
+        }) {
+            let bh = ch_px + pad;
+            let by = (h as usize).saturating_sub(bh);
+            let aw = (w as usize).saturating_sub(sb);
+            fill_rect(buf, w, h, sb, by, aw, bh, chrome);
+            let accent = (1.5 * self.scale).round().max(1.0) as usize;
+            fill_rect(buf, w, h, sb, by, aw, accent, OPAQUE | self.theme.selection);
+            let ty = (by + pad / 2) as i32;
+            // Left: "Find: <query>" + a caret.
+            let label = format!("Find: {query}");
+            let mut gx = sb + pad;
+            for ch in label.chars() {
+                if gx + cw > sb + aw {
+                    break;
+                }
+                ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                blit_char(buf, w, h, &self.glyph_cache, ch, gx, ty, self.theme.fg);
+                gx += cw;
+            }
+            fill_rect(buf, w, h, gx, by + pad / 2, (cw / 8).max(2), ch_px, OPAQUE | self.theme.cursor);
+            // Right: match count (or "no matches"). Esc / Enter / Shift+Enter hint.
+            let count = if total == 0 && !query.is_empty() {
+                "no matches".to_string()
+            } else {
+                format!("{nth}/{total}   Enter/Shift+Enter: next/prev   Esc: close")
+            };
+            let cwidth = count.chars().count() * cw;
+            let mut gx = (sb + aw).saturating_sub(cwidth + pad);
+            let ccol = if total == 0 && !query.is_empty() {
+                mix(self.theme.bg, 0xFF_5555, 0.9)
+            } else {
+                mix(self.theme.bg, self.theme.fg, 0.6)
+            };
+            for ch in count.chars() {
+                ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                blit_char(buf, w, h, &self.glyph_cache, ch, gx, ty, ccol);
+                gx += cw;
             }
         }
 

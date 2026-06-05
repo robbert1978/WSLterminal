@@ -833,6 +833,49 @@ impl Screen {
         }
         None
     }
+
+    /// Case-insensitive (ASCII) occurrences of `needle` across scrollback +
+    /// screen, top→bottom, as `(abs_row, start_col, end_col_inclusive)`.
+    /// Non-overlapping. Empty needle yields nothing.
+    pub fn search(&self, needle: &str) -> Vec<(i64, usize, usize)> {
+        let mut out = Vec::new();
+        let nlc: Vec<char> = needle.chars().map(|c| c.to_ascii_lowercase()).collect();
+        if nlc.is_empty() {
+            return out;
+        }
+        let n = nlc.len();
+        let total = (self.scrollback.count() + self.rows) as i64;
+        for abs in 0..total {
+            let line = match self.abs_line(abs) {
+                Some(l) => l,
+                None => continue,
+            };
+            let mut chars: Vec<char> = Vec::with_capacity(self.cols);
+            let mut cols: Vec<usize> = Vec::with_capacity(self.cols);
+            for c in 0..self.cols {
+                let cell = &line[c];
+                if cell.width == 0 {
+                    continue;
+                }
+                let ch = char::from_u32(cell.rune).filter(|&r| r != '\0').unwrap_or(' ');
+                chars.push(ch.to_ascii_lowercase());
+                cols.push(c);
+            }
+            if chars.len() < n {
+                continue;
+            }
+            let mut i = 0;
+            while i + n <= chars.len() {
+                if chars[i..i + n] == nlc[..] {
+                    out.push((abs, cols[i], cols[i + n - 1]));
+                    i += n;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
 }
 
 fn matches_at(chars: &[char], i: usize, pat: &str) -> bool {

@@ -120,6 +120,10 @@ impl Terminal {
     pub fn url_at(&self, abs_row: i64, col: i64) -> Option<(usize, usize, String)> {
         self.screen.url_at(abs_row, col)
     }
+    /// Scrollback search: `(abs_row, start_col, end_col)` of each match, top→bottom.
+    pub fn search(&self, needle: &str) -> Vec<(i64, usize, usize)> {
+        self.screen.search(needle)
+    }
 
     // direct cursor access (parity with C# Cx/Cy used by tests)
     pub fn cx(&self) -> usize {
@@ -194,6 +198,19 @@ mod tests {
         t.feed(b"(ref http://a.io).");
         let (_, _, u) = t.url_at(0, 8).unwrap();
         assert_eq!(u, "http://a.io"); // trailing ")." dropped
+    }
+
+    #[test]
+    fn scrollback_search_case_insensitive() {
+        let mut t = Terminal::new(20, 3);
+        t.feed(b"Foo bar foo\r\nbaz FOO");
+        let m = t.search("foo");
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[0], (0, 0, 2)); // "Foo"
+        assert_eq!(m[1], (0, 8, 10)); // "foo"
+        assert_eq!(m[2], (1, 4, 6)); // "FOO"
+        assert!(t.search("").is_empty());
+        assert!(t.search("zzz").is_empty());
     }
 
     #[test]
