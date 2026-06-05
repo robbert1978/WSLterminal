@@ -216,3 +216,9 @@ Example `settings.json`:
 
 Build: `./build.ps1` (compiles the Linux helpers inside WSL, then the Rust GUI).
 Run `wslterm.exe` with the `artifacts/` folder beside it.
+
+## Credits
+
+The app icon is a penguin by [Creative Tail](https://www.creativetail.com/),
+licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) (rasterized to
+a multi-size `.ico`; artwork unmodified). See [CREDITS.md](CREDITS.md).
