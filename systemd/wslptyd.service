@@ -1,0 +1,27 @@
+# WSL Terminal PTY daemon, managed by systemd (optional — see README.md).
+#
+# This is a *user* service: it runs as you, so the shells it spawns are yours
+# (your uid, your $HOME, your login config). Install it at:
+#     ~/.config/systemd/user/wslptyd.service
+#
+# wslptyd auto-exits when the last terminal window closes, so Restart=always
+# keeps it resident (it relaunches and waits for the next connection). With this
+# running, opening a window is an instant vsock connect — no cold-start bootstrap.
+
+[Unit]
+Description=WSL Terminal PTY daemon (wslptyd) on vsock port 5523
+Documentation=https://github.com/robbert1978/WSLterminal
+After=default.target
+# Don't fall into a failed state from rapid restarts (RestartSec already paces it).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Build with native/build.sh and copy artifacts/wslptyd here (NOT /tmp — the
+# daemon unlinks /tmp/wslptyd, its staged-copy path, on exit).
+ExecStart=%h/.local/bin/wslptyd --vsock 5523
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
