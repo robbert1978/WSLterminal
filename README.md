@@ -122,6 +122,7 @@ Advanced overrides via environment variables:
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `Alt+Shift+=` | Split the focused pane left/right (columns) |
 | `Alt+Shift+-` | Split the focused pane top/bottom (rows) |
+| `Alt+Shift+Arrow` | Resize the focused pane (grow toward the arrow) |
 | `Ctrl+Shift+E` | Toggle the file sidebar |
 | `Ctrl+Shift+H` | Toggle hidden files in the sidebar |
 | `Ctrl+=` / `Ctrl+-` | Increase / decrease font size |

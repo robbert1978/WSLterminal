@@ -298,6 +298,38 @@ fn split_layout(node: Layout, target: u32, side_by_side: bool, newp: &mut Option
     }
 }
 
+/// Nudge the divider of the *nearest* ancestor split that sits on the requested
+/// side of the focused pane, growing it in that direction (Alt+Shift+Arrow).
+/// `want_sbs` picks the orientation (true = columns/left-right, false = rows);
+/// `want_in_a` requires the focused pane to be in the split's first child
+/// (left/top) so the divider is on the desired side; `delta` shifts the ratio.
+/// Returns `(focus_in_subtree, adjusted)`.
+fn resize_split(node: &mut Layout, focus: u32, want_sbs: bool, want_in_a: bool, delta: f32) -> (bool, bool) {
+    match node {
+        Layout::Empty => (false, false),
+        Layout::Leaf(p) => (p.session == focus, false),
+        Layout::Split { side_by_side, ratio, a, b } => {
+            let (in_a, adj) = resize_split(a, focus, want_sbs, want_in_a, delta);
+            if in_a {
+                if !adj && *side_by_side == want_sbs && want_in_a {
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    return (true, true);
+                }
+                return (true, adj);
+            }
+            let (in_b, adj) = resize_split(b, focus, want_sbs, want_in_a, delta);
+            if in_b {
+                if !adj && *side_by_side == want_sbs && !want_in_a {
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    return (true, true);
+                }
+                return (true, adj);
+            }
+            (false, false)
+        }
+    }
+}
+
 /// Remove the leaf with `session`, collapsing its parent split. Returns the new
 /// tree (None if the tab is now empty) and the removed pane via `out`.
 fn remove_layout(node: Layout, session: u32, out: &mut Option<Pane>) -> Option<Layout> {
@@ -1190,6 +1222,22 @@ impl App {
         self.request_redraw();
     }
 
+    /// Resize the focused pane (Windows-Terminal-style Alt+Shift+Arrow): grow it
+    /// toward the arrow by nudging the nearest divider on that side. `want_sbs`
+    /// is the orientation (columns vs rows); `want_in_a` whether the focused pane
+    /// is the first child (left/top) of that split.
+    fn resize_focused(&mut self, want_sbs: bool, want_in_a: bool) {
+        const STEP: f32 = 0.04;
+        let focus = self.focused_session();
+        let delta = if want_in_a { STEP } else { -STEP };
+        let tab = &mut self.tabs[self.active_term];
+        let (_, adjusted) = resize_split(&mut tab.root, focus, want_sbs, want_in_a, delta);
+        if adjusted {
+            self.reflow();
+            self.request_redraw();
+        }
+    }
+
     /// Close a session's pane (collapsing its split); `exited` skips re-closing
     /// the PTY. Closes the tab when its last pane goes, and exits on the last tab.
     fn close_session(&mut self, session: u32, exited: bool, event_loop: &ActiveEventLoop) {
@@ -1340,6 +1388,23 @@ impl App {
                 }
                 KeyCode::Minus | KeyCode::NumpadSubtract if alt && shift => {
                     self.split_focused(false);
+                    return;
+                }
+                // Alt+Shift+Arrow resizes the focused pane (grow toward the arrow).
+                KeyCode::ArrowRight if alt && shift => {
+                    self.resize_focused(true, true);
+                    return;
+                }
+                KeyCode::ArrowLeft if alt && shift => {
+                    self.resize_focused(true, false);
+                    return;
+                }
+                KeyCode::ArrowDown if alt && shift => {
+                    self.resize_focused(false, true);
+                    return;
+                }
+                KeyCode::ArrowUp if alt && shift => {
+                    self.resize_focused(false, false);
                     return;
                 }
                 KeyCode::KeyC if ctrl && shift => {
