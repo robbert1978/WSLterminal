@@ -4,9 +4,10 @@
 # (your uid, your $HOME, your login config). Install it at:
 #     ~/.config/systemd/user/wslptyd.service
 #
-# wslptyd auto-exits when the last terminal window closes, so Restart=always
-# keeps it resident (it relaunches and waits for the next connection). With this
-# running, opening a window is an instant vsock connect — no cold-start bootstrap.
+# --persist stops wslptyd from auto-exiting when the last window closes, so the
+# service stays resident instead of cycling under Restart=always. KillMode=process
+# means a stop/restart only signals the listener, never the cgroup — so it can't
+# tear down the connection child and your shells while you're using them.
 
 [Unit]
 Description=WSL Terminal PTY daemon (wslptyd) on vsock port 5523
@@ -19,9 +20,12 @@ StartLimitIntervalSec=0
 Type=simple
 # Build with native/build.sh and copy artifacts/wslptyd here (NOT /tmp — the
 # daemon unlinks /tmp/wslptyd, its staged-copy path, on exit).
-ExecStart=%h/.local/bin/wslptyd --vsock 5523
+ExecStart=%h/.local/bin/wslptyd --vsock 5523 --persist
 Restart=always
 RestartSec=2
+# Only signal the main listener on stop/restart — never the whole cgroup, so
+# active sessions (your shells) aren't killed underneath you.
+KillMode=process
 
 [Install]
 WantedBy=default.target

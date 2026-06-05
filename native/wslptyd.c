@@ -59,8 +59,11 @@ static int g_in = 0, g_out = 1;
 /* The vsock listening socket (owner only), closed/cleaned up on shutdown. */
 static volatile sig_atomic_t g_listen_fd = -1;
 static const char *STAGE_PATH = "/tmp/wslptyd";
-/* Live per-connection children; the listener auto-exits when it reaches 0. */
+/* Live per-connection children; the listener auto-exits when it reaches 0,
+ * unless --persist is set (e.g. under systemd, where Restart=always would just
+ * cycle the service and the cgroup kill would tear down active sessions). */
 static volatile sig_atomic_t g_active = 0;
+static int g_persist = 0;
 
 static ssize_t writen(int fd, const void *buf, size_t n) {
     const char *p = (const char *)buf;
@@ -302,7 +305,7 @@ static void on_chld(int sig) {
     while (waitpid(-1, NULL, WNOHANG) > 0) {
         if (g_active > 0) g_active--;
     }
-    if (g_active == 0) cleanup_and_exit();
+    if (g_active == 0 && !g_persist) cleanup_and_exit();
 }
 
 static int vsock_serve(int port) {
@@ -365,6 +368,7 @@ int main(int argc, char **argv) {
     int port = -1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--vsock") && i + 1 < argc) port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--persist")) g_persist = 1; /* don't auto-exit (systemd) */
     }
     if (port > 0)
       return vsock_serve(port);

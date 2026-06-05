@@ -18,11 +18,14 @@ tree for those who want it.
 ## How it fits together
 
 `wslptyd --vsock 5523` binds `AF_VSOCK` on port **5523**, accepts one connection
-per terminal window, and forks a PTY session per connection. It **auto-exits when
-the last connection closes**, so the unit uses `Restart=always` to stay resident
-(it relaunches and waits for the next window). The app probes the port first and
-only falls back to its own bootstrap if nothing is listening — so once this
-service is up, the app just connects to it.
+per window, and forks a PTY session per connection. On its own it **auto-exits
+when the last connection closes** (for the app's ephemeral bootstrap), so the
+unit passes **`--persist`** to keep it resident instead — otherwise `Restart=always`
+would cycle the service every time you closed a window, and the cgroup kill on
+restart would tear down sessions you were still using. The unit also sets
+**`KillMode=process`** so a stop/restart only signals the listener, never your
+shells. The app probes the port first and only falls back to its own bootstrap if
+nothing is listening — so once this service is up, the app just connects to it.
 
 Run it as a **user service** so the shells it spawns are *yours* (your uid,
 `$HOME`, and login config), not root's.
@@ -115,8 +118,11 @@ sudo systemctl enable --now wslptyd.service
 
 - **Port:** 5523, matched to the app's `wslterm-pty` client. If you change it,
   you'd also have to change the app — don't.
-- **`Restart=always` is expected to fire** each time the last window closes (the
-  daemon auto-exits, systemd relaunches it). That's normal, not an error.
+- **It should stay resident** (`--persist`), not restart on every window close.
+  If `systemctl --user status wslptyd` shows a climbing restart counter while you
+  use it, you're on an old unit/binary without `--persist` — rebuild + reinstall
+  the daemon and unit (below). The repeated restarts there can drop active
+  sessions and make the app exit.
 - **`EADDRINUSE` flapping:** if you opened a window *before* the service started,
   the app may have bootstrapped its own `/tmp/wslptyd` on 5523; the service then
   can't bind and exits. Fix by `pkill -f 'wslptyd --vsock'` (or `wsl --shutdown`)
