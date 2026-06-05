@@ -780,6 +780,74 @@ impl Screen {
         }
         Some((s, e))
     }
+
+    /// Find an `http(s)://` URL on `abs_row` that covers column `col`. Returns
+    /// `(start_col, end_col_inclusive, url)`. Single-row detection (no wrapping).
+    pub fn url_at(&self, abs_row: i64, col: i64) -> Option<(usize, usize, String)> {
+        if col < 0 {
+            return None;
+        }
+        let line = self.abs_line(abs_row)?;
+        let target = col as usize;
+        // Printable cells as (column, char); skip wide-char trailing slots.
+        let mut cols: Vec<usize> = Vec::with_capacity(self.cols);
+        let mut chars: Vec<char> = Vec::with_capacity(self.cols);
+        for c in 0..self.cols {
+            let cell = &line[c];
+            if cell.width == 0 {
+                continue;
+            }
+            let ch = char::from_u32(cell.rune).filter(|&r| r != '\0').unwrap_or(' ');
+            cols.push(c);
+            chars.push(ch);
+        }
+        let n = chars.len();
+        let mut i = 0;
+        while i < n {
+            if matches_at(&chars, i, "http://") || matches_at(&chars, i, "https://") {
+                let start = i;
+                let mut end = i;
+                while end < n && is_url_char(chars[end]) {
+                    end += 1;
+                }
+                // Trim trailing sentence punctuation; keep a balanced ')'.
+                while end > start {
+                    let strip = match chars[end - 1] {
+                        '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' => true,
+                        ')' => count(&chars[start..end], '(') < count(&chars[start..end], ')'),
+                        _ => false,
+                    };
+                    if strip {
+                        end -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                if end > start && target >= cols[start] && target <= cols[end - 1] {
+                    return Some((cols[start], cols[end - 1], chars[start..end].iter().collect()));
+                }
+                i = end.max(i + 1);
+            } else {
+                i += 1;
+            }
+        }
+        None
+    }
+}
+
+fn matches_at(chars: &[char], i: usize, pat: &str) -> bool {
+    pat.chars().enumerate().all(|(k, pc)| chars.get(i + k) == Some(&pc))
+}
+
+// A URL runs until whitespace or a delimiter that's unlikely to be part of it.
+fn is_url_char(c: char) -> bool {
+    c.is_ascii()
+        && !c.is_whitespace()
+        && !matches!(c, '"' | '\'' | '<' | '>' | '`' | '{' | '}' | '|' | '\\' | '^' | '[' | ']')
+}
+
+fn count(chars: &[char], target: char) -> usize {
+    chars.iter().filter(|&&c| c == target).count()
 }
 
 fn ext_color(p: &[i32], i: usize, slot: &mut i32) -> usize {

@@ -148,6 +148,17 @@ impl ScrollBar {
     }
 }
 
+/// A hyperlink under the cursor (Ctrl-hover): its pane, absolute row, the column
+/// span `[c0, c1]` to underline, and the URL to open on Ctrl-click.
+#[derive(Clone, PartialEq)]
+struct HoverUrl {
+    session: u32,
+    row: i64,
+    c0: i64,
+    c1: i64,
+    url: String,
+}
+
 /// One terminal pane: its session + emulator state + view (scroll/selection).
 struct Pane {
     session: u32,
@@ -515,6 +526,7 @@ struct App {
     scrollbars: Vec<ScrollBar>,   // active tab's per-pane scrollbar geometry
     scrollbar_drag: Option<(u32, f64)>, // (session, grab offset within thumb, px)
     sb_hover: Option<u32>, // session whose scrollbar the cursor is over (hover-expands the bar)
+    hover_url: Option<HoverUrl>, // hyperlink under the cursor while Ctrl is held
 
     // Mouse reporting: when a focused app enables DEC mouse tracking, button/
     // motion/wheel events are encoded and sent to the PTY instead of driving
@@ -607,6 +619,7 @@ impl App {
             scrollbars: Vec::new(),
             scrollbar_drag: None,
             sb_hover: None,
+            hover_url: None,
             mouse_held: None,
             mouse_session: None,
             mouse_cell: (-1, -1),
@@ -1457,6 +1470,16 @@ impl App {
         (abs, col.clamp(0, (cols - 1).max(0)))
     }
 
+    /// The hyperlink under the cursor, if any (used for Ctrl-hover/Ctrl-click).
+    fn url_under_cursor(&self) -> Option<HoverUrl> {
+        let session = self.pane_at_cursor()?;
+        let rect = self.rect_of(session)?;
+        let (row, col) = self.cell_in(session, rect);
+        let term = self.pane(session)?.term.clone();
+        let (c0, c1, url) = term.lock().unwrap().url_at(row, col)?;
+        Some(HoverUrl { session, row, c0: c0 as i64, c1: c1 as i64, url })
+    }
+
     // ---- mouse reporting (DEC mouse tracking) --------------------------
     /// The mouse mode + SGR-encoding flag a pane's app has enabled.
     fn mouse_mode(&self, session: u32) -> (MouseTracking, bool) {
@@ -2087,6 +2110,22 @@ impl App {
                 }
             }
 
+            // Ctrl-hover hyperlink: underline the URL span on its row.
+            if let Some(hl) = &self.hover_url {
+                if hl.session == *session && hl.row >= top_abs {
+                    let vis = (hl.row - top_abs) as usize;
+                    if vis < rrows {
+                        let off = (2.0 * self.scale).round().max(1.0) as usize;
+                        let uy = rect.y + vis * ch_px + ch_px.saturating_sub(off);
+                        let ux0 = rect.x + (hl.c0 as usize) * cw;
+                        let ux1 = (rect.x + (hl.c1 as usize + 1) * cw).min(rect.x + rect.w);
+                        let uth = (1.5 * self.scale).round().max(1.0) as usize;
+                        fill_rect(buf, w, h, ux0, uy, ux1.saturating_sub(ux0), uth,
+                            OPAQUE | self.theme.selection);
+                    }
+                }
+            }
+
             // Divider lines between split panes (compared against the pane AREA,
             // not the window — the reserved bottom margin must not draw a divider).
             if rect.x + rect.w < area.x + area.w {
@@ -2505,7 +2544,14 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                self.mods = m.state();
+                // Releasing Ctrl drops the hyperlink affordance immediately.
+                if !self.mods.control_key() && self.hover_url.take().is_some() {
+                    self.update_resize_cursor();
+                    self.request_redraw();
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(&event, event_loop),
             WindowEvent::MouseWheel { delta, .. } => {
                 let y = match delta {
@@ -2557,6 +2603,24 @@ impl ApplicationHandler<UserEvent> for App {
                     self.sb_hover = hov;
                     self.request_redraw();
                 }
+                // Ctrl-hover a hyperlink: highlight it and show the hand cursor.
+                let url = if self.mods.control_key()
+                    && self.active_doc.is_none()
+                    && self.scrollbar_drag.is_none()
+                {
+                    self.url_under_cursor()
+                } else {
+                    None
+                };
+                if url != self.hover_url {
+                    self.hover_url = url;
+                    self.request_redraw();
+                }
+                if self.hover_url.is_some() {
+                    if let Some(win) = &self.win {
+                        win.set_cursor(CursorIcon::Pointer);
+                    }
+                }
                 // Forward motion to a mouse-tracking app before any local selection.
                 if self.active_doc.is_none() && self.report_mouse_motion() {
                     return;
@@ -2573,6 +2637,13 @@ impl ApplicationHandler<UserEvent> for App {
                     // A click anywhere dismisses/handles an open context menu first.
                     if self.menu_click() {
                         return;
+                    }
+                    // Ctrl-click opens a hyperlink under the cursor (before selection).
+                    if self.mods.control_key() {
+                        if let Some(hl) = self.url_under_cursor() {
+                            open_url(&hl.url);
+                            return;
+                        }
                     }
                     let (px, py) = self.cursor_px;
                     let size = self.win.as_ref().map(|w| w.inner_size());
@@ -2823,6 +2894,33 @@ fn spawn_window(dir: Option<String>) {
 
 #[cfg(not(windows))]
 fn spawn_window(_dir: Option<String>) {}
+
+/// Open a URL in the default browser (Ctrl-click on a hyperlink). Restricted to
+/// http(s) — the detector only matches those, but double-check before launching.
+#[cfg(windows)]
+fn open_url(url: &str) {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return;
+    }
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let op: Vec<u16> = "open\0".encode_utf16().collect();
+    let file: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        ShellExecuteW(
+            0 as HWND,
+            op.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn open_url(_url: &str) {}
 
 /// Last path component of a (WSL) path, for tab titles.
 fn basename(path: &str) -> String {

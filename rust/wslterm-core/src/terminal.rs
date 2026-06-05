@@ -116,6 +116,10 @@ impl Terminal {
     pub fn word_span(&self, abs_row: i64, col: i64) -> Option<(usize, usize)> {
         self.screen.word_span(abs_row, col)
     }
+    /// Hyperlink (http/https) under `(abs_row, col)`: `(start_col, end_col, url)`.
+    pub fn url_at(&self, abs_row: i64, col: i64) -> Option<(usize, usize, String)> {
+        self.screen.url_at(abs_row, col)
+    }
 
     // direct cursor access (parity with C# Cx/Cy used by tests)
     pub fn cx(&self) -> usize {
@@ -170,6 +174,26 @@ mod tests {
         let mut t = Terminal::new(20, 4);
         t.feed(b"\x1b]52;c;?\x07"); // a paste/read query — we don't serve it
         assert_eq!(t.take_clipboard(), None);
+    }
+
+    #[test]
+    fn url_detection() {
+        let mut t = Terminal::new(60, 4);
+        t.feed(b"see https://example.com/p?q=1 ok");
+        let (a, b, u) = t.url_at(0, 10).expect("url under col 10");
+        assert_eq!(u, "https://example.com/p?q=1");
+        assert_eq!(a, 4); // after "see "
+        assert_eq!(b, 4 + u.chars().count() - 1);
+        assert!(t.url_at(0, 1).is_none()); // over "see"
+        assert!(t.url_at(0, 30).is_none()); // over "ok"
+    }
+
+    #[test]
+    fn url_trailing_punctuation_trimmed() {
+        let mut t = Terminal::new(60, 4);
+        t.feed(b"(ref http://a.io).");
+        let (_, _, u) = t.url_at(0, 8).unwrap();
+        assert_eq!(u, "http://a.io"); // trailing ")." dropped
     }
 
     #[test]
