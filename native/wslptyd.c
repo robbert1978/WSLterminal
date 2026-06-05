@@ -29,6 +29,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <poll.h>
+#include <sys/uio.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -73,14 +74,33 @@ static ssize_t writen(int fd, const void *buf, size_t n) {
     return (ssize_t)(n - left);
 }
 
-/* All frames to the host are written from the single main thread. */
+/* All frames to the host are written from the single main thread. The 9-byte
+ * header and the payload go out in a single writev so each frame is one syscall
+ * and (ideally) one vsock send instead of two — fewer syscalls, less
+ * packetization on the latency-sensitive path. Loops past partial writes. */
 static void send_frame(uint32_t id, uint8_t type, const void *payload, uint32_t len) {
     unsigned char hdr[9];
     memcpy(hdr, &id, 4);
     hdr[4] = type;
     memcpy(hdr + 5, &len, 4);
-    writen(g_out, hdr, 9);
-    if (len) writen(g_out, payload, len);
+
+    struct iovec iov[2];
+    iov[0].iov_base = hdr;
+    iov[0].iov_len = 9;
+    iov[1].iov_base = (void *)payload;
+    iov[1].iov_len = len;
+    int n = len ? 2 : 1, i = 0;
+    while (i < n) {
+        ssize_t w = writev(g_out, &iov[i], n - i);
+        if (w < 0) { if (errno == EINTR) continue; return; }
+        if (w == 0) break;
+        size_t adv = (size_t)w;
+        while (i < n && adv >= iov[i].iov_len) { adv -= iov[i].iov_len; i++; }
+        if (i < n) {
+            iov[i].iov_base = (char *)iov[i].iov_base + adv;
+            iov[i].iov_len -= adv;
+        }
+    }
 }
 
 static void send_exit(uint32_t id, uint32_t code) { send_frame(id, 6, &code, 4); }
