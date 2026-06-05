@@ -64,6 +64,10 @@ static const char *STAGE_PATH = "/tmp/wslptyd";
  * cycle the service and the cgroup kill would tear down active sessions). */
 static volatile sig_atomic_t g_active = 0;
 static int g_persist = 0;
+/* Zero-copy PTY->host forwarding: splice master -> pipe -> connection so the
+ * payload never enters userspace. Disabled if the kernel rejects it. */
+static int g_use_splice = 1;
+static int g_pipe[2] = {-1, -1};
 
 static ssize_t writen(int fd, const void *buf, size_t n) {
     const char *p = (const char *)buf;
@@ -235,10 +239,58 @@ static void feed_stdin(const unsigned char *data, size_t n) {
     if (off) { memmove(g_buf, g_buf + off, g_len - off); g_len -= off; }
 }
 
+/* Move exactly n bytes from the pipe read end to the connection, looping past
+ * partial moves / EINTR. Returns 0 on success, -1 if the connection broke. */
+static int splice_drain(size_t n) {
+    while (n) {
+        ssize_t w = splice(g_pipe[0], NULL, g_out, NULL, n, SPLICE_F_MOVE);
+        if (w < 0) { if (errno == EINTR) continue; return -1; }
+        if (w == 0) return -1;
+        n -= (size_t)w;
+    }
+    return 0;
+}
+
+/* Forward one chunk of a session's PTY output to the host. Zero-copy via splice
+ * (master -> pipe -> connection): only the 9-byte DATA header passes through
+ * userspace. Falls back to read()+send_frame() if splice is unsupported. */
+static void forward_master(Sess *s, char *buf, size_t bufsz) {
+    if (g_use_splice && g_pipe[0] >= 0) {
+        ssize_t n = splice(s->master, NULL, g_pipe[1], NULL, 1 << 20, SPLICE_F_MOVE);
+        if (n > 0) {
+            unsigned char hdr[9];
+            uint32_t len = (uint32_t)n;
+            memcpy(hdr, &s->id, 4);
+            hdr[4] = 2;                          /* DATA */
+            memcpy(hdr + 5, &len, 4);
+            writen(g_out, hdr, 9);
+            splice_drain((size_t)n);             /* a write error => host_gone next poll */
+            return;
+        }
+        if (n < 0 && (errno == EINVAL || errno == ENOSYS)) {
+            g_use_splice = 0;                    /* kernel can't splice this -> copy path */
+        } else {
+            if (n == 0 || errno != EINTR) end_sess(s, 0);   /* shell exited */
+            return;
+        }
+    }
+    ssize_t kk = read(s->master, buf, bufsz);
+    if (kk > 0) send_frame(s->id, 2, buf, (uint32_t)kk);
+    else if (kk == 0 || errno != EINTR) end_sess(s, 0);
+}
+
 /* ---- per-connection session loop (g_in/g_out are the transport fds) ---- */
 
 static void run_session_loop(void) {
     char buf[65536];
+    if (g_use_splice && g_pipe[0] < 0) {
+        if (pipe2(g_pipe, O_CLOEXEC) == 0) {
+            fcntl(g_pipe[0], F_SETPIPE_SZ, 1 << 18); /* larger chunks (best-effort) */
+        } else {
+            g_pipe[0] = g_pipe[1] = -1;
+            g_use_splice = 0;
+        }
+    }
     struct pollfd fds[1 + MAX_SESS];
     Sess *pmap[1 + MAX_SESS];
     int infd = g_in;
@@ -268,10 +320,7 @@ static void run_session_loop(void) {
                     host_gone = 1;
                 }
             } else {                                   /* a pty master -> host */
-                Sess *s = pmap[k];
-                ssize_t kk = read(s->master, buf, sizeof buf);
-                if (kk > 0) send_frame(s->id, 2, buf, (uint32_t)kk);
-                else if (kk == 0 || errno != EINTR) end_sess(s, 0);   /* shell exited */
+                forward_master(pmap[k], buf, sizeof buf);
             }
         }
 
@@ -281,6 +330,7 @@ static void run_session_loop(void) {
         }
     }
 
+    if (g_pipe[0] >= 0) { close(g_pipe[0]); close(g_pipe[1]); g_pipe[0] = g_pipe[1] = -1; }
     free(g_buf);
     g_buf = NULL; g_len = g_cap = 0;
 }
