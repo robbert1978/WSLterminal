@@ -168,6 +168,100 @@ struct Search {
     session: u32,
 }
 
+/// A command-palette action (Ctrl+Shift+P). Each maps to an App method in
+/// `run_command`; `label` is searched and shown, `hint` shows its shortcut.
+#[derive(Clone, Copy)]
+enum Cmd {
+    NewTab,
+    NewWindow,
+    SplitRight,
+    SplitDown,
+    ClosePane,
+    NextTab,
+    PrevTab,
+    Find,
+    PrevPrompt,
+    NextPrompt,
+    Copy,
+    Paste,
+    ToggleSidebar,
+    ToggleHidden,
+    FontInc,
+    FontDec,
+    FontReset,
+    EditSettings,
+    ReloadSettings,
+    Maximize,
+}
+
+impl Cmd {
+    fn label(self) -> &'static str {
+        match self {
+            Cmd::NewTab => "New Tab",
+            Cmd::NewWindow => "New Window",
+            Cmd::SplitRight => "Split Pane Right",
+            Cmd::SplitDown => "Split Pane Down",
+            Cmd::ClosePane => "Close Pane / Tab",
+            Cmd::NextTab => "Next Tab",
+            Cmd::PrevTab => "Previous Tab",
+            Cmd::Find => "Find in Scrollback",
+            Cmd::PrevPrompt => "Jump to Previous Prompt",
+            Cmd::NextPrompt => "Jump to Next Prompt",
+            Cmd::Copy => "Copy",
+            Cmd::Paste => "Paste",
+            Cmd::ToggleSidebar => "Toggle Sidebar",
+            Cmd::ToggleHidden => "Toggle Hidden Files",
+            Cmd::FontInc => "Increase Font Size",
+            Cmd::FontDec => "Decrease Font Size",
+            Cmd::FontReset => "Reset Font Size",
+            Cmd::EditSettings => "Edit settings.json",
+            Cmd::ReloadSettings => "Reload settings.json",
+            Cmd::Maximize => "Toggle Maximize",
+        }
+    }
+    fn hint(self) -> &'static str {
+        match self {
+            Cmd::NewTab => "Ctrl+Shift+T",
+            Cmd::NewWindow => "Ctrl+Shift+N",
+            Cmd::SplitRight => "Alt+Shift+=",
+            Cmd::SplitDown => "Alt+Shift+-",
+            Cmd::ClosePane => "Ctrl+Shift+W",
+            Cmd::NextTab => "Ctrl+Tab",
+            Cmd::PrevTab => "Ctrl+Shift+Tab",
+            Cmd::Find => "Ctrl+Shift+F",
+            Cmd::PrevPrompt => "Ctrl+Shift+Up",
+            Cmd::NextPrompt => "Ctrl+Shift+Down",
+            Cmd::Copy => "Ctrl+Shift+C",
+            Cmd::Paste => "Ctrl+Shift+V",
+            Cmd::ToggleSidebar => "Ctrl+Shift+E",
+            Cmd::ToggleHidden => "Ctrl+Shift+H",
+            Cmd::FontInc => "Ctrl+=",
+            Cmd::FontDec => "Ctrl+-",
+            Cmd::FontReset => "Ctrl+0",
+            Cmd::EditSettings => "Ctrl+,",
+            Cmd::ReloadSettings => "Ctrl+Shift+,",
+            Cmd::Maximize => "F11",
+        }
+    }
+}
+
+const COMMANDS: &[Cmd] = &[
+    Cmd::NewTab, Cmd::NewWindow, Cmd::SplitRight, Cmd::SplitDown, Cmd::ClosePane,
+    Cmd::NextTab, Cmd::PrevTab, Cmd::Find, Cmd::PrevPrompt, Cmd::NextPrompt,
+    Cmd::Copy, Cmd::Paste, Cmd::ToggleSidebar, Cmd::ToggleHidden,
+    Cmd::FontInc, Cmd::FontDec, Cmd::FontReset, Cmd::EditSettings, Cmd::ReloadSettings,
+    Cmd::Maximize,
+];
+const MAX_PALETTE_ROWS: usize = 12;
+
+/// Command-palette overlay state (Ctrl+Shift+P): the typed filter, the matching
+/// command indices into `COMMANDS`, and the highlighted row.
+struct Palette {
+    query: String,
+    items: Vec<usize>,
+    current: usize,
+}
+
 /// One terminal pane: its session + emulator state + view (scroll/selection).
 struct Pane {
     session: u32,
@@ -564,6 +658,7 @@ struct App {
     sb_hover: Option<u32>, // session whose scrollbar the cursor is over (hover-expands the bar)
     hover_url: Option<HoverUrl>, // hyperlink under the cursor while Ctrl is held
     search: Option<Search>, // scrollback search overlay (Ctrl+Shift+F)
+    palette: Option<Palette>, // command palette overlay (Ctrl+Shift+P)
 
     // Mouse reporting: when a focused app enables DEC mouse tracking, button/
     // motion/wheel events are encoded and sent to the PTY instead of driving
@@ -658,6 +753,7 @@ impl App {
             sb_hover: None,
             hover_url: None,
             search: None,
+            palette: None,
             mouse_held: None,
             mouse_session: None,
             mouse_cell: (-1, -1),
@@ -1364,7 +1460,11 @@ impl App {
         let shift = self.mods.shift_key();
         let alt = self.mods.alt_key();
 
-        // While the search overlay is open it captures all key input.
+        // While an overlay is open it captures all key input.
+        if self.palette.is_some() {
+            self.palette_key(ev, event_loop);
+            return;
+        }
         if self.search.is_some() {
             self.search_key(ev, shift);
             return;
@@ -1374,6 +1474,10 @@ impl App {
             match code {
                 KeyCode::KeyF if ctrl && shift => {
                     self.open_search();
+                    return;
+                }
+                KeyCode::KeyP if ctrl && shift => {
+                    self.open_palette();
                     return;
                 }
                 // Alt+Shift +/- split the focused pane (columns / rows).
@@ -1462,6 +1566,10 @@ impl App {
                 }
                 KeyCode::Digit0 | KeyCode::Numpad0 if ctrl => {
                     self.reset_font();
+                    return;
+                }
+                KeyCode::Comma if ctrl && shift => {
+                    self.apply_settings(); // reload settings.json from disk
                     return;
                 }
                 KeyCode::Comma if ctrl => {
@@ -1850,6 +1958,122 @@ impl App {
         let session = self.focused_session();
         self.search = Some(Search { query: String::new(), matches: Vec::new(), current: 0, session });
         self.request_redraw();
+    }
+
+    // ---- command palette (Ctrl+Shift+P) --------------------------------
+    fn open_palette(&mut self) {
+        self.palette =
+            Some(Palette { query: String::new(), items: (0..COMMANDS.len()).collect(), current: 0 });
+        self.request_redraw();
+    }
+
+    /// Recompute the matching commands (case-insensitive substring on the label).
+    fn palette_filter(&mut self) {
+        if let Some(p) = self.palette.as_mut() {
+            let q = p.query.to_ascii_lowercase();
+            p.items = COMMANDS
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| q.is_empty() || c.label().to_ascii_lowercase().contains(&q))
+                .map(|(i, _)| i)
+                .collect();
+            p.current = 0;
+        }
+        self.request_redraw();
+    }
+
+    fn palette_move(&mut self, dir: i32) {
+        if let Some(p) = self.palette.as_mut() {
+            let n = p.items.len();
+            if n == 0 {
+                return;
+            }
+            p.current = ((p.current.min(n - 1) as i32 + dir).rem_euclid(n as i32)) as usize;
+            self.request_redraw();
+        }
+    }
+
+    /// Route a key to the command palette (it owns input while open).
+    fn palette_key(&mut self, ev: &KeyEvent, event_loop: &ActiveEventLoop) {
+        if let PhysicalKey::Code(code) = ev.physical_key {
+            match code {
+                KeyCode::Escape => {
+                    self.palette = None;
+                    self.request_redraw();
+                    return;
+                }
+                KeyCode::Enter | KeyCode::NumpadEnter => {
+                    let cmd = self
+                        .palette
+                        .as_ref()
+                        .and_then(|p| p.items.get(p.current).map(|&i| COMMANDS[i]));
+                    self.palette = None;
+                    self.request_redraw();
+                    if let Some(c) = cmd {
+                        self.run_command(c, event_loop);
+                    }
+                    return;
+                }
+                KeyCode::ArrowDown => {
+                    self.palette_move(1);
+                    return;
+                }
+                KeyCode::ArrowUp => {
+                    self.palette_move(-1);
+                    return;
+                }
+                KeyCode::Backspace => {
+                    if let Some(p) = self.palette.as_mut() {
+                        p.query.pop();
+                    }
+                    self.palette_filter();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if let Some(text) = &ev.text {
+            let t: String = text.chars().filter(|c| !c.is_control()).collect();
+            if !t.is_empty() {
+                if let Some(p) = self.palette.as_mut() {
+                    p.query.push_str(&t);
+                }
+                self.palette_filter();
+            }
+        }
+    }
+
+    /// Execute a palette command (the same actions as the keyboard shortcuts).
+    fn run_command(&mut self, cmd: Cmd, event_loop: &ActiveEventLoop) {
+        match cmd {
+            Cmd::NewTab => self.add_tab(),
+            Cmd::NewWindow => self.spawn_new_window(),
+            Cmd::SplitRight => self.split_focused(true),
+            Cmd::SplitDown => self.split_focused(false),
+            Cmd::ClosePane => {
+                if self.active_doc.is_some() {
+                    self.close_active_doc();
+                } else {
+                    let s = self.focused_session();
+                    self.close_session(s, false, event_loop);
+                }
+            }
+            Cmd::NextTab => self.switch_tab(1),
+            Cmd::PrevTab => self.switch_tab(-1),
+            Cmd::Find => self.open_search(),
+            Cmd::PrevPrompt => self.jump_prompt(-1),
+            Cmd::NextPrompt => self.jump_prompt(1),
+            Cmd::Copy => self.copy_selection(),
+            Cmd::Paste => self.paste(),
+            Cmd::ToggleSidebar => self.toggle_sidebar(),
+            Cmd::ToggleHidden => self.toggle_hidden(),
+            Cmd::FontInc => self.zoom_font(1.0),
+            Cmd::FontDec => self.zoom_font(-1.0),
+            Cmd::FontReset => self.reset_font(),
+            Cmd::EditSettings => self.open_settings(),
+            Cmd::ReloadSettings => self.apply_settings(),
+            Cmd::Maximize => self.toggle_maximize(),
+        }
     }
 
     /// Route a key to the search overlay (it owns input while open).
@@ -2252,6 +2476,16 @@ impl App {
         // (the GPU paints glyphs above the chrome framebuffer).
         let search_bar_top: Option<usize> =
             self.search.as_ref().map(|_| (h as usize).saturating_sub(ch_px + pad));
+        // Command-palette box geometry (also used to suppress glyphs under it).
+        let pal_geom: Option<Rect> = self.palette.as_ref().map(|p| {
+            let aw = (w as usize).saturating_sub(sb);
+            let visible = p.items.len().min(MAX_PALETTE_ROWS);
+            let bw = (aw * 3 / 5).clamp((34 * cw).min(aw), 80 * cw);
+            let bh = (1 + visible) * ch_px + 2 * pad;
+            let bx = sb + (aw.saturating_sub(bw)) / 2;
+            let by = bar_h + ch_px;
+            Rect { x: bx, y: by, w: bw, h: bh }
+        });
         if self.active_doc.is_none() {
         for (session, rect) in &rects {
             if has_background {
@@ -2357,7 +2591,13 @@ impl App {
                     if !has_background || !default_bg || is_cursor || reverse || selected {
                         fill_rect(buf, w, h, x0, y0, cw, ch_px, (a << 24) | bg);
                     }
-                    if cell.rune >= 0x20 && search_bar_top.map_or(true, |t| y0 + ch_px <= t) {
+                    // Don't draw glyphs the GPU would paint over an overlay (the
+                    // search bar at the bottom, or the command-palette box).
+                    let under_overlay = search_bar_top.map_or(false, |t| y0 + ch_px > t)
+                        || pal_geom.map_or(false, |g| {
+                            x0 < g.x + g.w && x0 + cw > g.x && y0 < g.y + g.h && y0 + ch_px > g.y
+                        });
+                    if cell.rune >= 0x20 && !under_overlay {
                         if let Some(ch) = char::from_u32(cell.rune) {
                             if self.gpu_text {
                                 self.term_glyphs.push(GlyphDraw {
@@ -2631,6 +2871,57 @@ impl App {
                 ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
                 blit_char(buf, w, h, &self.glyph_cache, ch, gx, ty, ccol);
                 gx += cw;
+            }
+        }
+
+        // --- command palette overlay --------------------------------------
+        if let (Some(r), Some((query, items, current))) = (
+            pal_geom,
+            self.palette.as_ref().map(|p| (p.query.clone(), p.items.clone(), p.current)),
+        ) {
+            let t = (1.0 * self.scale).round().max(1.0) as usize;
+            let bd = OPAQUE | self.theme.selection;
+            fill_rect(buf, w, h, r.x, r.y, r.w, r.h, OPAQUE | mix(self.theme.bg, self.theme.fg, 0.14));
+            fill_rect(buf, w, h, r.x, r.y, r.w, t, bd); // border
+            fill_rect(buf, w, h, r.x, r.y + r.h.saturating_sub(t), r.w, t, bd);
+            fill_rect(buf, w, h, r.x, r.y, t, r.h, bd);
+            fill_rect(buf, w, h, r.x + r.w.saturating_sub(t), r.y, t, r.h, bd);
+            let maxw = r.w.saturating_sub(pad * 2) / cw.max(1);
+            // Input row: "> query" + caret.
+            let prompt = format!("> {query}");
+            let mut gx = r.x + pad;
+            let iy = (r.y + pad) as i32;
+            for ch in prompt.chars().take(maxw) {
+                ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                blit_char(buf, w, h, &self.glyph_cache, ch, gx, iy, self.theme.fg);
+                gx += cw;
+            }
+            fill_rect(buf, w, h, gx, r.y + pad, (cw / 8).max(2), ch_px, OPAQUE | self.theme.cursor);
+            // Command rows, scrolled so the highlighted one stays visible.
+            let visible = items.len().min(MAX_PALETTE_ROWS);
+            let start = if current >= visible { current + 1 - visible } else { 0 };
+            for (row, &ci) in items.iter().enumerate().skip(start).take(visible) {
+                let ry = r.y + pad + (row - start + 1) * ch_px;
+                let sel = row == current;
+                if sel {
+                    fill_rect(buf, w, h, r.x + t, ry, r.w.saturating_sub(2 * t), ch_px, bd);
+                }
+                let fg = if sel { 0x10_1010 } else { self.theme.fg };
+                let hc = if sel { 0x10_1010 } else { mix(self.theme.bg, self.theme.fg, 0.5) };
+                let cmd = COMMANDS[ci];
+                let mut gx = r.x + pad;
+                for ch in cmd.label().chars().take(maxw) {
+                    ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                    blit_char(buf, w, h, &self.glyph_cache, ch, gx, ry as i32, fg);
+                    gx += cw;
+                }
+                let hint = cmd.hint();
+                let mut gx = (r.x + r.w).saturating_sub(pad + hint.chars().count() * cw);
+                for ch in hint.chars() {
+                    ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                    blit_char(buf, w, h, &self.glyph_cache, ch, gx, ry as i32, hc);
+                    gx += cw;
+                }
             }
         }
 

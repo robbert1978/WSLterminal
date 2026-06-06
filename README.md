@@ -128,9 +128,11 @@ Advanced overrides via environment variables:
 | `Ctrl+=` / `Ctrl+-` | Increase / decrease font size |
 | `Ctrl+0` | Reset font size |
 | `Shift+PageUp` / `Shift+PageDown` | Scroll the scrollback up / down one screen |
+| `Ctrl+Shift+P` | Command palette — type to filter, Enter to run, Esc to close |
 | `Ctrl+Shift+F` | Search the scrollback (Enter / Shift+Enter to step matches, Esc to close) |
 | `Ctrl+Shift+Up` / `Ctrl+Shift+Down` | Jump to the previous / next shell prompt (needs shell integration) |
 | `Ctrl+,` | Edit `settings.json` (opens `edit.exe`; applies on close) |
+| `Ctrl+Shift+,` | Reload `settings.json` from disk and apply (no editor) |
 | `F11` | Toggle maximize |
 
 **Mouse:** the wheel scrolls the scrollback (`Ctrl+wheel` zooms the font); drag to
