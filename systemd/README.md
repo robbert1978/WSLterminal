@@ -15,6 +15,28 @@ gives you:
 It's intentionally **not part of the GitHub release** — it lives in the source
 tree for those who want it.
 
+## Scope: one daemon per distro
+
+Install this unit inside your **default** distro and keep it on the base port
+**5523** — that's the port a plain `wslterm.exe` connects to. This is the normal,
+single-distro case.
+
+Other distros each need their *own* daemon (all distros share one WSL2 VM, so they
+can't share port 5523). You usually don't have to do anything: `wslterm.exe
+--distro Mint` **finds Mint's daemon by name, or starts one on demand** — no port
+to manage. If you'd rather have systemd own a second distro's daemon too, install
+this unit inside that distro on a distinct port just above the base (5524–5539,
+the range the app scans):
+
+```ini
+# ~/.config/systemd/user/wslptyd.service  (inside the second distro)
+ExecStart=%h/.local/bin/wslptyd --vsock 5524 --persist
+```
+
+The app will discover it by distro name on the next `wslterm.exe --distro <that>`
+— you do **not** pass `--port` on the client. Simplest split: systemd for your
+main distro on 5523, on-demand bootstrap (or an extra unit) for the rest.
+
 ## How it fits together
 
 `wslptyd --vsock 5523` binds `AF_VSOCK` on port **5523**, accepts one connection
@@ -116,8 +138,9 @@ sudo systemctl enable --now wslptyd.service
 
 ## Notes & troubleshooting
 
-- **Port:** 5523, matched to the app's `wslterm-pty` client. If you change it,
-  you'd also have to change the app — don't.
+- **Port:** 5523 — the app's base port (a plain `wslterm.exe`). Keep it 5523 for
+  your main distro. A second distro's unit should bind a distinct port in
+  5524–5539; the app finds it by distro name (see *Scope* above), no client flag.
 - **It should stay resident** (`--persist`), not restart on every window close.
   If `systemctl --user status wslptyd` shows a climbing restart counter while you
   use it, you're on an old unit/binary without `--persist` — rebuild + reinstall

@@ -68,6 +68,9 @@ static int g_persist = 0;
  * payload never enters userspace. Disabled if the kernel rejects it. */
 static int g_use_splice = 1;
 static int g_pipe[2] = {-1, -1};
+/* This distro's WSL registration name (self-detected via wslpath; see main).
+ * Reported to the host once per connection so it never has to query wsl.exe. */
+static char g_distro[128];
 
 static ssize_t writen(int fd, const void *buf, size_t n) {
     const char *p = (const char *)buf;
@@ -283,6 +286,9 @@ static void forward_master(Sess *s, char *buf, size_t bufsz) {
 
 static void run_session_loop(void) {
     char buf[65536];
+    /* Tell the host which distro this daemon serves (type 7, session 0), so it
+     * can build \\wsl.localhost\<name> paths without querying wsl.exe itself. */
+    if (g_distro[0]) send_frame(0, 7, g_distro, (uint32_t)strlen(g_distro));
     if (g_use_splice && g_pipe[0] < 0) {
         if (pipe2(g_pipe, O_CLOEXEC) == 0) {
             fcntl(g_pipe[0], F_SETPIPE_SZ, 1 << 18); /* larger chunks (best-effort) */
@@ -407,11 +413,67 @@ static int vsock_serve(int port) {
     return 0;
 }
 
+/* Self-detect the WSL distro registration name WITHOUT relying on
+ * $WSL_DISTRO_NAME — which WSL only sets for sessions it spawns directly, not
+ * for a daemon reparented to init (or launched by systemd). `/init` dispatches
+ * on argv[0]; invoked as "wslpath -m /" it prints the share path for `/`, e.g.
+ * "//wsl.localhost/Ubuntu/", whose component after the host is the registered
+ * name. Writes it to `out` and returns 1 on success, 0 on any failure. */
+static int detect_distro_name(char *out, size_t outsz) {
+    int pfd[2];
+    if (pipe(pfd) != 0) return 0;
+    pid_t pid = fork();
+    if (pid < 0) { close(pfd[0]); close(pfd[1]); return 0; }
+    if (pid == 0) {
+        dup2(pfd[1], 1);
+        close(pfd[0]); close(pfd[1]);
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) { dup2(dn, 2); close(dn); }
+        char *const a[] = { "wslpath", "-m", "/", NULL };
+        execv("/init", a);                              /* argv[0] selects mode */
+        _exit(127);
+    }
+    close(pfd[1]);
+    char buf[256];
+    ssize_t n, total = 0;
+    while (total < (ssize_t)sizeof buf - 1 &&
+           (n = read(pfd[0], buf + total, sizeof buf - 1 - total)) > 0)
+        total += n;
+    close(pfd[0]);
+    int st; waitpid(pid, &st, 0);
+    if (total <= 0) return 0;
+    buf[total] = 0;
+    for (char *p = buf; *p; p++) if (*p == '\\') *p = '/'; /* normalize seps */
+    while (total > 0 && (buf[total-1] == '\n' || buf[total-1] == '\r' ||
+                         buf[total-1] == '/'  || buf[total-1] == ' '))
+        buf[--total] = 0;                                /* trim trailing junk */
+    char *p = buf;
+    while (*p == '/') p++;                               /* skip leading // */
+    char *slash = strchr(p, '/');                        /* end of host comp */
+    if (!slash) return 0;
+    char *name = slash + 1;                              /* distro starts here */
+    char *end = strchr(name, '/');
+    if (end) *end = 0;
+    if (!*name) return 0;
+    snprintf(out, outsz, "%s", name);
+    return 1;
+}
+
 int main(int argc, char **argv) {
     if (!getenv("TERM")) setenv("TERM", "xterm-256color", 1);
     /* Let shells/apps detect this terminal (e.g. the shell-integration script). */
     setenv("WSLTERM", "1", 1);
     setenv("TERM_PROGRAM", "WSLTerminal", 1);
+    /* Detect this distro's registration name once (prefer an existing
+     * WSL_DISTRO_NAME, else ask wslpath). We both export it — so our shells look
+     * like a native WSL session; forked children inherit it — and stash it in
+     * g_distro to report to the host on each connection. */
+    const char *have = getenv("WSL_DISTRO_NAME");
+    if (have && *have) {
+        snprintf(g_distro, sizeof g_distro, "%s", have);
+    } else if (detect_distro_name(g_distro, sizeof g_distro)) {
+        setenv("WSL_DISTRO_NAME", g_distro, 1);
+    }
     signal(SIGPIPE, SIG_IGN);
     for (int i = 0; i < MAX_SESS; i++) { g_sess[i].active = 0; g_sess[i].master = -1; g_sess[i].pid = -1; }
 

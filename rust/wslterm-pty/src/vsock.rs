@@ -13,9 +13,10 @@ use std::io::{self, Read, Write};
 use std::sync::{Arc, Once};
 
 use windows_sys::Win32::Networking::WinSock::{
-    closesocket, connect as ws_connect, getsockopt, ioctlsocket, recv, select, send, shutdown,
-    socket, WSAGetLastError, WSAStartup, FD_SET, INVALID_SOCKET, SD_BOTH, SOCKADDR, SOCKET,
-    SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET, SO_ERROR, TIMEVAL, WSADATA, WSAEWOULDBLOCK,
+    closesocket, connect as ws_connect, getsockopt, ioctlsocket, recv, select, send, setsockopt,
+    shutdown, socket, WSAGetLastError, WSAStartup, FD_SET, INVALID_SOCKET, SD_BOTH, SOCKADDR,
+    SOCKET, SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET, SO_ERROR, SO_RCVTIMEO, TIMEVAL, WSADATA,
+    WSAEWOULDBLOCK,
 };
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
@@ -23,6 +24,7 @@ use windows_sys::Win32::System::Registry::{
 };
 
 use crate::mux::{MuxEvent, WslMux};
+use crate::protocol;
 
 const AF_HYPERV: u16 = 34;
 const HV_PROTOCOL_RAW: i32 = 1;
@@ -254,6 +256,39 @@ pub fn connect(port: u32) -> io::Result<VsockHandle> {
         }
         Ok(VsockHandle(Arc::new(Sock(s))))
     }
+}
+
+unsafe fn set_recv_timeout(s: SOCKET, ms: u32) {
+    // Winsock's SO_RCVTIMEO takes a DWORD of milliseconds (not a `timeval`).
+    let v = ms;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &v as *const u32 as *const u8, std::mem::size_of::<u32>() as i32);
+}
+
+/// Probe vsock `port` for a `wslptyd` and read the distro name it announces (the
+/// INFO frame it sends first on every connection). Used to *route by distro*:
+/// `Ok(Some(name))` — a daemon is there serving `name`; `Ok(None)` — a connection
+/// opened but no INFO arrived (a foreign/old listener); `Err` — nothing is
+/// listening (a free port). A short recv timeout keeps a silent peer from hanging
+/// the scan. The probe connection is closed immediately (the caller reconnects
+/// via `start_mux` if it decides to use this daemon).
+pub fn probe_distro(port: u32) -> io::Result<Option<String>> {
+    let mut h = connect(port)?;
+    unsafe { set_recv_timeout(h.0 .0, 800) };
+    let mut hdr = [0u8; 9];
+    if h.read_exact(&mut hdr).is_err() {
+        return Ok(None);
+    }
+    let ty = hdr[4];
+    let len = u32::from_le_bytes(hdr[5..9].try_into().unwrap()) as usize;
+    if ty != protocol::T_INFO || len == 0 || len > 256 {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; len];
+    if h.read_exact(&mut buf).is_err() {
+        return Ok(None);
+    }
+    let name = String::from_utf8_lossy(&buf).trim().to_string();
+    Ok((!name.is_empty()).then_some(name))
 }
 
 /// Connect and build a mux over the vsock socket. Dropping the mux shuts the

@@ -3,7 +3,7 @@
 //!   `[u32 session][u8 type][u32 len][payload]`  (all little-endian)
 //!
 //! Host -> server: 1 OPEN, 2 DATA, 3 RESIZE, 4 SIGNAL, 5 CLOSE
-//! Server -> host: 2 DATA, 6 EXIT
+//! Server -> host: 2 DATA, 6 EXIT, 7 INFO (session 0; payload = distro name)
 //!
 //! Kept transport-free so it unit-tests over in-memory buffers; `mux.rs` wires
 //! it to the real wslg.exe pipes on Windows.
@@ -16,6 +16,9 @@ pub const T_RESIZE: u8 = 3;
 pub const T_SIGNAL: u8 = 4;
 pub const T_CLOSE: u8 = 5;
 pub const T_EXIT: u8 = 6;
+/// Server -> host, sent once per connection: payload is the daemon's self-detected
+/// WSL distro registration name (session id is unused / 0).
+pub const T_INFO: u8 = 7;
 
 /// Sanity bound matching the C# reader (drop the connection past this).
 pub const MAX_FRAME: u32 = 64 * 1024 * 1024;

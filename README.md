@@ -85,11 +85,13 @@ cargo run --release          # prints a per-benchmark summary table
 
 ## Arguments
 
-`wslterm.exe` takes a single command-line argument:
+`wslterm.exe` accepts these command-line arguments:
 
 | argument | default | meaning |
 |---|---|---|
 | `--cd <dir>` | *(none — first tab starts in your home `~`)* | Directory the first tab opens in. Accepts a Linux path (used internally by **Open in new window** / `Ctrl+Shift+N`) **or a Windows path**, which is translated to WSL: `C:\Users` → `/mnt/c/Users`, `\\wsl.localhost\Ubuntu\home\me` → `/home/me`. A path that can't be resolved falls back to `~`. |
+| `--distro <name>` | *(WSL's default distro)* | Run this window against a specific WSL distro — e.g. `--distro Mint`. It works alongside other distros automatically: the window finds (or starts) **that distro's own `wslptyd`** and reconnects to the same one on later launches. So `wslterm.exe --distro Mint` gives a Mint shell even while an Ubuntu window is already open. |
+| `--port <n>` | *(auto)* | Advanced override — pin this window to a specific in-VM `wslptyd` vsock port instead of letting it route by distro. Normally unnecessary (`--distro` already finds the right daemon); useful only to target a daemon you run yourself, e.g. under systemd. |
 
 **Explorer integration.** Because `--cd` accepts Windows paths, you can add an
 "Open WSL in here" right-click entry via the bundled **`openinwsl.reg`** (edit

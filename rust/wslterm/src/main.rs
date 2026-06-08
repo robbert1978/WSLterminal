@@ -64,6 +64,9 @@ enum UserEvent {
     Redraw,
     SessionExit(u32),
     Closed,
+    /// The daemon reported its WSL distro registration name (for the file
+    /// sidebar's `\\wsl.localhost\<distro>` paths + the window title).
+    Distro(String),
 }
 
 /// A glyph rasterized once and cached: 8-bit coverage plus its pixel offset from
@@ -191,6 +194,7 @@ enum Cmd {
     FontReset,
     EditSettings,
     ReloadSettings,
+    EditWslConfig,
     Maximize,
 }
 
@@ -214,8 +218,9 @@ impl Cmd {
             Cmd::FontInc => "Increase Font Size",
             Cmd::FontDec => "Decrease Font Size",
             Cmd::FontReset => "Reset Font Size",
-            Cmd::EditSettings => "Edit settings.json",
-            Cmd::ReloadSettings => "Reload settings.json",
+            Cmd::EditSettings => "Edit config",
+            Cmd::ReloadSettings => "Reload config",
+            Cmd::EditWslConfig => "Edit .wslconfig",
             Cmd::Maximize => "Toggle Maximize",
         }
     }
@@ -240,6 +245,7 @@ impl Cmd {
             Cmd::FontReset => "Ctrl+0",
             Cmd::EditSettings => "Ctrl+,",
             Cmd::ReloadSettings => "Ctrl+Shift+,",
+            Cmd::EditWslConfig => "",
             Cmd::Maximize => "F11",
         }
     }
@@ -250,7 +256,7 @@ const COMMANDS: &[Cmd] = &[
     Cmd::NextTab, Cmd::PrevTab, Cmd::Find, Cmd::PrevPrompt, Cmd::NextPrompt,
     Cmd::Copy, Cmd::Paste, Cmd::ToggleSidebar, Cmd::ToggleHidden,
     Cmd::FontInc, Cmd::FontDec, Cmd::FontReset, Cmd::EditSettings, Cmd::ReloadSettings,
-    Cmd::Maximize,
+    Cmd::EditWslConfig, Cmd::Maximize,
 ];
 const MAX_PALETTE_ROWS: usize = 12;
 
@@ -640,6 +646,10 @@ struct App {
     docs: Vec<Doc>,     // open file/editor tabs
     active_doc: Option<usize>, // Some(i) => doc tab is foreground; None => terminal
     start_dir: Option<String>, // cwd for the first tab (from --cd)
+    start_distro: Option<String>, // explicit `--distro <name>` (else WSL's default distro)
+    start_port: Option<u32>,      // explicit `--port <n>` (else VSOCK_PORT)
+    distro: String, // explicit distro selection: empty = WSL default (no `-d`); drives spawn
+    distro_label: String, // actual distro name for sidebar UNC paths/display (daemon-reported if default)
 
     mods: ModifiersState,
     cursor_px: (f64, f64),
@@ -696,7 +706,12 @@ struct SidebarMenu {
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<UserEvent>, start_dir: Option<String>) -> App {
+    fn new(
+        proxy: EventLoopProxy<UserEvent>,
+        start_dir: Option<String>,
+        start_distro: Option<String>,
+        start_port: Option<u32>,
+    ) -> App {
         let cfg = Settings::load();
         let font = load_monospace_font(&cfg.font_family)
             .expect("no monospace font found (Consolas/Cascadia)");
@@ -738,6 +753,10 @@ impl App {
             docs: Vec::new(),
             active_doc: None,
             start_dir,
+            start_distro,
+            start_port,
+            distro: String::new(), // resolved on first resume (empty = WSL default)
+            distro_label: String::new(), // filled from --distro or the daemon's report
             mods: ModifiersState::empty(),
             cursor_px: (0.0, 0.0),
             grid: Vec::new(),
@@ -822,6 +841,18 @@ impl App {
         self.request_redraw();
     }
 
+    /// The actual WSL distro registration name, for the file sidebar's
+    /// `\\wsl.localhost\<distro>` paths and the window title. This is the explicit
+    /// `--distro` if given, else the name the daemon self-reported (via wslpath);
+    /// `DISTRO` is only a fallback before that report arrives.
+    fn distro(&self) -> &str {
+        if !self.distro_label.is_empty() {
+            &self.distro_label
+        } else {
+            DISTRO
+        }
+    }
+
     /// List an explicit directory into the sidebar (browsing). This does NOT
     /// touch the shell's working directory — the panel is an independent file
     /// browser. No-op when the sidebar is closed.
@@ -830,7 +861,7 @@ impl App {
             return;
         }
         let dir = if dir.is_empty() { "/".to_string() } else { dir };
-        let mut entries = wslfiles::list(DISTRO, &dir, self.show_hidden);
+        let mut entries = wslfiles::list(self.distro(), &dir, self.show_hidden);
         // Prepend a ".." parent entry (unless at root), like the C# sidebar.
         if dir != "/" {
             let trimmed = dir.trim_end_matches('/');
@@ -880,6 +911,26 @@ impl App {
         let esc = file.replace('\'', "'\\''");
         let cmd = format!("'/mnt/c/WINDOWS/system32/edit.exe' '{esc}'");
         self.settings_session = self.open_editor_tab(&dir, &cmd);
+    }
+
+    /// Edit the global `%USERPROFILE%\.wslconfig` with Windows `edit.exe` in a new
+    /// tab. Unlike our settings, this configures the whole WSL2 VM and needs
+    /// `wsl --shutdown` to take effect, so we don't reload anything on close.
+    fn open_wslconfig(&mut self) {
+        let home = match std::env::var("USERPROFILE") {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let path = std::path::PathBuf::from(&home).join(".wslconfig");
+        if !path.exists() {
+            let _ = std::fs::write(
+                &path,
+                "# WSL2 global config — run `wsl --shutdown` to apply changes.\n[wsl2]\n",
+            );
+        }
+        let dir = bootstrap::windows_to_wsl_path(&home);
+        let cmd = "'/mnt/c/WINDOWS/system32/edit.exe' '.wslconfig'".to_string();
+        self.open_editor_tab(&dir, &cmd);
     }
 
     /// Serialize the current appearance to the settings.json schema.
@@ -1035,7 +1086,10 @@ impl App {
             None => return true,
         };
         match item {
-            "Open in new window" => spawn_window(Some(lp)),
+            "Open in new window" => {
+                let (distro, port) = self.spawn_inherit();
+                spawn_window(Some(lp), distro, port);
+            }
             "Open" => {
                 if is_dir {
                     self.list_sidebar_dir(lp); // browse in the panel; don't cd the shell
@@ -1103,8 +1157,9 @@ impl App {
         }
         let mut reload_settings = false;
         if save {
+            let distro = self.distro().to_string(); // capture before the &mut doc borrow
             if let Some(d) = self.cur_doc_mut() {
-                d.save(DISTRO);
+                d.save(&distro);
                 reload_settings = d.is_settings;
             }
         }
@@ -1400,10 +1455,21 @@ impl App {
         self.request_redraw();
     }
 
-    /// Open a new top-level window (a fresh wslterm process) in the focused cwd.
+    /// The `--distro`/`--port` a child window should inherit so it lands on the
+    /// same distro+daemon as this one. We pass only `--distro` (routing reunites
+    /// it with this distro's daemon by name) and a `--port` *only* if one was
+    /// explicitly pinned; both `None` for a plain default window.
+    fn spawn_inherit(&self) -> (Option<String>, Option<u32>) {
+        let distro = (!self.distro.is_empty()).then(|| self.distro.clone());
+        (distro, self.start_port)
+    }
+
+    /// Open a new top-level window (a fresh wslterm process) in the focused cwd,
+    /// on the same distro+port as this window.
     fn spawn_new_window(&self) {
         let dir = self.focused_cwd();
-        spawn_window(if dir.is_empty() { None } else { Some(dir) });
+        let (distro, port) = self.spawn_inherit();
+        spawn_window(if dir.is_empty() { None } else { Some(dir) }, distro, port);
     }
 
     /// Close an entire tab (all its panes).
@@ -2072,6 +2138,7 @@ impl App {
             Cmd::FontReset => self.reset_font(),
             Cmd::EditSettings => self.open_settings(),
             Cmd::ReloadSettings => self.apply_settings(),
+            Cmd::EditWslConfig => self.open_wslconfig(),
             Cmd::Maximize => self.toggle_maximize(),
         }
     }
@@ -2995,8 +3062,17 @@ impl ApplicationHandler<UserEvent> for App {
         let size = win.inner_size();
         let (cols, rows) = self.grid_dims(size.width, size.height);
 
-        // Bring up the live WSL server (vsock daemon, else wslg pipe).
-        let (mux, rx) = bring_up_mux(DISTRO);
+        // Resolve the distro once (the `self.win` guard above makes this run a
+        // single time). Empty name => WSL's *default* distro (no `-d`); the daemon
+        // self-reports its real name (via wslpath), so the host never queries
+        // wsl.exe. bring_up_mux then routes to the daemon serving this distro
+        // (reusing or bootstrapping it) — see its docs — so a second distro lands
+        // on its own daemon automatically, no port juggling.
+        self.distro = self.start_distro.take().unwrap_or_default();
+        // An explicit --distro is also its display/UNC label; for the default
+        // distro the daemon reports the real name shortly after connecting.
+        self.distro_label = self.distro.clone();
+        let (mux, rx) = bring_up_mux(&self.distro, self.start_port);
 
         // First tab (in --cd directory if given).
         let term = Arc::new(Mutex::new(Terminal::new(cols, rows)));
@@ -3005,7 +3081,8 @@ impl ApplicationHandler<UserEvent> for App {
         self.tabs.push(Tab { root: Layout::Leaf(Pane::new(session, term)), focus: session });
         self.active_term = 0;
         self.mux = Some(mux);
-        eprintln!("[wslterm] window up {cols}x{rows}, first session {session} on {DISTRO}");
+        let on = if self.distro.is_empty() { "(default distro)" } else { &self.distro };
+        eprintln!("[wslterm] window up {cols}x{rows}, first session {session} on {on}");
 
         // Feed thread: route frames to the right session's terminal by id.
         let registry = self.registry.clone();
@@ -3039,6 +3116,9 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             MuxEvent::Exit { id, .. } => {
                                 let _ = proxy.send_event(UserEvent::SessionExit(id));
+                            }
+                            MuxEvent::Info { distro } => {
+                                let _ = proxy.send_event(UserEvent::Distro(distro));
                             }
                         }
                         ev = rx.try_recv().ok();
@@ -3132,6 +3212,20 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Closed => {
                 eprintln!("[wslterm] mux ended");
                 event_loop.exit();
+            }
+            UserEvent::Distro(name) => {
+                // Only the default distro learns its name this way (an explicit
+                // --distro already set the label in resumed). Adopt it for the
+                // sidebar's UNC paths and refresh the panel if it's open.
+                if self.distro_label.is_empty() && !name.is_empty() {
+                    eprintln!("[wslterm] daemon reported distro {name}");
+                    self.distro_label = name;
+                    if self.sidebar_open {
+                        let dir = self.sidebar_dir.clone();
+                        self.list_sidebar_dir(dir);
+                        self.request_redraw();
+                    }
+                }
             }
         }
     }
@@ -3402,11 +3496,13 @@ impl ApplicationHandler<UserEvent> for App {
 fn main() {
     install_panic_log();
     let start_dir = parse_cd_arg();
+    let start_distro = parse_distro_arg();
+    let start_port = parse_port_arg();
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .expect("build event loop");
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(proxy, start_dir);
+    let mut app = App::new(proxy, start_dir, start_distro, start_port);
     event_loop.run_app(&mut app).expect("run app");
 }
 
@@ -3451,6 +3547,37 @@ fn parse_cd_arg() -> Option<String> {
     None
 }
 
+/// `--distro <name>`: pin this window (and any it spawns) to a specific WSL
+/// distro instead of using WSL's default — e.g. `wslterm.exe --distro Mint`. To
+/// run it *alongside* another distro, also pass `--port` so the two daemons don't
+/// collide on the base vsock port (they share one WSL2 VM).
+fn parse_distro_arg() -> Option<String> {
+    let mut args = std::env::args();
+    while let Some(a) = args.next() {
+        if a == "--distro" {
+            return args.next().filter(|s| !s.is_empty());
+        }
+    }
+    None
+}
+
+/// `--port <n>`: the vsock port `wslptyd` listens on for this window. Defaults to
+/// `VSOCK_PORT` (5523). Give a second, simultaneously-running distro its own port
+/// — e.g. `wslterm.exe --distro Mint --port 5524` — since all distros share one
+/// WSL2 VM and would otherwise fight over 5523. Garbage/out-of-range is ignored.
+fn parse_port_arg() -> Option<u32> {
+    let mut args = std::env::args();
+    while let Some(a) = args.next() {
+        if a == "--port" {
+            return args
+                .next()
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|&p| (1..=65535).contains(&p));
+        }
+    }
+    None
+}
+
 /// Translate a Windows path into its WSL/Linux equivalent so `--cd %V` from an
 /// Explorer context menu works:
 ///   - drive paths map under `/mnt`:    `C:\Users` -> `/mnt/c/Users`,
@@ -3489,9 +3616,11 @@ fn windows_to_wsl_path(p: &str) -> String {
     s.to_string() // unrecognized — caller discards (falls back to ~)
 }
 
-/// Launch another wslterm window (a detached, windowless child process).
+/// Launch another wslterm window (a detached, windowless child process). Carries
+/// `--distro`/`--port` through so a window opened from a non-default distro stays
+/// on that distro and vsock port instead of falling back to the default.
 #[cfg(windows)]
-fn spawn_window(dir: Option<String>) {
+fn spawn_window(dir: Option<String>, distro: Option<String>, port: Option<u32>) {
     use std::os::windows::process::CommandExt;
     if let Ok(exe) = std::env::current_exe() {
         let mut cmd = std::process::Command::new(exe);
@@ -3500,13 +3629,21 @@ fn spawn_window(dir: Option<String>) {
                 cmd.arg("--cd").arg(d);
             }
         }
+        if let Some(d) = distro {
+            if !d.is_empty() {
+                cmd.arg("--distro").arg(d);
+            }
+        }
+        if let Some(p) = port {
+            cmd.arg("--port").arg(p.to_string());
+        }
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW (no console flash)
         let _ = cmd.spawn();
     }
 }
 
 #[cfg(not(windows))]
-fn spawn_window(_dir: Option<String>) {}
+fn spawn_window(_dir: Option<String>, _distro: Option<String>, _port: Option<u32>) {}
 
 /// Open a URL in the default browser (Ctrl-click on a hyperlink). Restricted to
 /// http(s) — the detector only matches those, but double-check before launching.
@@ -3656,24 +3793,70 @@ fn parse_opacity_env() -> Option<f32> {
     Some(v.clamp(0.4, 1.0))
 }
 
-/// Bring up the WSL backend. Prefer a direct **vsock** connection to a running
-/// `wslptyd`; if none is listening, start it detached (once, via `wslg`) and
-/// retry briefly (covers VM boot + the daemon's bind race); finally fall back to
-/// the legacy `wslg` stdin/stdout pipe if vsock is unavailable.
-fn bring_up_mux(distro: &str) -> (WslMux, std::sync::mpsc::Receiver<MuxEvent>) {
+/// Ports above the base scanned to route a named distro to its own daemon.
+const VSOCK_SCAN_SPAN: u32 = 16;
+
+/// Bring up the WSL backend for `distro`, picking the right `wslptyd` *by distro*
+/// rather than a fixed port — because all distros share one WSL2 VM (one vsock
+/// namespace), so a window must reach the daemon actually running ITS distro:
+///
+/// - `explicit_port` (`--port`): pin to exactly that port (e.g. a systemd daemon).
+/// - default distro (empty name): the base port is reserved for it — whatever
+///   answers there is the default's daemon.
+/// - named distro (`--distro X`): walk up from `VSOCK_PORT+1` and **reuse** the
+///   daemon that announces itself as `X` (via the INFO frame), so a second window
+///   for `X` reconnects to the same one; if none is found, bootstrap `X` on the
+///   first free port. This is what makes `wslterm --distro Mint` give a Mint shell
+///   even while an Ubuntu window (on the base port) is already up.
+fn bring_up_mux(
+    distro: &str,
+    explicit_port: Option<u32>,
+) -> (WslMux, std::sync::mpsc::Receiver<MuxEvent>) {
     let server = bootstrap::resolve_server()
         .expect("wslptyd not found (build native/ and place under artifacts/)");
-    let port = bootstrap::VSOCK_PORT;
 
-    // 1) Already-running daemon? Connect instantly — no process spawn.
+    if let Some(port) = explicit_port {
+        return connect_or_bootstrap(&server, distro, port);
+    }
+    if distro.is_empty() {
+        return connect_or_bootstrap(&server, distro, bootstrap::VSOCK_PORT);
+    }
+
+    let mut port = bootstrap::VSOCK_PORT + 1;
+    let limit = bootstrap::VSOCK_PORT + VSOCK_SCAN_SPAN;
+    while port <= limit {
+        match wslterm_pty::vsock::probe_distro(port) {
+            // The daemon here serves our distro: reconnect and reuse it.
+            Ok(Some(name)) if name.eq_ignore_ascii_case(distro) => {
+                if let Ok(mux) = wslterm_pty::vsock::start_mux(port) {
+                    eprintln!("[wslterm] reusing wslptyd for {distro} on vsock:{port}");
+                    return mux;
+                }
+                break; // present but couldn't attach — bootstrap on this port
+            }
+            Ok(_) => port += 1, // a different distro (or unidentified): keep scanning
+            Err(_) => break,    // nothing listening: this free port is ours to claim
+        }
+    }
+    connect_or_bootstrap(&server, distro, port)
+}
+
+/// Connect to `wslptyd` on `port`, else bootstrap it (detached) for `distro` and
+/// poll briefly (covers cold VM boot + the daemon's bind race), else fall back to
+/// the legacy `wslg` stdin/stdout pipe.
+fn connect_or_bootstrap(
+    server: &std::path::Path,
+    distro: &str,
+    port: u32,
+) -> (WslMux, std::sync::mpsc::Receiver<MuxEvent>) {
+    let label = if distro.is_empty() { "(default distro)" } else { distro };
+
     if let Ok(mux) = wslterm_pty::vsock::start_mux(port) {
         eprintln!("[wslterm] connected to wslptyd over vsock:{port}");
         return mux;
     }
-    // 2) Not up: start it (fire-and-forget), then poll the connect for a while —
-    //    long enough to cover a cold WSL VM boot plus the daemon's bind.
-    eprintln!("[wslterm] vsock connect failed; bootstrapping wslptyd on vsock:{port}");
-    let cmd = bootstrap::build_vsock_command(&server, port);
+    eprintln!("[wslterm] bootstrapping wslptyd for {label} on vsock:{port}");
+    let cmd = bootstrap::build_vsock_command(server, port);
     if wslterm_pty::process::spawn_bootstrap(distro, &cmd).is_ok() {
         let deadline = Instant::now() + std::time::Duration::from_secs(15);
         while Instant::now() < deadline {
@@ -3684,9 +3867,8 @@ fn bring_up_mux(distro: &str) -> (WslMux, std::sync::mpsc::Receiver<MuxEvent>) {
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
     }
-    // 3) Fall back to the legacy wslg pipe transport.
     eprintln!("[wslterm] vsock unavailable; falling back to the wslg pipe");
-    let command = bootstrap::build_server_command(&server);
+    let command = bootstrap::build_server_command(server);
     let proc = WslProcess::launch(distro, &command).expect("launch wslg.exe");
     WslMux::from_process(proc)
 }

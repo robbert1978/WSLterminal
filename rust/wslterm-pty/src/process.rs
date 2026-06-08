@@ -114,14 +114,17 @@ fn b64(data: &[u8]) -> String {
 pub fn spawn_bootstrap(distribution: &str, command: &str) -> io::Result<()> {
     let inner = format!("echo {} | base64 -d | /bin/sh", b64(command.as_bytes()));
     let mut cmd = Command::new(resolve_wsl_exe());
-    cmd.arg("-d").arg(distribution).arg("--").arg("/bin/sh").arg("-c").arg(&inner);
+    if !distribution.is_empty() {
+        cmd.arg("-d").arg(distribution); // empty => WSL's default distro
+    }
+    cmd.arg("--").arg("/bin/sh").arg("-c").arg(&inner);
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     no_window(&mut cmd);
     cmd.spawn()?; // detached: drop the Child without waiting
     Ok(())
 }
 
-/// Build `~ --distribution <name> <command>` as the launcher's argument tail.
+/// Build `~ [--distribution <name>] <command>` as the launcher's argument tail.
 ///
 /// wsl/wslg parse their tail raw and run it through the login shell, so the
 /// shell snippet must reach them VERBATIM. On Windows we use `raw_arg` to append
@@ -129,16 +132,25 @@ pub fn spawn_bootstrap(distribution: &str, command: &str) -> io::Result<()> {
 /// would be wrapped in one quoted argv element and the login shell (zsh) would
 /// try to `exec` it as a single program name. This mirrors the C# `CreateProcess`
 /// path, which appends the command unquoted. The distro name is also unquoted
-/// (quotes would yield WSL_E_DISTRO_NOT_FOUND).
+/// (quotes would yield WSL_E_DISTRO_NOT_FOUND). An empty `distribution` selects
+/// WSL's default distro (no `--distribution`).
 #[cfg(windows)]
 fn build_tail(cmd: &mut Command, distribution: &str, command: &str) {
     use std::os::windows::process::CommandExt;
-    cmd.raw_arg(format!("~ --distribution {distribution} {command}"));
+    if distribution.is_empty() {
+        cmd.raw_arg(format!("~ {command}"));
+    } else {
+        cmd.raw_arg(format!("~ --distribution {distribution} {command}"));
+    }
 }
 
 #[cfg(not(windows))]
 fn build_tail(cmd: &mut Command, distribution: &str, command: &str) {
-    cmd.arg("~").arg("--distribution").arg(distribution).arg(command);
+    cmd.arg("~");
+    if !distribution.is_empty() {
+        cmd.arg("--distribution").arg(distribution);
+    }
+    cmd.arg(command);
 }
 
 #[cfg(windows)]

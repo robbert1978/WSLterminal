@@ -51,7 +51,9 @@ pub fn resolve_helper() -> Option<PathBuf> {
 }
 
 /// Default vsock port `wslptyd` binds. VM-global (one utility VM for all distros)
-/// and deliberately not 22 (ssh).
+/// and deliberately not 22 (ssh). To run a *second* distro at the same time, the
+/// app picks a different port via its `--port` flag (the daemons share one VM, so
+/// they'd otherwise collide here); a single distro always just uses this base.
 pub const VSOCK_PORT: u32 = 5523;
 
 /// Shell snippet that stages the multiplexed server into a fixed `/tmp/wslptyd`

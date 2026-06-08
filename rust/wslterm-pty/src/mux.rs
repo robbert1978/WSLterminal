@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::process::WslProcess;
-use crate::protocol::{self, T_CLOSE, T_DATA, T_EXIT, T_OPEN, T_RESIZE, T_SIGNAL};
+use crate::protocol::{self, T_CLOSE, T_DATA, T_EXIT, T_INFO, T_OPEN, T_RESIZE, T_SIGNAL};
 
 /// Bound on queued, not-yet-consumed server frames. When the owner falls behind
 /// (e.g. a flood like termbench), the reader blocks here, which fills the OS
@@ -27,6 +27,8 @@ pub enum MuxEvent {
     Data { id: u32, bytes: Vec<u8> },
     /// Session `id` ended with `code` (or -1 if the whole server died).
     Exit { id: u32, code: i32 },
+    /// The daemon's self-detected WSL distro registration name (sent once on connect).
+    Info { distro: String },
 }
 
 struct Shared {
@@ -166,6 +168,13 @@ fn reader_loop(mut stdout: Box<dyn Read + Send>, shared: Arc<Shared>, tx: SyncSe
                     };
                     shared.live.lock().unwrap().remove(&id);
                     let _ = tx.send(MuxEvent::Exit { id, code });
+                }
+                T_INFO => {
+                    if let Ok(s) = std::str::from_utf8(&scratch[..len]) {
+                        if !s.is_empty() && tx.send(MuxEvent::Info { distro: s.to_string() }).is_err() {
+                            break;
+                        }
+                    }
                 }
                 _ => {}
             },

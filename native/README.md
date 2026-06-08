@@ -62,9 +62,12 @@ Length-prefixed frames, **little-endian**, both directions:
 | host → daemon | 5 | `CLOSE` | *(empty)* → `SIGHUP` + reap the session |
 | daemon → host | 2 | `DATA` | raw PTY output for that session |
 | daemon → host | 6 | `EXIT` | `u32 exitcode` → session ended |
+| daemon → host | 7 | `INFO` | this distro's registration name (sent once on connect; session id 0) |
 
 `OPEN` honors the requested `cwd` if it exists, else falls back to `$HOME`. The
-daemon exports `WSLTERM=1` and `TERM_PROGRAM=WSLTerminal` so shells/apps (and the
+daemon exports `WSLTERM=1`, `TERM_PROGRAM=WSLTerminal`, and `WSL_DISTRO_NAME`
+(self-detected via `wslpath -m /` when WSL didn't already set it — the daemon is
+detached from the session that normally would) so shells/apps (and the
 shell-integration script) can detect this terminal.
 
 ## Data path: zero-copy PTY → host (`splice`)
