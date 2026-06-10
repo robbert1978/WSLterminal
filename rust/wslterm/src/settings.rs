@@ -17,6 +17,19 @@ pub struct Settings {
     pub editor: String, // command run (in a new terminal tab) to open files
     pub background: BackgroundConfig,
     pub theme: Theme,
+    pub actions: Vec<ActionBinding>, // user keybindings (settings.json "actions")
+}
+
+/// One user keybinding from settings.json's `actions` array (Windows Terminal
+/// shape): a `keys` chord (e.g. `"ctrl+shift+up"`) bound to a command. `action`
+/// is the command name (e.g. `"sendInput"`); `input` is its payload, already
+/// JSON-unescaped (so `"\u001b[1;6A"` arrives as the real ESC sequence). The host
+/// (`main.rs`) compiles these into matchable bindings.
+#[derive(Clone)]
+pub struct ActionBinding {
+    pub keys: String,
+    pub action: String,
+    pub input: String,
 }
 
 /// Concrete RGB palette used by the renderer.
@@ -67,6 +80,29 @@ struct Raw {
     background_image_opacity: u32,
     background_image_fit: String,
     ansi: Vec<String>,
+    // Keybindings. Lowercase `actions` (Windows Terminal style); `Actions` also ok.
+    #[serde(rename = "actions", alias = "Actions")]
+    actions: Vec<RawAction>,
+}
+
+#[derive(Deserialize, Clone)]
+struct RawAction {
+    #[serde(default)]
+    keys: String,
+    command: RawCommand,
+}
+
+/// A `command` is either a bare action name (`"command": "copy"`) or an object
+/// with parameters (`"command": { "action": "sendInput", "input": "..." }`).
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum RawCommand {
+    Named(String),
+    Detailed {
+        action: String,
+        #[serde(default)]
+        input: String,
+    },
 }
 
 impl Default for Raw {
@@ -84,6 +120,7 @@ impl Default for Raw {
             background_image_opacity: 35,
             background_image_fit: "cover".into(),
             ansi: CAMPBELL.iter().map(|s| s.to_string()).collect(),
+            actions: Vec::new(),
         }
     }
 }
@@ -118,6 +155,17 @@ impl From<Raw> for Settings {
             let fb = color::parse_hex(CAMPBELL[i], 0);
             *slot = r.ansi.get(i).map(|s| hex(s, fb)).unwrap_or(fb);
         }
+        let actions = r
+            .actions
+            .into_iter()
+            .map(|ra| {
+                let (action, input) = match ra.command {
+                    RawCommand::Named(s) => (s, String::new()),
+                    RawCommand::Detailed { action, input } => (action, input),
+                };
+                ActionBinding { keys: ra.keys, action, input }
+            })
+            .collect();
         Settings {
             font_family: r.font_family,
             font_pts: if r.font_size > 0.0 { r.font_size } else { 12.0 },
@@ -140,6 +188,37 @@ impl From<Raw> for Settings {
                 selection: hex(&r.selection, 0x26_4F78),
                 ansi,
             },
+            actions,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_actions_object_and_string_forms() {
+        // Object form (action + input) and the bare-string command form.
+        let json = r#"{
+          "FontFamily": "Cascadia Mono",
+          "actions": [
+            { "keys": "ctrl+shift+up", "command": { "action": "sendInput", "input": "hi" } },
+            { "keys": "ctrl+shift+c",  "command": "copy" }
+          ]
+        }"#;
+        let s = Settings::from(serde_json::from_str::<Raw>(json).unwrap());
+        assert_eq!(s.actions.len(), 2);
+        assert_eq!(s.actions[0].keys, "ctrl+shift+up");
+        assert_eq!(s.actions[0].action, "sendInput");
+        assert_eq!(s.actions[0].input, "hi");
+        assert_eq!(s.actions[1].action, "copy"); // bare string -> empty input
+        assert_eq!(s.actions[1].input, "");
+    }
+
+    #[test]
+    fn missing_actions_defaults_empty() {
+        let s = Settings::from(serde_json::from_str::<Raw>(r#"{"FontFamily":"x"}"#).unwrap());
+        assert!(s.actions.is_empty());
     }
 }

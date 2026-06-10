@@ -45,7 +45,7 @@ mod wslfiles;
 use background::BackgroundImage;
 use gpu::{Gpu, GlyphDraw};
 use layered::{work_area, Layered};
-use settings::{Settings, Theme};
+use settings::{ActionBinding, Settings, Theme};
 
 /// Opaque alpha in the high byte (for the framebuffer ARGB encoding).
 const OPAQUE: u32 = 0xFF00_0000;
@@ -183,8 +183,6 @@ enum Cmd {
     NextTab,
     PrevTab,
     Find,
-    PrevPrompt,
-    NextPrompt,
     Copy,
     Paste,
     ToggleSidebar,
@@ -209,8 +207,6 @@ impl Cmd {
             Cmd::NextTab => "Next Tab",
             Cmd::PrevTab => "Previous Tab",
             Cmd::Find => "Find in Scrollback",
-            Cmd::PrevPrompt => "Jump to Previous Prompt",
-            Cmd::NextPrompt => "Jump to Next Prompt",
             Cmd::Copy => "Copy",
             Cmd::Paste => "Paste",
             Cmd::ToggleSidebar => "Toggle Sidebar",
@@ -234,8 +230,6 @@ impl Cmd {
             Cmd::NextTab => "Ctrl+Tab",
             Cmd::PrevTab => "Ctrl+Shift+Tab",
             Cmd::Find => "Ctrl+Shift+F",
-            Cmd::PrevPrompt => "Ctrl+Shift+Up",
-            Cmd::NextPrompt => "Ctrl+Shift+Down",
             Cmd::Copy => "Ctrl+Shift+C",
             Cmd::Paste => "Ctrl+Shift+V",
             Cmd::ToggleSidebar => "Ctrl+Shift+E",
@@ -253,12 +247,126 @@ impl Cmd {
 
 const COMMANDS: &[Cmd] = &[
     Cmd::NewTab, Cmd::NewWindow, Cmd::SplitRight, Cmd::SplitDown, Cmd::ClosePane,
-    Cmd::NextTab, Cmd::PrevTab, Cmd::Find, Cmd::PrevPrompt, Cmd::NextPrompt,
+    Cmd::NextTab, Cmd::PrevTab, Cmd::Find,
     Cmd::Copy, Cmd::Paste, Cmd::ToggleSidebar, Cmd::ToggleHidden,
     Cmd::FontInc, Cmd::FontDec, Cmd::FontReset, Cmd::EditSettings, Cmd::ReloadSettings,
     Cmd::EditWslConfig, Cmd::Maximize,
 ];
 const MAX_PALETTE_ROWS: usize = 12;
+
+/// A compiled user keybinding (settings.json `actions`): an exact modifier+key
+/// chord mapped to an action. Built once from `Settings.actions` (and rebuilt on
+/// reload); checked before the built-in shortcuts so users can override them.
+struct KeyBinding {
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    code: KeyCode,
+    action: BoundAction,
+}
+
+#[derive(Clone)]
+enum BoundAction {
+    SendInput(Vec<u8>), // write raw bytes to the focused PTY (e.g. an escape seq)
+    Command(Cmd),       // run a built-in command (same set as the palette)
+}
+
+/// Compile settings.json `actions` into matchable keybindings, skipping (with a
+/// warning) any entry whose chord won't parse or whose action is unknown.
+fn compile_keybindings(actions: &[ActionBinding]) -> Vec<KeyBinding> {
+    let mut out = Vec::new();
+    for a in actions {
+        let Some((ctrl, alt, shift, code)) = parse_chord(&a.keys) else {
+            eprintln!("[wslterm] keybinding ignored: unparseable keys {:?}", a.keys);
+            continue;
+        };
+        let action = if a.action.eq_ignore_ascii_case("sendInput") {
+            BoundAction::SendInput(a.input.clone().into_bytes())
+        } else if let Some(cmd) = action_name_to_cmd(&a.action.to_ascii_lowercase()) {
+            BoundAction::Command(cmd)
+        } else {
+            eprintln!("[wslterm] keybinding ignored: unknown action {:?}", a.action);
+            continue;
+        };
+        out.push(KeyBinding { ctrl, alt, shift, code, action });
+    }
+    out
+}
+
+/// Parse a chord like `"ctrl+shift+up"` into (ctrl, alt, shift, key). The key may
+/// be a letter/digit, an arrow, `f1`..`f12`, or a named key (space, tab, enter,
+/// esc, home, end, pageup/pagedown, insert, delete, backspace) or a punctuation
+/// name (plus, minus, comma, …). `None` if no/unknown key is present.
+fn parse_chord(keys: &str) -> Option<(bool, bool, bool, KeyCode)> {
+    let (mut ctrl, mut alt, mut shift) = (false, false, false);
+    let mut code = None;
+    for part in keys.split('+') {
+        let p = part.trim().to_ascii_lowercase();
+        if p.is_empty() {
+            continue;
+        }
+        match p.as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "alt" | "option" => alt = true,
+            "shift" => shift = true,
+            other => code = Some(key_name_to_code(other)?),
+        }
+    }
+    code.map(|c| (ctrl, alt, shift, c))
+}
+
+fn key_name_to_code(name: &str) -> Option<KeyCode> {
+    use KeyCode::*;
+    Some(match name {
+        "a" => KeyA, "b" => KeyB, "c" => KeyC, "d" => KeyD, "e" => KeyE, "f" => KeyF,
+        "g" => KeyG, "h" => KeyH, "i" => KeyI, "j" => KeyJ, "k" => KeyK, "l" => KeyL,
+        "m" => KeyM, "n" => KeyN, "o" => KeyO, "p" => KeyP, "q" => KeyQ, "r" => KeyR,
+        "s" => KeyS, "t" => KeyT, "u" => KeyU, "v" => KeyV, "w" => KeyW, "x" => KeyX,
+        "y" => KeyY, "z" => KeyZ,
+        "0" => Digit0, "1" => Digit1, "2" => Digit2, "3" => Digit3, "4" => Digit4,
+        "5" => Digit5, "6" => Digit6, "7" => Digit7, "8" => Digit8, "9" => Digit9,
+        "up" => ArrowUp, "down" => ArrowDown, "left" => ArrowLeft, "right" => ArrowRight,
+        "space" => Space, "tab" => Tab, "enter" | "return" => Enter,
+        "esc" | "escape" => Escape, "backspace" => Backspace,
+        "delete" | "del" => Delete, "insert" | "ins" => Insert,
+        "home" => Home, "end" => End,
+        "pageup" | "pgup" => PageUp, "pagedown" | "pgdn" => PageDown,
+        "f1" => F1, "f2" => F2, "f3" => F3, "f4" => F4, "f5" => F5, "f6" => F6,
+        "f7" => F7, "f8" => F8, "f9" => F9, "f10" => F10, "f11" => F11, "f12" => F12,
+        "=" | "plus" => Equal, "-" | "minus" => Minus,
+        "," | "comma" => Comma, "." | "period" => Period, "/" | "slash" => Slash,
+        ";" | "semicolon" => Semicolon, "'" | "quote" => Quote,
+        "[" => BracketLeft, "]" => BracketRight, "\\" => Backslash, "`" => Backquote,
+        _ => return None,
+    })
+}
+
+/// Map a settings.json action name (lowercased) to a built-in `Cmd`, so bindings
+/// can drive the same commands as the palette. `None` for unknown names.
+fn action_name_to_cmd(name: &str) -> Option<Cmd> {
+    Some(match name {
+        "newtab" => Cmd::NewTab,
+        "newwindow" => Cmd::NewWindow,
+        "splitright" => Cmd::SplitRight,
+        "splitdown" => Cmd::SplitDown,
+        "closepane" => Cmd::ClosePane,
+        "nexttab" => Cmd::NextTab,
+        "prevtab" | "previoustab" => Cmd::PrevTab,
+        "find" => Cmd::Find,
+        "copy" => Cmd::Copy,
+        "paste" => Cmd::Paste,
+        "togglesidebar" => Cmd::ToggleSidebar,
+        "togglehidden" => Cmd::ToggleHidden,
+        "increasefontsize" | "fontinc" => Cmd::FontInc,
+        "decreasefontsize" | "fontdec" => Cmd::FontDec,
+        "resetfontsize" | "fontreset" => Cmd::FontReset,
+        "editconfig" | "editsettings" => Cmd::EditSettings,
+        "reloadconfig" | "reloadsettings" => Cmd::ReloadSettings,
+        "editwslconfig" => Cmd::EditWslConfig,
+        "togglemaximize" | "maximize" => Cmd::Maximize,
+        _ => return None,
+    })
+}
 
 /// Command-palette overlay state (Ctrl+Shift+P): the typed filter, the matching
 /// command indices into `COMMANDS`, and the highlighted row.
@@ -669,6 +777,7 @@ struct App {
     hover_url: Option<HoverUrl>, // hyperlink under the cursor while Ctrl is held
     search: Option<Search>, // scrollback search overlay (Ctrl+Shift+F)
     palette: Option<Palette>, // command palette overlay (Ctrl+Shift+P)
+    keybindings: Vec<KeyBinding>, // user actions (settings.json); override built-ins
 
     // Mouse reporting: when a focused app enables DEC mouse tracking, button/
     // motion/wheel events are encoded and sent to the PTY instead of driving
@@ -713,6 +822,7 @@ impl App {
         start_port: Option<u32>,
     ) -> App {
         let cfg = Settings::load();
+        let keybindings = compile_keybindings(&cfg.actions);
         let font = load_monospace_font(&cfg.font_family)
             .expect("no monospace font found (Consolas/Cascadia)");
         let mut app = App {
@@ -773,6 +883,7 @@ impl App {
             hover_url: None,
             search: None,
             palette: None,
+            keybindings,
             mouse_held: None,
             mouse_session: None,
             mouse_cell: (-1, -1),
@@ -964,6 +1075,7 @@ impl App {
     /// Re-load settings.json and apply colors/opacity/font live.
     fn apply_settings(&mut self) {
         let cfg = Settings::load();
+        self.keybindings = compile_keybindings(&cfg.actions);
         self.theme = cfg.theme;
         self.opacity = cfg.opacity;
         self.editor = cfg.editor;
@@ -1536,6 +1648,14 @@ impl App {
             return;
         }
 
+        // User keybindings (settings.json "actions") run before the built-ins, so
+        // they can rebind or override them — e.g. ctrl+shift+up -> sendInput.
+        if let PhysicalKey::Code(code) = ev.physical_key {
+            if self.run_keybinding(code, ctrl, alt, shift, event_loop) {
+                return;
+            }
+        }
+
         if let PhysicalKey::Code(code) = ev.physical_key {
             match code {
                 KeyCode::KeyF if ctrl && shift => {
@@ -1611,15 +1731,6 @@ impl App {
                 }
                 KeyCode::Tab if ctrl => {
                     self.switch_tab(if shift { -1 } else { 1 });
-                    return;
-                }
-                // Jump between shell prompts (needs OSC 133 shell integration).
-                KeyCode::ArrowUp if ctrl && shift => {
-                    self.jump_prompt(-1);
-                    return;
-                }
-                KeyCode::ArrowDown if ctrl && shift => {
-                    self.jump_prompt(1);
                     return;
                 }
                 KeyCode::Equal | KeyCode::NumpadAdd if ctrl => {
@@ -1702,6 +1813,44 @@ impl App {
         }
         if let Some(text) = &ev.text {
             self.send(text.as_bytes());
+        }
+    }
+
+    /// Run a user keybinding matching this exact chord (modifiers must match
+    /// exactly). Returns true if one fired, so the caller skips the built-ins.
+    fn run_keybinding(
+        &mut self,
+        code: KeyCode,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+        event_loop: &ActiveEventLoop,
+    ) -> bool {
+        let action = self
+            .keybindings
+            .iter()
+            .find(|b| b.code == code && b.ctrl == ctrl && b.alt == alt && b.shift == shift)
+            .map(|b| b.action.clone());
+        match action {
+            Some(BoundAction::SendInput(bytes)) => {
+                // Snap the focused view to the live bottom (like typing), then send.
+                let s = self.focused_session();
+                if self.pane(s).map(|p| p.scroll_off).unwrap_or(0) != 0 {
+                    if let Some(p) = self.pane_mut(s) {
+                        p.scroll_off = 0;
+                    }
+                    self.request_redraw();
+                }
+                if !bytes.is_empty() {
+                    self.send(&bytes);
+                }
+                true
+            }
+            Some(BoundAction::Command(cmd)) => {
+                self.run_command(cmd, event_loop);
+                true
+            }
+            None => false,
         }
     }
 
@@ -2127,8 +2276,6 @@ impl App {
             Cmd::NextTab => self.switch_tab(1),
             Cmd::PrevTab => self.switch_tab(-1),
             Cmd::Find => self.open_search(),
-            Cmd::PrevPrompt => self.jump_prompt(-1),
-            Cmd::NextPrompt => self.jump_prompt(1),
             Cmd::Copy => self.copy_selection(),
             Cmd::Paste => self.paste(),
             Cmd::ToggleSidebar => self.toggle_sidebar(),
@@ -2236,36 +2383,6 @@ impl App {
         let off = (sbc - abs_row + rows / 2).clamp(0, sbc);
         if let Some(p) = self.pane_mut(session) {
             p.scroll_off = off as usize;
-        }
-    }
-
-    /// Jump the focused pane to the previous (`-1`, older) / next (`+1`, newer)
-    /// shell prompt (OSC 133 mark), placing it at the top of the viewport.
-    fn jump_prompt(&mut self, dir: i32) {
-        let s = self.focused_session();
-        let (marks, sbc, off) = match self.pane(s) {
-            Some(p) => {
-                let t = p.term.lock().unwrap();
-                (t.prompt_marks(), t.scrollback_count() as i64, p.scroll_off as i64)
-            }
-            None => return,
-        };
-        if marks.is_empty() {
-            return;
-        }
-        let top_abs = sbc - off; // absolute row currently at the top of the view
-        let rows_it = marks.iter().map(|(r, _)| *r);
-        let target = if dir < 0 {
-            rows_it.filter(|&r| r < top_abs).max()
-        } else {
-            rows_it.filter(|&r| r > top_abs).min()
-        };
-        if let Some(abs) = target {
-            let new_off = (sbc - abs).clamp(0, sbc);
-            if let Some(p) = self.pane_mut(s) {
-                p.scroll_off = new_off as usize;
-            }
-            self.request_redraw();
         }
     }
 
@@ -4146,5 +4263,36 @@ mod tests {
     fn unrecognized_returned_as_is() {
         // Caller discards anything not starting with '/'.
         assert!(!w(r"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}").starts_with('/'));
+    }
+
+    #[test]
+    fn parses_key_chords() {
+        use super::{parse_chord, KeyCode};
+        assert_eq!(parse_chord("ctrl+shift+up"), Some((true, false, true, KeyCode::ArrowUp)));
+        assert_eq!(parse_chord("Ctrl+Shift+Down"), Some((true, false, true, KeyCode::ArrowDown)));
+        assert_eq!(parse_chord("alt+t"), Some((false, true, false, KeyCode::KeyT)));
+        assert_eq!(parse_chord("f5"), Some((false, false, false, KeyCode::F5)));
+        assert_eq!(parse_chord("ctrl+shift+nope"), None); // unknown key name
+        assert_eq!(parse_chord("ctrl+shift"), None); // modifiers but no key
+    }
+
+    #[test]
+    fn compiles_bindings() {
+        use super::{compile_keybindings, ActionBinding, BoundAction, Cmd};
+        let acts = vec![
+            ActionBinding { keys: "ctrl+shift+up".into(), action: "sendInput".into(), input: "ESC[1;6A".into() },
+            ActionBinding { keys: "ctrl+shift+c".into(), action: "copy".into(), input: String::new() },
+            // Unparseable chord: dropped, not panicked.
+            ActionBinding { keys: "ctrl+nope".into(), action: "sendInput".into(), input: "x".into() },
+            // Unknown action: also dropped.
+            ActionBinding { keys: "ctrl+shift+z".into(), action: "frobnicate".into(), input: String::new() },
+        ];
+        let kb = compile_keybindings(&acts);
+        assert_eq!(kb.len(), 2);
+        match &kb[0].action {
+            BoundAction::SendInput(b) => assert_eq!(b, b"ESC[1;6A"),
+            _ => panic!("expected SendInput"),
+        }
+        assert!(matches!(kb[1].action, BoundAction::Command(Cmd::Copy)));
     }
 }

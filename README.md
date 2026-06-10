@@ -132,10 +132,13 @@ Advanced overrides via environment variables:
 | `Shift+PageUp` / `Shift+PageDown` | Scroll the scrollback up / down one screen |
 | `Ctrl+Shift+P` | Command palette — type to filter, Enter to run, Esc to close |
 | `Ctrl+Shift+F` | Search the scrollback (Enter / Shift+Enter to step matches, Esc to close) |
-| `Ctrl+Shift+Up` / `Ctrl+Shift+Down` | Jump to the previous / next shell prompt (needs shell integration) |
 | `Ctrl+,` | Edit `settings.json` (opens `edit.exe`; applies on close) |
 | `Ctrl+Shift+,` | Reload `settings.json` from disk and apply (no editor) |
 | `F11` | Toggle maximize |
+
+Any key not bound above (or rebound — see **Custom keybindings** below) is sent to
+the shell, so `Ctrl+Shift+Up`/`Down` etc. reach apps like tmux as the usual
+`CSI 1;6 A`/`B` sequences.
 
 **Mouse:** the wheel scrolls the scrollback (`Ctrl+wheel` zooms the font); drag to
 select text and double-click to select a word; drag the scrollbar thumb (or click
@@ -152,7 +155,6 @@ report the working directory (OSC 7) and mark shell prompts and command exit
 status (OSC 133). With it enabled:
 
 - **new tabs/splits open in the focused pane's directory**;
-- **`Ctrl+Shift+Up/Down` jumps between prompts** in the scrollback;
 - **failed commands** get a red tick in the scrollbar.
 
 Copy the script into WSL and source it from `~/.bashrc` (bash) and/or `~/.zshrc`
@@ -216,6 +218,37 @@ Example `settings.json`:
            "#767676","#E74856","#16C60C","#F9F1A5","#3B78FF","#B4009E","#61D6D6","#F2F2F2"]
 }
 ```
+
+### Custom keybindings
+
+An optional **`actions`** array binds key chords to commands, in the same shape as
+Windows Terminal. User bindings are checked **before** the built-in shortcuts, so
+they can override them; a binding that fails to parse is skipped (the rest still
+load). Changes apply on the next reload (`Ctrl+Shift+,`).
+
+```json
+{
+  "actions": [
+    { "keys": "ctrl+shift+up",   "command": { "action": "sendInput", "input": "\u001b[1;6A" } },
+    { "keys": "ctrl+shift+down", "command": { "action": "sendInput", "input": "\u001b[1;6B" } },
+    { "keys": "alt+enter",       "command": "toggleMaximize" }
+  ]
+}
+```
+
+- **`keys`** — a chord like `"ctrl+shift+up"`: optional `ctrl` / `alt` / `shift`
+  plus one key. The key may be a letter/digit, an arrow (`up`/`down`/`left`/`right`),
+  `f1`–`f12`, or a named key (`space`, `tab`, `enter`, `esc`, `home`, `end`,
+  `pageup`, `pagedown`, `insert`, `delete`, `backspace`, `plus`, `minus`, `comma`, …).
+- **`command`** — either an object `{ "action": "sendInput", "input": "…" }` or a
+  bare action name (`"copy"`).
+  - **`sendInput`** writes `input` verbatim to the shell (JSON `\uXXXX` escapes
+    decode first, so `"\u001b[1;6A"` sends the `Ctrl+Shift+Up` sequence — handy for
+    forwarding chords to tmux/vim).
+  - Named actions match the command palette: `newTab`, `newWindow`, `splitRight`,
+    `splitDown`, `closePane`, `nextTab`, `prevTab`, `find`, `copy`, `paste`,
+    `toggleSidebar`, `toggleHidden`, `increaseFontSize`, `decreaseFontSize`,
+    `resetFontSize`, `editConfig`, `reloadConfig`, `editWslConfig`, `toggleMaximize`.
 
 ---
 
