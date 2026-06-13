@@ -23,7 +23,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
+use ab_glyph::{Font, FontRef, FontVec, PxScale, ScaleFont};
+use memmap2::Mmap;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -83,7 +84,7 @@ struct Glyph {
 /// Rasterize one char from `font` at pixel size `px`, positioned on the baseline
 /// `ascent` (passed in so fallback glyphs align to the primary font's baseline).
 /// `None` if it has no outline (e.g. space, or a color/bitmap-only emoji glyph).
-fn rasterize_glyph(font: &FontVec, px: f32, ascent: f32, ch: char) -> Option<Glyph> {
+fn rasterize_glyph<F: Font>(font: &F, px: f32, ascent: f32, ch: char) -> Option<Glyph> {
     let scale = PxScale::from(px);
     let g = font
         .glyph_id(ch)
@@ -728,7 +729,7 @@ struct App {
     restore_rect: Option<(i32, i32, u32, u32)>,
 
     font: FontVec,
-    fallback: Vec<FontVec>, // for glyphs the primary font lacks (CJK, Cyrillic, symbols)
+    fallbacks: Fallbacks, // glyphs the primary font lacks (CJK, symbols, emoji) — lazy + mmapped
     font_family: String,
     font_path: Option<std::path::PathBuf>, // resolved font file (shared by CPU + GPU text)
     scale: f32,
@@ -839,7 +840,7 @@ impl App {
             maximized: false,
             restore_rect: None,
             font,
-            fallback: load_fallback_fonts(),
+            fallbacks: Fallbacks::new(),
             font_path: font_file_path(&cfg.font_family),
             font_family: cfg.font_family.clone(),
             scale: 1.0,
@@ -1116,13 +1117,14 @@ impl App {
         self.request_redraw();
     }
 
-    /// Sidebar entry index under the mouse, if any.
+    /// Sidebar entry index under the mouse, if any. Entries start below the tab
+    /// bar *and* the one-row directory-name header.
     fn sidebar_entry_at_cursor(&self) -> Option<usize> {
-        let bar = self.tab_bar_h();
-        if (self.cursor_px.1 as usize) < bar {
+        let top = self.tab_bar_h() + self.cell_h; // tab bar + dir-name header row
+        if (self.cursor_px.1 as usize) < top {
             return None;
         }
-        let idx = (self.cursor_px.1 as usize - bar) / self.cell_h + self.sidebar_scroll;
+        let idx = (self.cursor_px.1 as usize - top) / self.cell_h + self.sidebar_scroll;
         (idx < self.sidebar_entries.len()).then_some(idx)
     }
 
@@ -2596,7 +2598,7 @@ impl App {
             };
             let mut gx = x0 + pad;
             for ch in text.chars() {
-                ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, ch);
                 blit_char(buf, w, h, &self.glyph_cache, ch, gx, text_top, fg);
                 gx += cw;
             }
@@ -2606,7 +2608,7 @@ impl App {
         }
         let px0 = x;
         let px1 = (x + cw + pad * 2).min(w as usize);
-        ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, '+');
+        ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, '+');
         blit_char(buf, w, h, &self.glyph_cache, '+', px0 + pad, text_top,
             mix(self.theme.bg, self.theme.fg, 0.7));
         self.plus_range = (px0 as f32, px1 as f32);
@@ -2633,7 +2635,7 @@ impl App {
             fill_rect(buf, w, h, mx + sq - t, my, t, sq, OPAQUE | fg);
             // close: an X (drawn as a filled box tinted red on the glyph)
             let cxx = close_x + bw / 2;
-            ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, 'x');
+            ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, 'x');
             blit_char(buf, w, h, &self.glyph_cache, 'x', cxx - cw / 2, text_top, 0xE0_6C75);
             self.win_btns = [
                 (min_x as f32, (min_x + bw) as f32),
@@ -2717,7 +2719,7 @@ impl App {
                         let rune = self.grid[r][c].rune;
                         if rune >= 0x20 {
                             if let Some(ch) = char::from_u32(rune) {
-                                ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                                ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, ch);
                             }
                         }
                     }
@@ -2906,7 +2908,7 @@ impl App {
             fill_rect(buf, w, h, ax, bar_h, aw, ch_px, OPAQUE | mix(self.theme.bg, self.theme.fg, 0.12));
             let mut gx = ax + pad;
             for ch in header.chars().take(aw / cw) {
-                ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, ch);
                 blit_char(buf, w, h, &self.glyph_cache, ch, gx, bar_h as i32, self.theme.fg);
                 gx += cw;
             }
@@ -2926,7 +2928,7 @@ impl App {
                 let num = format!("{:>w$} ", li + 1, w = gutter - 1);
                 let mut gx = ax;
                 for ch in num.chars() {
-                    ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                    ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, ch);
                     blit_char(buf, w, h, &self.glyph_cache, ch, gx, y, dim);
                     gx += cw;
                 }
@@ -2946,7 +2948,7 @@ impl App {
                         break;
                     }
                     let color = colors.get(i).copied().unwrap_or(self.theme.fg);
-                    ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                    ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, ch);
                     blit_char(buf, w, h, &self.glyph_cache, ch, gx, y, color);
                     gx += cw;
                 }
@@ -2964,13 +2966,32 @@ impl App {
             let sb_bg = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.05);
             fill_rect(buf, w, h, 0, bar_h, sb, (h as usize).saturating_sub(bar_h), sb_bg);
             let line_h = ch_px;
-            let visible = (h as usize).saturating_sub(bar_h) / line_h;
             let dir_color = self.theme.ansi[12]; // bright blue
             let icon_w = cw + cw / 2; // room for a small folder/file glyph
+
+            // Header: label the panel with the current directory's name so it's
+            // clear which folder is shown. Distinct background + a separator line
+            // set it apart from the entries below it.
+            let hdr_bg = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.12);
+            fill_rect(buf, w, h, 0, bar_h, sb, line_h, hdr_bg);
+            fill_rect(buf, w, h, 0, bar_h + line_h.saturating_sub(1), sb, 1, divider);
+            draw_folder_icon(buf, w, h, 5, bar_h, ch_px, dir_color);
+            let mut gx = 4 + icon_w;
+            let max_chars = sb.saturating_sub(gx) / cw;
+            let label = ellipsize_path(&self.sidebar_dir, max_chars);
+            for ch in label.chars().take(max_chars) {
+                ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, ch);
+                blit_char(buf, w, h, &self.glyph_cache, ch, gx, bar_h as i32, self.theme.fg);
+                gx += cw;
+            }
+
+            // Entries below the header.
+            let top = bar_h + line_h;
+            let visible = (h as usize).saturating_sub(top) / line_h;
             for (vi, ent) in
                 self.sidebar_entries.iter().skip(self.sidebar_scroll).take(visible).enumerate()
             {
-                let y = bar_h + vi * line_h;
+                let y = top + vi * line_h;
                 let color = if ent.is_dir { dir_color } else { self.theme.fg };
                 // icon
                 if ent.is_dir {
@@ -2981,7 +3002,7 @@ impl App {
                 // name (no trailing slash now that there's an icon)
                 let mut gx = 4 + icon_w;
                 for ch in ent.name.chars().take(sb.saturating_sub(gx) / cw) {
-                    ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                    ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, ch);
                     blit_char(buf, w, h, &self.glyph_cache, ch, gx, y as i32, color);
                     gx += cw;
                 }
@@ -3006,7 +3027,7 @@ impl App {
                 let iy = (r.y + 2 + i * line_h) as i32;
                 let mut gx = r.x + pad;
                 for ch in item.chars() {
-                    ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                    ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, ch);
                     blit_char(buf, w, h, &self.glyph_cache, ch, gx, iy, self.theme.fg);
                     gx += cw;
                 }
@@ -3033,7 +3054,7 @@ impl App {
                 if gx + cw > sb + aw {
                     break;
                 }
-                ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, ch);
                 blit_char(buf, w, h, &self.glyph_cache, ch, gx, ty, self.theme.fg);
                 gx += cw;
             }
@@ -3052,7 +3073,7 @@ impl App {
                 mix(self.theme.bg, self.theme.fg, 0.6)
             };
             for ch in count.chars() {
-                ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, ch);
                 blit_char(buf, w, h, &self.glyph_cache, ch, gx, ty, ccol);
                 gx += cw;
             }
@@ -3076,7 +3097,7 @@ impl App {
             let mut gx = r.x + pad;
             let iy = (r.y + pad) as i32;
             for ch in prompt.chars().take(maxw) {
-                ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, ch);
                 blit_char(buf, w, h, &self.glyph_cache, ch, gx, iy, self.theme.fg);
                 gx += cw;
             }
@@ -3095,14 +3116,14 @@ impl App {
                 let cmd = COMMANDS[ci];
                 let mut gx = r.x + pad;
                 for ch in cmd.label().chars().take(maxw) {
-                    ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                    ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, ch);
                     blit_char(buf, w, h, &self.glyph_cache, ch, gx, ry as i32, fg);
                     gx += cw;
                 }
                 let hint = cmd.hint();
                 let mut gx = (r.x + r.w).saturating_sub(pad + hint.chars().count() * cw);
                 for ch in hint.chars() {
-                    ensure_glyph(&self.font, &self.fallback, &mut self.glyph_cache, self.font_px, ch);
+                    ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, ch);
                     blit_char(buf, w, h, &self.glyph_cache, ch, gx, ry as i32, hc);
                     gx += cw;
                 }
@@ -3798,6 +3819,30 @@ fn basename(path: &str) -> String {
     }
 }
 
+/// Fit a path into `max` characters for the sidebar header, keeping the start and
+/// end with a middle ellipsis: `/tmp/a/b/c/d/e/f/hehe` -> `/tmp/.../hehe`. Returns
+/// the path unchanged when it already fits.
+fn ellipsize_path(path: &str, max: usize) -> String {
+    let len = path.chars().count();
+    if max == 0 || len <= max {
+        return path.to_string();
+    }
+    // Prefer the first component and the basename joined by "/.../".
+    let trimmed = path.trim_end_matches('/');
+    let last = trimmed.rsplit('/').next().unwrap_or("");
+    let first = trimmed.trim_start_matches('/').split('/').next().unwrap_or("");
+    if !first.is_empty() && !last.is_empty() && first != last {
+        let candidate = format!("/{first}/.../{last}");
+        if candidate.chars().count() <= max {
+            return candidate;
+        }
+    }
+    // Degenerate (one huge component, or first+last still too long): keep the tail.
+    let keep = max.saturating_sub(3);
+    let tail: String = path.chars().skip(len - keep).collect();
+    format!("...{tail}")
+}
+
 /// Linear blend between two 0RGB colors by `t` (0 = a, 1 = b).
 fn mix(a: u32, b: u32, t: f32) -> u32 {
     let t = t.clamp(0.0, 1.0);
@@ -3814,7 +3859,7 @@ fn mix(a: u32, b: u32, t: f32) -> u32 {
 /// missing from the primary still render). All glyphs share the primary baseline.
 fn ensure_glyph(
     primary: &FontVec,
-    fallback: &[FontVec],
+    fallbacks: &mut Fallbacks,
     cache: &mut HashMap<char, Option<Glyph>>,
     px: f32,
     ch: char,
@@ -3823,37 +3868,79 @@ fn ensure_glyph(
         return;
     }
     let ascent = primary.as_scaled(PxScale::from(px)).ascent();
-    let font = if primary.glyph_id(ch).0 != 0 {
-        primary
+    let glyph = if primary.glyph_id(ch).0 != 0 {
+        rasterize_glyph(primary, px, ascent, ch)
+    } else if let Some(f) = fallbacks.font_with(ch) {
+        rasterize_glyph(f, px, ascent, ch)
     } else {
-        fallback.iter().find(|f| f.glyph_id(ch).0 != 0).unwrap_or(primary)
+        rasterize_glyph(primary, px, ascent, ch) // no fallback has it: .notdef box
     };
-    cache.insert(ch, rasterize_glyph(font, px, ascent, ch));
+    cache.insert(ch, glyph);
 }
 
-/// Load fallback fonts for glyphs the primary monospace font lacks. Color emoji
-/// (CBDT/COLR) still won't render in color — that needs a color-glyph renderer.
-fn load_fallback_fonts() -> Vec<FontVec> {
-    let mut v = Vec::new();
-    let candidates: &[(&str, bool)] = &[
-        (r"C:\Windows\Fonts\segoeui.ttf", false),  // Latin/Cyrillic/Greek/diacritics
-        (r"C:\Windows\Fonts\seguisym.ttf", false), // symbols, arrows, misc
-        (r"C:\Windows\Fonts\msgothic.ttc", true),  // CJK incl. (half-width) katakana
-        (r"C:\Windows\Fonts\seguiemj.ttf", false), // emoji (monochrome outline at best)
-    ];
-    for &(path, ttc) in candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            let font = if ttc {
-                FontVec::try_from_vec_and_index(bytes, 0)
-            } else {
-                FontVec::try_from_vec(bytes)
-            };
-            if let Ok(f) = font {
-                v.push(f);
-            }
+/// Memory-map a font file and parse it into a `'static` `FontRef`. The mapping is
+/// leaked (fonts live for the whole process), so its pages stay file-backed —
+/// demand-paged, shared between windows, and not counted as private commit.
+///
+/// SAFETY: we only ever read the mapping, and Windows system fonts aren't
+/// modified out from under us; leaking keeps the backing valid for `'static`.
+fn mmap_font(path: &str, index: u32) -> Option<FontRef<'static>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mmap = unsafe { Mmap::map(&file).ok()? };
+    let leaked: &'static Mmap = Box::leak(Box::new(mmap));
+    FontRef::try_from_slice_and_index(&leaked[..], index).ok()
+}
+
+/// Fallback fonts for glyphs the primary monospace font lacks (Latin extras,
+/// symbols, CJK, emoji). Loaded **lazily** and memory-mapped: a typical session
+/// renders only the primary's glyphs, so the large CJK/emoji files (~20 MB) are
+/// never touched; each candidate is mapped only the first time a glyph needs it.
+/// (Color emoji still render as monochrome outlines — that needs a color-glyph
+/// renderer.)
+struct Fallbacks {
+    candidates: &'static [(&'static str, u32)], // (file path, ttc face index)
+    fonts: Vec<FontRef<'static>>,               // loaded so far, in candidate order
+    next: usize,                                // next candidate not yet attempted
+}
+
+impl Fallbacks {
+    fn new() -> Self {
+        Fallbacks {
+            candidates: &[
+                (r"C:\Windows\Fonts\segoeui.ttf", 0),  // Latin/Cyrillic/Greek/diacritics
+                (r"C:\Windows\Fonts\seguisym.ttf", 0), // symbols, arrows, misc
+                (r"C:\Windows\Fonts\msgothic.ttc", 0), // CJK incl. (half-width) katakana
+                (r"C:\Windows\Fonts\seguiemj.ttf", 0), // emoji (monochrome outline at best)
+            ],
+            fonts: Vec::new(),
+            next: 0,
         }
     }
-    v
+
+    /// A loaded fallback that has `ch`, mapping further candidates on demand;
+    /// `None` if none of them covers it.
+    fn font_with(&mut self, ch: char) -> Option<&FontRef<'static>> {
+        while !self.fonts.iter().any(|f| f.glyph_id(ch).0 != 0) {
+            if !self.load_next() {
+                break;
+            }
+        }
+        self.fonts.iter().find(|f| f.glyph_id(ch).0 != 0)
+    }
+
+    /// Map + parse the next candidate (skipping any that fail); false when none
+    /// remain.
+    fn load_next(&mut self) -> bool {
+        while self.next < self.candidates.len() {
+            let (path, index) = self.candidates[self.next];
+            self.next += 1;
+            if let Some(f) = mmap_font(path, index) {
+                self.fonts.push(f);
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Blit a cached glyph with its top-left cell at (x, cell_top) in color `fg`.
@@ -4263,6 +4350,19 @@ mod tests {
     fn unrecognized_returned_as_is() {
         // Caller discards anything not starting with '/'.
         assert!(!w(r"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}").starts_with('/'));
+    }
+
+    #[test]
+    fn ellipsizes_long_paths() {
+        use super::ellipsize_path as e;
+        // Fits -> unchanged.
+        assert_eq!(e("/tmp/hehe", 20), "/tmp/hehe");
+        // Too long -> keep first component + basename.
+        assert_eq!(e("/tmp/a/b/c/d/e/f/hehe", 16), "/tmp/.../hehe");
+        // Still too tight for /first/.../last -> tail with leading ellipsis.
+        assert_eq!(e("/tmp/a/b/c/d/e/f/hehe", 8), ".../hehe");
+        // max 0 -> unchanged (caller caps with take()).
+        assert_eq!(e("/x/y/z", 0), "/x/y/z");
     }
 
     #[test]

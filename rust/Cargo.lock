@@ -2061,6 +2061,7 @@ dependencies = [
  "clipboard-win",
  "ico",
  "image",
+ "memmap2",
  "raw-window-handle",
  "serde",
  "serde_json",

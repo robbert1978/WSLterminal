@@ -14,6 +14,9 @@ wslterm-pty = { path = "../wslterm-pty" }
 # Presentation is via UpdateLayeredWindow (see layered.rs) for per-pixel alpha.
 winit = "0.30"
 ab_glyph = "0.2"
+# Memory-map fallback font files (lazy, file-backed, shared between windows)
+# instead of reading them into owned buffers — keeps per-window RAM low.
+memmap2 = "0.9"
 # Lightweight, Windows-only clipboard access for copy/paste.
 clipboard-win = "5"
 raw-window-handle = "0.6"
