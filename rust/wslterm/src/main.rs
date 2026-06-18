@@ -799,6 +799,7 @@ struct App {
     sidebar_entries: Vec<wslfiles::Entry>,
     sidebar_scroll: usize,
     sidebar_menu: Option<SidebarMenu>, // right-click context menu
+    tab_menu: Option<TabMenu>, // right-click context menu over a tab
 }
 
 /// What a tab-bar chip selects.
@@ -811,6 +812,13 @@ enum ChipTarget {
 /// Right-click context menu over a sidebar entry.
 struct SidebarMenu {
     entry: usize,             // index into sidebar_entries
+    items: Vec<&'static str>, // menu labels
+    rect: Rect,               // popup rect (device px)
+}
+
+/// Right-click context menu over a terminal tab.
+struct TabMenu {
+    tab: usize,               // index into self.tabs
     items: Vec<&'static str>, // menu labels
     rect: Rect,               // popup rect (device px)
 }
@@ -897,6 +905,7 @@ impl App {
             sidebar_entries: Vec::new(),
             sidebar_scroll: 0,
             sidebar_menu: None,
+            tab_menu: None,
         };
         app.recompute_metrics();
         app
@@ -1220,6 +1229,47 @@ impl App {
         true
     }
 
+    /// Open the right-click context menu for tab `idx` at the cursor.
+    fn open_tab_menu(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let items = vec!["Move to New Window", "Close Tab"];
+        let pad = (6.0 * self.scale).round().max(2.0) as usize;
+        let mw = items.iter().map(|s| s.len()).max().unwrap_or(8) * self.cell_w + pad * 2;
+        let line_h = self.cell_h + 4;
+        let rect = Rect {
+            x: self.cursor_px.0 as usize,
+            y: self.cursor_px.1 as usize,
+            w: mw,
+            h: items.len() * line_h + 4,
+        };
+        self.tab_menu = Some(TabMenu { tab: idx, items, rect });
+        self.request_redraw();
+    }
+
+    /// Handle a click while the tab context menu is open. Returns true if the
+    /// click was consumed (menu was open).
+    fn tab_menu_click(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        let menu = match self.tab_menu.take() {
+            Some(m) => m,
+            None => return false,
+        };
+        self.request_redraw();
+        let (mx, my) = self.cursor_px;
+        if !menu.rect.contains(mx, my) {
+            return true; // clicked outside: dismissed
+        }
+        let line_h = self.cell_h + 4;
+        let row = (my as usize - menu.rect.y).saturating_sub(2) / line_h;
+        match menu.items.get(row).copied() {
+            Some("Move to New Window") => self.move_tab_to_new_window(menu.tab, event_loop),
+            Some("Close Tab") => self.close_whole_tab(menu.tab, event_loop),
+            _ => {}
+        }
+        true
+    }
+
     /// Editor key handling while a document is open.
     fn doc_key(&mut self, ev: &KeyEvent) {
         let ctrl = self.mods.control_key();
@@ -1401,6 +1451,32 @@ impl App {
             .and_then(|_| self.pane(self.focused_session()))
             .and_then(|p| p.term.lock().unwrap().current_directory().map(String::from))
             .unwrap_or_default()
+    }
+
+    /// Working directory of tab `idx`'s focused pane (empty if unknown).
+    fn tab_cwd(&self, idx: usize) -> String {
+        let Some(t) = self.tabs.get(idx) else {
+            return String::new();
+        };
+        let sid = if t.root.find(t.focus).is_some() { t.focus } else { t.root.first_session() };
+        t.root
+            .find(sid)
+            .and_then(|p| p.term.lock().unwrap().current_directory().map(String::from))
+            .unwrap_or_default()
+    }
+
+    /// "Move" a tab to a fresh window: open a new window in that tab's directory
+    /// (inheriting this window's distro/port) and close the tab here. The shell is
+    /// new — a running program and the scrollback don't carry over (windows are
+    /// separate processes, so the live session can't be handed across).
+    fn move_tab_to_new_window(&mut self, idx: usize, event_loop: &ActiveEventLoop) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let cwd = self.tab_cwd(idx);
+        let (distro, port) = self.spawn_inherit();
+        spawn_window(if cwd.is_empty() { None } else { Some(cwd) }, distro, port);
+        self.close_whole_tab(idx, event_loop);
     }
 
     /// Open a new tab, inheriting the focused pane's working directory.
@@ -1788,20 +1864,16 @@ impl App {
             return;
         }
 
-        // Typing snaps the focused view to the live bottom.
-        let s = self.focused_session();
-        if self.pane(s).map(|p| p.scroll_off).unwrap_or(0) != 0 {
-            if let Some(p) = self.pane_mut(s) {
-                p.scroll_off = 0;
-            }
-            self.request_redraw();
-        }
         let mods = Mods { ctrl, alt, shift };
         let app_cursor = self.focused_term().lock().unwrap().app_cursor_keys();
 
+        // Only keys that actually send input snap the view back to the live bottom
+        // — pressing a bare modifier (e.g. the Shift/Ctrl of Ctrl+Shift+C while
+        // reading scrollback) must NOT yank the view down.
         if let PhysicalKey::Code(code) = ev.physical_key {
             if let Some(n) = function_number(code) {
                 if let Some(b) = input::encode(Key::F(n), mods, app_cursor) {
+                    self.snap_to_live();
                     self.send(&b);
                     return;
                 }
@@ -1810,11 +1882,24 @@ impl App {
 
         let key = map_key(&ev.logical_key);
         if let Some(bytes) = key.and_then(|k| input::encode(k, mods, app_cursor)) {
+            self.snap_to_live();
             self.send(&bytes);
             return;
         }
         if let Some(text) = &ev.text {
+            self.snap_to_live();
             self.send(text.as_bytes());
+        }
+    }
+
+    /// Pull the focused pane back to the live bottom (called when sending input).
+    fn snap_to_live(&mut self) {
+        let s = self.focused_session();
+        if self.pane(s).map(|p| p.scroll_off).unwrap_or(0) != 0 {
+            if let Some(p) = self.pane_mut(s) {
+                p.scroll_off = 0;
+            }
+            self.request_redraw();
         }
     }
 
@@ -2672,6 +2757,8 @@ impl App {
             let by = bar_h + ch_px;
             Rect { x: bx, y: by, w: bw, h: bh }
         });
+        // Tab context menu also overlays the terminal (it drops below the tab bar).
+        let tab_menu_geom: Option<Rect> = self.tab_menu.as_ref().map(|m| m.rect);
         if self.active_doc.is_none() {
         for (session, rect) in &rects {
             if has_background {
@@ -2779,10 +2866,12 @@ impl App {
                     }
                     // Don't draw glyphs the GPU would paint over an overlay (the
                     // search bar at the bottom, or the command-palette box).
+                    let overlaps = |g: Rect| {
+                        x0 < g.x + g.w && x0 + cw > g.x && y0 < g.y + g.h && y0 + ch_px > g.y
+                    };
                     let under_overlay = search_bar_top.map_or(false, |t| y0 + ch_px > t)
-                        || pal_geom.map_or(false, |g| {
-                            x0 < g.x + g.w && x0 + cw > g.x && y0 < g.y + g.h && y0 + ch_px > g.y
-                        });
+                        || pal_geom.map_or(false, overlaps)
+                        || tab_menu_geom.map_or(false, overlaps);
                     if cell.rune >= 0x20 && !under_overlay {
                         if let Some(ch) = char::from_u32(cell.rune) {
                             if self.gpu_text {
@@ -3014,6 +3103,28 @@ impl App {
 
         // --- sidebar context menu (popup) ---------------------------------
         if let Some(menu) = &self.sidebar_menu {
+            let r = menu.rect;
+            let menu_bg = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.16);
+            let border = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.4);
+            fill_rect(buf, w, h, r.x, r.y, r.w, r.h, menu_bg);
+            fill_rect(buf, w, h, r.x, r.y, r.w, 1, border);
+            fill_rect(buf, w, h, r.x, r.y + r.h - 1, r.w, 1, border);
+            fill_rect(buf, w, h, r.x, r.y, 1, r.h, border);
+            fill_rect(buf, w, h, r.x + r.w - 1, r.y, 1, r.h, border);
+            let line_h = ch_px + 4;
+            for (i, item) in menu.items.iter().enumerate() {
+                let iy = (r.y + 2 + i * line_h) as i32;
+                let mut gx = r.x + pad;
+                for ch in item.chars() {
+                    ensure_glyph(&self.font, &mut self.fallbacks, &mut self.glyph_cache, self.font_px, ch);
+                    blit_char(buf, w, h, &self.glyph_cache, ch, gx, iy, self.theme.fg);
+                    gx += cw;
+                }
+            }
+        }
+
+        // --- tab context menu (popup) -------------------------------------
+        if let Some(menu) = &self.tab_menu {
             let r = menu.rect;
             let menu_bg = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.16);
             let border = OPAQUE | mix(self.theme.bg, self.theme.fg, 0.4);
@@ -3480,6 +3591,9 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
                 (MouseButton::Left, ElementState::Pressed) => {
                     // A click anywhere dismisses/handles an open context menu first.
+                    if self.tab_menu_click(event_loop) {
+                        return;
+                    }
                     if self.menu_click() {
                         return;
                     }
@@ -3601,10 +3715,18 @@ impl ApplicationHandler<UserEvent> for App {
                     self.report_mouse_release(1);
                 }
                 (MouseButton::Right, ElementState::Pressed) => {
+                    let in_tab_bar = self.cursor_px.1 < self.tab_bar_h() as f64;
                     let in_sidebar = self.sidebar_w() > 0
                         && self.cursor_px.0 < self.sidebar_w() as f64 - self.sidebar_resize_handle_w()
                         && self.cursor_px.1 >= self.tab_bar_h() as f64;
-                    if in_sidebar {
+                    if in_tab_bar {
+                        // Right-click a terminal tab -> its context menu.
+                        if let Some(i) = self.chip_at(self.cursor_px.0 as f32) {
+                            if let Some(ChipTarget::Term(t)) = self.chip_targets.get(i).copied() {
+                                self.open_tab_menu(t);
+                            }
+                        }
+                    } else if in_sidebar {
                         self.open_sidebar_menu();
                     } else {
                         self.report_mouse_press(2);
