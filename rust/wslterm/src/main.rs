@@ -709,8 +709,10 @@ impl Doc {
     }
 }
 
-struct App {
-    proxy: EventLoopProxy<UserEvent>,
+/// Per-OS-window state. One process drives several of these; they share the
+/// backend (the `mux` vsock connection + the session→terminal `registry`) so a
+/// tab — with its live session and scrollback — can move between windows.
+struct Win {
     win: Option<Rc<Window>>,
     gpu: Option<Gpu>,          // GPU present path (DirectComposition); preferred
     layered: Option<Layered>,  // CPU fallback (UpdateLayeredWindow)
@@ -745,18 +747,16 @@ struct App {
     settings_session: Option<u32>, // the edit.exe tab editing settings.json; reload on its exit
     background: BackgroundImage,
 
-    mux: Option<WslMux>,
-    registry: Registry,
-    outbox: Outbox,
-    redraw_pending: Arc<AtomicBool>,
+    mux: Option<Rc<WslMux>>, // shared vsock connection (one per process, all windows)
+    registry: Registry,      // shared session -> terminal map (so moved tabs keep streaming)
+    detached: Option<Tab>,   // a tab pending move into a brand-new window (App drains it)
+    closing: bool,           // this window asked to close; App removes it after the event
 
     tabs: Vec<Tab>,
     active_term: usize, // index into `tabs` of the current terminal tab
     docs: Vec<Doc>,     // open file/editor tabs
     active_doc: Option<usize>, // Some(i) => doc tab is foreground; None => terminal
-    start_dir: Option<String>, // cwd for the first tab (from --cd)
-    start_distro: Option<String>, // explicit `--distro <name>` (else WSL's default distro)
-    start_port: Option<u32>,      // explicit `--port <n>` (else VSOCK_PORT)
+    start_port: Option<u32>,   // explicit `--port <n>` (inherited by child-process spawns)
     distro: String, // explicit distro selection: empty = WSL default (no `-d`); drives spawn
     distro_label: String, // actual distro name for sidebar UNC paths/display (daemon-reported if default)
 
@@ -823,20 +823,40 @@ struct TabMenu {
     rect: Rect,               // popup rect (device px)
 }
 
-impl App {
-    fn new(
-        proxy: EventLoopProxy<UserEvent>,
-        start_dir: Option<String>,
-        start_distro: Option<String>,
-        start_port: Option<u32>,
-    ) -> App {
+impl Win {
+    /// Create a new OS window (+ its GPU/layered surface) sharing the process
+    /// backend (`mux`/`registry`). Loads appearance per-window so settings apply
+    /// to each window independently. No tabs yet — the caller adds the first tab
+    /// (`open_first_tab`) or adopts a moved one (`adopt_tab`).
+    fn new(mux: Rc<WslMux>, registry: Registry, event_loop: &ActiveEventLoop) -> Win {
         let cfg = Settings::load();
         let keybindings = compile_keybindings(&cfg.actions);
         let font = load_monospace_font(&cfg.font_family)
             .expect("no monospace font found (Consolas/Cascadia)");
-        let mut app = App {
-            proxy,
-            win: None,
+
+        // Prefer the GPU path (DirectComposition); see resumed() in the old code.
+        let use_gpu = gpu::available();
+        let mut attrs = Window::default_attributes()
+            .with_title("WSL Terminal")
+            .with_window_icon(load_window_icon())
+            .with_decorations(false)
+            .with_resizable(true)
+            .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
+        if use_gpu {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_transparent(true).with_no_redirection_bitmap(true);
+        }
+        let window = Rc::new(event_loop.create_window(attrs).expect("create window"));
+        let scale = window.scale_factor() as f32;
+        let frame_interval = window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            .filter(|&mhz| mhz > 0)
+            .map(|mhz| std::time::Duration::from_secs_f64(1000.0 / mhz as f64))
+            .unwrap_or(std::time::Duration::from_millis(16));
+
+        let mut w = Win {
+            win: Some(window.clone()),
             gpu: None,
             layered: None,
             gpu_text: false,
@@ -844,14 +864,14 @@ impl App {
             fb: Vec::new(),
             want_frame: false,
             last_frame: Instant::now(),
-            frame_interval: std::time::Duration::from_millis(16),
+            frame_interval,
             maximized: false,
             restore_rect: None,
             font,
             fallbacks: Fallbacks::new(),
             font_path: font_file_path(&cfg.font_family),
             font_family: cfg.font_family.clone(),
-            scale: 1.0,
+            scale,
             font_pts: cfg.font_pts,
             font_pts_base: cfg.font_pts,
             font_px: cfg.font_pts * PT_TO_PX,
@@ -863,19 +883,17 @@ impl App {
             editor: cfg.editor,
             settings_session: None,
             background: BackgroundImage::load(cfg.background),
-            mux: None,
-            registry: Arc::new(Mutex::new(HashMap::new())),
-            outbox: Arc::new(Mutex::new(Vec::new())),
-            redraw_pending: Arc::new(AtomicBool::new(false)),
+            mux: Some(mux),
+            registry,
+            detached: None,
+            closing: false,
             tabs: Vec::new(),
             active_term: 0,
             docs: Vec::new(),
             active_doc: None,
-            start_dir,
-            start_distro,
-            start_port,
-            distro: String::new(), // resolved on first resume (empty = WSL default)
-            distro_label: String::new(), // filled from --distro or the daemon's report
+            start_port: None,
+            distro: String::new(),       // set by App::make_window
+            distro_label: String::new(), // set by App::make_window
             mods: ModifiersState::empty(),
             cursor_px: (0.0, 0.0),
             grid: Vec::new(),
@@ -907,8 +925,127 @@ impl App {
             sidebar_menu: None,
             tab_menu: None,
         };
-        app.recompute_metrics();
-        app
+        w.recompute_metrics();
+        if let Some(hwnd) = hwnd_of(&window) {
+            if use_gpu {
+                match Gpu::new(hwnd) {
+                    Ok(mut g) => {
+                        g.set_font(
+                            &w.font_family,
+                            w.font_px,
+                            w.cell_w as f32,
+                            w.cell_h as f32,
+                            w.font_path.as_deref(),
+                        );
+                        w.gpu = Some(g);
+                        w.gpu_text = true;
+                    }
+                    Err(e) => {
+                        eprintln!("[wslterm] GPU init failed ({e:?}); falling back to layered");
+                        w.layered = Some(Layered::new(hwnd));
+                    }
+                }
+            } else {
+                w.layered = Some(Layered::new(hwnd));
+            }
+        }
+        w
+    }
+
+    /// WindowId of this window's OS window (used by App to route events).
+    fn win_id(&self) -> Option<WindowId> {
+        self.win.as_ref().map(|w| w.id())
+    }
+
+    /// Open this window's first tab (the initial shell), in `start_dir` if given.
+    fn open_first_tab(&mut self, start_dir: Option<String>) {
+        let (cols, rows) = match &self.win {
+            Some(w) => {
+                let s = w.inner_size();
+                self.grid_dims(s.width, s.height)
+            }
+            None => (80, 24),
+        };
+        if let Some((session, term)) = self.open_session(cols, rows, start_dir.as_deref().unwrap_or("")) {
+            self.tabs.push(Tab { root: Layout::Leaf(Pane::new(session, term)), focus: session });
+            self.active_term = 0;
+        }
+    }
+
+    /// Adopt a tab moved from another window: its sessions/terminals are already
+    /// live on the shared backend, so just take it and reflow to this window.
+    fn adopt_tab(&mut self, tab: Tab) {
+        self.tabs.push(tab);
+        self.active_term = self.tabs.len() - 1;
+        self.active_doc = None;
+        self.reflow(); // resize the moved panes to this window's grid
+        self.request_redraw();
+    }
+
+    /// Close any sessions still owned by this window's tabs (called when the
+    /// window is removed via its close button). A window emptied by a tab *move*
+    /// has no tabs left, so this is a no-op there (the sessions moved with it).
+    fn close_all_sessions(&mut self) {
+        let mut sessions = Vec::new();
+        for t in &self.tabs {
+            t.root.collect_sessions(&mut sessions);
+        }
+        for s in &sessions {
+            if let Some(mux) = &self.mux {
+                mux.close(*s);
+            }
+            self.registry.lock().unwrap().remove(s);
+        }
+        self.tabs.clear();
+    }
+
+    /// Adopt the distro name the daemon reported (for the sidebar's UNC paths).
+    fn on_distro(&mut self, name: &str) {
+        if self.distro_label.is_empty() && !name.is_empty() {
+            self.distro_label = name.to_string();
+            if self.sidebar_open {
+                let dir = self.sidebar_dir.clone();
+                self.list_sidebar_dir(dir);
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Per-redraw bookkeeping for this window: keep scrolled-back panes pinned as
+    /// new output arrives, clear stale selection, follow the shell cwd in the
+    /// sidebar. (DSR/DA flushing is global and handled by App.)
+    fn on_redraw_tick(&mut self) {
+        for tab in &mut self.tabs {
+            let mut sids = Vec::new();
+            tab.root.collect_sessions(&mut sids);
+            for sid in sids {
+                if let Some(p) = tab.root.find_mut(sid) {
+                    let (total, sbc) = {
+                        let t = p.term.lock().unwrap();
+                        (t.scrolled_total(), t.scrollback_count())
+                    };
+                    let delta = total.saturating_sub(p.last_scrolled);
+                    if p.scroll_off > 0 && delta > 0 {
+                        p.scroll_off = (p.scroll_off + delta as usize).min(sbc);
+                    }
+                    p.last_scrolled = total;
+                }
+            }
+        }
+        let s = self.focused_session();
+        if let Some(p) = self.pane_mut(s) {
+            if !p.selecting {
+                p.sel = None;
+            }
+        }
+        if self.sidebar_open {
+            let cwd = self.focused_cwd();
+            if cwd != self.last_sidebar_cwd {
+                self.last_sidebar_cwd = cwd.clone();
+                self.list_sidebar_dir(cwd);
+            }
+        }
+        self.want_frame = true;
     }
 
     /// Sidebar width in device px (0 when closed).
@@ -1453,30 +1590,27 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Working directory of tab `idx`'s focused pane (empty if unknown).
-    fn tab_cwd(&self, idx: usize) -> String {
-        let Some(t) = self.tabs.get(idx) else {
-            return String::new();
-        };
-        let sid = if t.root.find(t.focus).is_some() { t.focus } else { t.root.first_session() };
-        t.root
-            .find(sid)
-            .and_then(|p| p.term.lock().unwrap().current_directory().map(String::from))
-            .unwrap_or_default()
-    }
-
-    /// "Move" a tab to a fresh window: open a new window in that tab's directory
-    /// (inheriting this window's distro/port) and close the tab here. The shell is
-    /// new — a running program and the scrollback don't carry over (windows are
-    /// separate processes, so the live session can't be handed across).
+    /// Move a tab to a brand-new window in THIS process, keeping its live session
+    /// and scrollback intact: detach the `Tab` (its sessions stay open on the
+    /// shared backend) and stash it for App to adopt into a fresh window. If this
+    /// was the window's last tab, the window closes (its tab — and sessions — left
+    /// with the move).
     fn move_tab_to_new_window(&mut self, idx: usize, event_loop: &ActiveEventLoop) {
-        if idx >= self.tabs.len() {
+        let _ = event_loop; // window creation is done by App during reconcile
+        if idx >= self.tabs.len() || self.detached.is_some() {
             return;
         }
-        let cwd = self.tab_cwd(idx);
-        let (distro, port) = self.spawn_inherit();
-        spawn_window(if cwd.is_empty() { None } else { Some(cwd) }, distro, port);
-        self.close_whole_tab(idx, event_loop);
+        let tab = self.tabs.remove(idx);
+        self.detached = Some(tab);
+        if self.tabs.is_empty() {
+            self.closing = true; // sessions moved with the tab; just drop this window
+            return;
+        }
+        if self.active_term >= self.tabs.len() {
+            self.active_term = self.tabs.len() - 1;
+        }
+        self.reflow();
+        self.request_redraw();
     }
 
     /// Open a new tab, inheriting the focused pane's working directory.
@@ -1577,6 +1711,7 @@ impl App {
     /// Close a session's pane (collapsing its split); `exited` skips re-closing
     /// the PTY. Closes the tab when its last pane goes, and exits on the last tab.
     fn close_session(&mut self, session: u32, exited: bool, event_loop: &ActiveEventLoop) {
+        let _ = event_loop; // window lifetime is managed by App (see `closing`)
         // The settings editor (edit.exe) tab closed -> reload + apply settings.
         if self.settings_session == Some(session) {
             self.settings_session = None;
@@ -1605,7 +1740,7 @@ impl App {
             None => {
                 self.tabs.remove(ti);
                 if self.tabs.is_empty() {
-                    event_loop.exit();
+                    self.closing = true; // last tab gone -> close this window
                     return;
                 }
                 if self.active_term >= self.tabs.len() {
@@ -1664,6 +1799,7 @@ impl App {
 
     /// Close an entire tab (all its panes).
     fn close_whole_tab(&mut self, idx: usize, event_loop: &ActiveEventLoop) {
+        let _ = event_loop; // window lifetime is managed by App (see `closing`)
         if idx >= self.tabs.len() {
             return;
         }
@@ -1677,7 +1813,7 @@ impl App {
         }
         self.tabs.remove(idx);
         if self.tabs.is_empty() {
-            event_loop.exit();
+            self.closing = true; // last tab gone -> close this window
             return;
         }
         if self.active_term >= self.tabs.len() {
@@ -3255,208 +3391,57 @@ impl App {
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.win.is_some() {
+        if self.started {
             return;
         }
-        // Prefer the GPU path (DirectComposition). It needs a window with no
-        // opaque redirection surface so DWM composites our premultiplied-alpha
-        // swapchain straight against the desktop; the CPU fallback instead uses a
-        // layered window (UpdateLayeredWindow) and must NOT set those flags.
-        let use_gpu = gpu::available();
-        // Borderless either way (we draw our own title/tab bar chrome).
-        let mut attrs = Window::default_attributes()
-            .with_title("WSL Terminal")
-            .with_window_icon(load_window_icon())
-            .with_decorations(false)
-            .with_resizable(true)
-            .with_inner_size(winit::dpi::LogicalSize::new(960.0, 600.0));
-        if use_gpu {
-            use winit::platform::windows::WindowAttributesExtWindows;
-            attrs = attrs.with_transparent(true).with_no_redirection_bitmap(true);
-        }
-        let win = Rc::new(event_loop.create_window(attrs).expect("create window"));
-        self.scale = win.scale_factor() as f32;
-        self.recompute_metrics();
-        // Pace presents to the monitor refresh (fallback 60 Hz).
-        self.frame_interval = win
-            .current_monitor()
-            .and_then(|m| m.refresh_rate_millihertz())
-            .filter(|&mhz| mhz > 0)
-            .map(|mhz| std::time::Duration::from_secs_f64(1000.0 / mhz as f64))
-            .unwrap_or(std::time::Duration::from_millis(16));
-
-        if let Some(hwnd) = hwnd_of(&win) {
-            if use_gpu {
-                match Gpu::new(hwnd) {
-                    Ok(mut g) => {
-                        g.set_font(
-                            &self.font_family,
-                            self.font_px,
-                            self.cell_w as f32,
-                            self.cell_h as f32,
-                            self.font_path.as_deref(),
-                        );
-                        self.gpu = Some(g);
-                        self.gpu_text = true;
-                    }
-                    Err(e) => {
-                        eprintln!("[wslterm] GPU init failed ({e:?}); falling back to layered");
-                        self.layered = Some(Layered::new(hwnd));
-                    }
-                }
-            } else {
-                self.layered = Some(Layered::new(hwnd));
-            }
-        }
-        let size = win.inner_size();
-        let (cols, rows) = self.grid_dims(size.width, size.height);
-
-        // Resolve the distro once (the `self.win` guard above makes this run a
-        // single time). Empty name => WSL's *default* distro (no `-d`); the daemon
-        // self-reports its real name (via wslpath), so the host never queries
-        // wsl.exe. bring_up_mux then routes to the daemon serving this distro
-        // (reusing or bootstrapping it) — see its docs — so a second distro lands
-        // on its own daemon automatically, no port juggling.
+        self.started = true;
+        // Resolve the distro once. Empty name => WSL's *default* distro (no `-d`);
+        // the daemon self-reports its real name (via wslpath), so the host never
+        // queries wsl.exe. The mux + registry are process-global (shared by every
+        // window) so a tab can move between windows keeping its live session.
         self.distro = self.start_distro.take().unwrap_or_default();
-        // An explicit --distro is also its display/UNC label; for the default
-        // distro the daemon reports the real name shortly after connecting.
         self.distro_label = self.distro.clone();
         let (mux, rx) = bring_up_mux(&self.distro, self.start_port);
-
-        // First tab (in --cd directory if given).
-        let term = Arc::new(Mutex::new(Terminal::new(cols, rows)));
-        let session = mux.open(cols as u16, rows as u16, self.start_dir.as_deref().unwrap_or(""));
-        self.registry.lock().unwrap().insert(session, term.clone());
-        self.tabs.push(Tab { root: Layout::Leaf(Pane::new(session, term)), focus: session });
-        self.active_term = 0;
-        self.mux = Some(mux);
         let on = if self.distro.is_empty() { "(default distro)" } else { &self.distro };
-        eprintln!("[wslterm] window up {cols}x{rows}, first session {session} on {on}");
-
-        // Feed thread: route frames to the right session's terminal by id.
-        let registry = self.registry.clone();
-        let outbox = self.outbox.clone();
-        let pending = self.redraw_pending.clone();
-        let proxy = self.proxy.clone();
-        std::thread::Builder::new()
-            .name("wsl-feed".into())
-            .spawn(move || {
-                let mut acc: u64 = 0;
-                let mut mark = Instant::now();
-                while let Ok(first) = rx.recv() {
-                    let mut ev = Some(first);
-                    let mut resp: Vec<(u32, Vec<u8>)> = Vec::new();
-                    let mut clip: Option<String> = None;
-                    while let Some(e) = ev.take() {
-                        match e {
-                            MuxEvent::Data { id, bytes } => {
-                                acc += bytes.len() as u64;
-                                let term = registry.lock().unwrap().get(&id).cloned();
-                                if let Some(term) = term {
-                                    let mut t = term.lock().unwrap();
-                                    t.feed(&bytes);
-                                    if !t.respond.is_empty() {
-                                        resp.push((id, std::mem::take(&mut t.respond)));
-                                    }
-                                    if let Some(c) = t.take_clipboard() {
-                                        clip = Some(c); // OSC 52 (zellij/tmux/vim copy)
-                                    }
-                                }
-                            }
-                            MuxEvent::Exit { id, .. } => {
-                                let _ = proxy.send_event(UserEvent::SessionExit(id));
-                            }
-                            MuxEvent::Info { distro } => {
-                                let _ = proxy.send_event(UserEvent::Distro(distro));
-                            }
-                        }
-                        ev = rx.try_recv().ok();
-                    }
-                    if !resp.is_empty() {
-                        outbox.lock().unwrap().extend(resp);
-                    }
-                    // OSC 52: push the latest clipboard request to the OS clipboard
-                    // (the per-terminal lock is already released here).
-                    if let Some(text) = clip {
-                        let _ = clipboard_win::set_clipboard_string(&text);
-                    }
-                    let dt = mark.elapsed().as_secs_f64();
-                    if dt >= 1.0 {
-                        if acc > 0 {
-                            eprintln!("[feed] {:.1} MB/s", acc as f64 / 1e6 / dt);
-                        }
-                        acc = 0;
-                        mark = Instant::now();
-                    }
-                    if !pending.swap(true, Ordering::AcqRel)
-                        && proxy.send_event(UserEvent::Redraw).is_err()
-                    {
-                        return;
-                    }
-                }
-                let _ = proxy.send_event(UserEvent::Closed);
-            })
-            .expect("spawn feed thread");
-
-        self.win = Some(win);
-        self.request_redraw(); // paint chrome immediately (before first output)
+        eprintln!("[wslterm] backend up on {on}");
+        self.mux = Some(Rc::new(mux));
+        spawn_feed_thread(
+            rx,
+            self.registry.clone(),
+            self.outbox.clone(),
+            self.redraw_pending.clone(),
+            self.proxy.clone(),
+        );
+        // First window + its first tab (in --cd directory if given).
+        let mut w = self.make_window(event_loop);
+        w.open_first_tab(self.start_dir.take());
+        w.request_redraw();
+        self.windows.push(w);
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Redraw => {
                 self.redraw_pending.store(false, Ordering::Release);
-                // Keep each scrolled-back pane pinned to the same content as new
-                // output arrives: advance scroll_off by however many lines just
-                // scrolled into history (so the view doesn't get yanked to the
-                // bottom). Panes already at the live bottom (scroll_off == 0) stay
-                // there. Typing is the explicit way back to live (see handle_key).
-                for tab in &mut self.tabs {
-                    let mut sids = Vec::new();
-                    tab.root.collect_sessions(&mut sids);
-                    for sid in sids {
-                        if let Some(p) = tab.root.find_mut(sid) {
-                            let (total, sbc) = {
-                                let t = p.term.lock().unwrap();
-                                (t.scrolled_total(), t.scrollback_count())
-                            };
-                            let delta = total.saturating_sub(p.last_scrolled);
-                            if p.scroll_off > 0 && delta > 0 {
-                                p.scroll_off = (p.scroll_off + delta as usize).min(sbc);
-                            }
-                            p.last_scrolled = total;
-                        }
-                    }
-                }
-                // Clear the focused pane's stale selection on new output.
-                let s = self.focused_session();
-                if let Some(p) = self.pane_mut(s) {
-                    if !p.selecting {
-                        p.sel = None;
-                    }
-                }
-                // Flush DSR/DA responses to their sessions.
+                // Flush DSR/DA responses to their sessions once (global).
                 let out = std::mem::take(&mut *self.outbox.lock().unwrap());
                 if let Some(mux) = &self.mux {
                     for (id, bytes) in out {
                         mux.send_data(id, &bytes);
                     }
                 }
-                // Follow the shell's cwd in the sidebar, but only when it actually
-                // changes (a manual `cd`). Clicking a folder browses the panel
-                // independently, so we must not snap it back to the cwd here.
-                if self.sidebar_open {
-                    let cwd = self.focused_cwd();
-                    if cwd != self.last_sidebar_cwd {
-                        self.last_sidebar_cwd = cwd.clone();
-                        self.list_sidebar_dir(cwd);
-                    }
+                // Per-window: pin scrolled-back panes, clear stale selection,
+                // follow the shell cwd in the sidebar, and request a present.
+                for w in &mut self.windows {
+                    w.on_redraw_tick();
                 }
-                // Pace the actual present to the monitor refresh (about_to_wait).
-                self.want_frame = true;
             }
             UserEvent::SessionExit(id) => {
-                self.close_session(id, true, event_loop);
+                // The owning window handles it; others no-op (session not found).
+                for w in &mut self.windows {
+                    w.close_session(id, true, event_loop);
+                }
+                self.reconcile(event_loop);
             }
             UserEvent::Closed => {
                 eprintln!("[wslterm] mux ended");
@@ -3464,15 +3449,13 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Distro(name) => {
                 // Only the default distro learns its name this way (an explicit
-                // --distro already set the label in resumed). Adopt it for the
-                // sidebar's UNC paths and refresh the panel if it's open.
+                // --distro already set the label). Adopt it for every window's
+                // sidebar UNC paths.
                 if self.distro_label.is_empty() && !name.is_empty() {
                     eprintln!("[wslterm] daemon reported distro {name}");
-                    self.distro_label = name;
-                    if self.sidebar_open {
-                        let dir = self.sidebar_dir.clone();
-                        self.list_sidebar_dir(dir);
-                        self.request_redraw();
+                    self.distro_label = name.clone();
+                    for w in &mut self.windows {
+                        w.on_distro(&name);
                     }
                 }
             }
@@ -3482,24 +3465,40 @@ impl ApplicationHandler<UserEvent> for App {
     /// Frame pacing: when output is pending, present at most once per monitor
     /// refresh — repaint when the interval elapses, otherwise sleep until then.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.want_frame {
-            let target = self.last_frame + self.frame_interval;
-            if Instant::now() >= target {
-                if let Some(win) = &self.win {
+        let now = Instant::now();
+        let mut next: Option<Instant> = None;
+        for w in &mut self.windows {
+            if !w.want_frame {
+                continue;
+            }
+            let target = w.last_frame + w.frame_interval;
+            if now >= target {
+                if let Some(win) = &w.win {
                     win.request_redraw();
                 }
-                event_loop.set_control_flow(ControlFlow::Wait);
             } else {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(target));
+                next = Some(next.map_or(target, |n| n.min(target)));
             }
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+        match next {
+            Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if let Some(i) = self.window_index(id) {
+            self.windows[i].handle_window_event(event, event_loop);
+            self.reconcile(event_loop);
+        }
+    }
+}
+
+impl Win {
+    /// Process one window event for THIS window (dispatched by App per WindowId).
+    fn handle_window_event(&mut self, event: WindowEvent, event_loop: &ActiveEventLoop) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.closing = true,
             WindowEvent::ModifiersChanged(m) => {
                 self.mods = m.state();
                 // Releasing Ctrl drops the hyperlink affordance immediately.
@@ -3625,7 +3624,7 @@ impl ApplicationHandler<UserEvent> for App {
                         let x = px as f32;
                         // 2) Window controls.
                         if x >= self.win_btns[2].0 {
-                            event_loop.exit();
+                            self.closing = true; // close just this window
                         } else if x >= self.win_btns[1].0 && x < self.win_btns[1].1 {
                             self.toggle_maximize();
                         } else if x >= self.win_btns[0].0 && x < self.win_btns[0].1 {
@@ -3749,6 +3748,163 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::RedrawRequested => self.render(),
             _ => {}
+        }
+    }
+}
+
+/// Spawn the single feed thread (one per process): route daemon frames to the
+/// shared registry's terminals, collect DSR/DA responses + OSC 52 clipboard, and
+/// poke the UI to repaint. The mux connection is shared by every window.
+fn spawn_feed_thread(
+    rx: std::sync::mpsc::Receiver<MuxEvent>,
+    registry: Registry,
+    outbox: Outbox,
+    pending: Arc<AtomicBool>,
+    proxy: EventLoopProxy<UserEvent>,
+) {
+    std::thread::Builder::new()
+        .name("wsl-feed".into())
+        .spawn(move || {
+            let mut acc: u64 = 0;
+            let mut mark = Instant::now();
+            while let Ok(first) = rx.recv() {
+                let mut ev = Some(first);
+                let mut resp: Vec<(u32, Vec<u8>)> = Vec::new();
+                let mut clip: Option<String> = None;
+                while let Some(e) = ev.take() {
+                    match e {
+                        MuxEvent::Data { id, bytes } => {
+                            acc += bytes.len() as u64;
+                            let term = registry.lock().unwrap().get(&id).cloned();
+                            if let Some(term) = term {
+                                let mut t = term.lock().unwrap();
+                                t.feed(&bytes);
+                                if !t.respond.is_empty() {
+                                    resp.push((id, std::mem::take(&mut t.respond)));
+                                }
+                                if let Some(c) = t.take_clipboard() {
+                                    clip = Some(c); // OSC 52 (zellij/tmux/vim copy)
+                                }
+                            }
+                        }
+                        MuxEvent::Exit { id, .. } => {
+                            let _ = proxy.send_event(UserEvent::SessionExit(id));
+                        }
+                        MuxEvent::Info { distro } => {
+                            let _ = proxy.send_event(UserEvent::Distro(distro));
+                        }
+                    }
+                    ev = rx.try_recv().ok();
+                }
+                if !resp.is_empty() {
+                    outbox.lock().unwrap().extend(resp);
+                }
+                if let Some(text) = clip {
+                    let _ = clipboard_win::set_clipboard_string(&text);
+                }
+                let dt = mark.elapsed().as_secs_f64();
+                if dt >= 1.0 {
+                    if acc > 0 {
+                        eprintln!("[feed] {:.1} MB/s", acc as f64 / 1e6 / dt);
+                    }
+                    acc = 0;
+                    mark = Instant::now();
+                }
+                if !pending.swap(true, Ordering::AcqRel)
+                    && proxy.send_event(UserEvent::Redraw).is_err()
+                {
+                    return;
+                }
+            }
+            let _ = proxy.send_event(UserEvent::Closed);
+        })
+        .expect("spawn feed thread");
+}
+
+/// The process-level app: owns the shared backend (the `mux` vsock connection +
+/// session→terminal `registry`) and every window, and routes winit events to the
+/// right window by `WindowId`. Per-window state lives in `Win`, so a tab — with
+/// its live session and scrollback — can move between windows in one process.
+struct App {
+    proxy: EventLoopProxy<UserEvent>,
+    windows: Vec<Win>,
+    mux: Option<Rc<WslMux>>,
+    registry: Registry,
+    outbox: Outbox,
+    redraw_pending: Arc<AtomicBool>,
+    start_dir: Option<String>,
+    start_distro: Option<String>,
+    start_port: Option<u32>,
+    distro: String,       // resolved on first resume (empty = WSL default)
+    distro_label: String, // from --distro or the daemon's report
+    started: bool,        // backend brought up + first window created
+}
+
+impl App {
+    fn new(
+        proxy: EventLoopProxy<UserEvent>,
+        start_dir: Option<String>,
+        start_distro: Option<String>,
+        start_port: Option<u32>,
+    ) -> App {
+        App {
+            proxy,
+            windows: Vec::new(),
+            mux: None,
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            outbox: Arc::new(Mutex::new(Vec::new())),
+            redraw_pending: Arc::new(AtomicBool::new(false)),
+            start_dir,
+            start_distro,
+            start_port,
+            distro: String::new(),
+            distro_label: String::new(),
+            started: false,
+        }
+    }
+
+    /// Build a new per-window state sharing the process backend, applying the
+    /// resolved distro so child-process spawns (Ctrl+Shift+N, sidebar "Open in
+    /// new window") inherit it.
+    fn make_window(&self, event_loop: &ActiveEventLoop) -> Win {
+        let mux = self.mux.clone().expect("backend up before making a window");
+        let mut w = Win::new(mux, self.registry.clone(), event_loop);
+        w.distro = self.distro.clone();
+        w.distro_label = self.distro_label.clone();
+        w.start_port = self.start_port;
+        w
+    }
+
+    fn window_index(&self, id: WindowId) -> Option<usize> {
+        self.windows.iter().position(|w| w.win_id() == Some(id))
+    }
+
+    /// After each event: open windows for detached (moved) tabs, drop windows
+    /// that asked to close (closing any leftover sessions), and exit the process
+    /// once the last window is gone.
+    fn reconcile(&mut self, event_loop: &ActiveEventLoop) {
+        let mut moved: Vec<Tab> = Vec::new();
+        for w in &mut self.windows {
+            if let Some(t) = w.detached.take() {
+                moved.push(t);
+            }
+        }
+        for tab in moved {
+            let mut w = self.make_window(event_loop);
+            w.adopt_tab(tab);
+            self.windows.push(w);
+        }
+        let mut i = 0;
+        while i < self.windows.len() {
+            if self.windows[i].closing {
+                let mut w = self.windows.remove(i);
+                w.close_all_sessions();
+            } else {
+                i += 1;
+            }
+        }
+        if self.started && self.windows.is_empty() {
+            event_loop.exit();
         }
     }
 }
